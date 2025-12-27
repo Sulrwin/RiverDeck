@@ -2,10 +2,11 @@
 
 ## Architecture Overview
 
-RiverDeck is a Tauri desktop application for controlling Elgato Stream Deck devices. RiverDeck is forked from OpenDeck. It's built with:
-- **Backend**: Rust (Tauri v2) - device communication, plugin management, WebSocket/HTTP servers
-- **Frontend**: SvelteKit + TypeScript + Tailwind CSS v4 - UI rendered in webview
-- **Build Tool**: Deno (not Node.js) - manages tasks and dependencies
+RiverDeck is a native Rust desktop application for controlling Elgato Stream Deck devices. RiverDeck is forked from OpenDeck. It's built with:
+- **Backend core**: Rust (`crates/riverdeck-core`) - device communication, plugin management, WebSocket/HTTP servers
+- **Main UI**: Rust egui (`crates/riverdeck-egui`) - native UI
+- **Property Inspectors**: Rust `wry` helper (`crates/riverdeck-pi`) - embeds plugin HTML inspectors
+- **Build Tool**: Cargo (Deno is only used by some plugin build scripts)
 
 ### Core Architecture Pattern
 
@@ -20,23 +21,11 @@ Key data flow: `Device (elgato-streamdeck crate) → Rust event handlers → Web
 ## Project Structure
 
 ```
-src-tauri/src/              # Rust backend
-├── main.rs                 # Entry point, Tauri setup, tray icon
-├── elgato.rs               # Direct hardware communication (elgato-streamdeck crate)
-├── plugins/                # Plugin lifecycle, WebSocket/HTTP servers
-├── events/                 # Event routing (inbound/outbound/frontend)
-├── store/                  # JSON file-based persistence (profiles, settings)
-└── application_watcher.rs  # Auto-switch profiles based on active window
-
-src/                        # SvelteKit frontend
-├── lib/                    # TypeScript types mirroring Rust structs
-├── components/             # Svelte UI components
-└── routes/                 # SvelteKit routing (currently single-page app)
-
-plugins/com.amansprojects.starterpack.sdPlugin/  # Plugin with basic actions
-├── assets/manifest.json                         # Plugin metadata
-├── assets/propertyInspector/                    # HTML UIs for action settings
-└── src/                                         # Rust plugin using openaction crate
+crates/riverdeck-core/      # Rust backend core (no GUI framework dependency)
+crates/riverdeck-egui/      # egui main UI
+crates/riverdeck-pi/        # wry-based property inspector helper
+packaging/                  # icons, desktop/metainfo, udev rules, flatpak manifests
+plugins/                    # built-in plugin sources
 ```
 
 ## Critical Workflows
@@ -44,22 +33,15 @@ plugins/com.amansprojects.starterpack.sdPlugin/  # Plugin with basic actions
 ### Development Commands
 
 ```bash
-# Frontend dev server (Vite HMR on port 5173)
-deno task dev
-
-# Run Tauri app in dev mode (spawns frontend + Rust app)
-deno task tauri dev
-
-# Build production bundle
-deno task tauri build
+# Run the native egui app
+cargo run -p riverdeck-egui
 ```
 
 ### Pre-commit Requirements
 
 Before commits, **always** run:
-1. `cargo clippy` (no violations allowed)
-2. `cargo fmt` (in both `src-tauri/` and plugin directories)
-3. `deno check`, `deno task check` and `deno lint` (no violations)
+1. `cargo clippy --workspace --all-targets -- -D warnings`
+2. `cargo fmt --all`
 
 These are project standards, not suggestions.
 
@@ -71,9 +53,8 @@ Built-in plugins included in RiverDeck are Rust binaries. The `build.ts` script 
 
 ### Type Synchronization
 
-TypeScript types in `src/lib/` **must** mirror Rust structs in `src-tauri/src/shared.rs`:
+Core Rust types live in `crates/riverdeck-core/src/shared.rs`:
 - `Context`, `ActionInstance`, `ActionState`, `DeviceInfo`, `Profile`
-- Changes to Rust structs require updating corresponding TypeScript types
 
 ### Context System
 
@@ -121,11 +102,9 @@ An `ActionContext` extends this with an action instance index for nested actions
 
 ## Common Patterns
 
-### Adding a New Tauri Command
+### Adding a New API function
 
-1. Define handler in `src-tauri/src/events/frontend.rs`
-2. Add to `invoke_handler![]` macro in `main.rs`
-3. Call from frontend: `await invoke<ReturnType>("command_name", { arg })`
+Add it under `crates/riverdeck-core/src/api/` and call it directly from `crates/riverdeck-egui`.
 
 ### Profile Management
 
@@ -155,7 +134,7 @@ Auto-switching: `application_watcher.rs` polls active window every 250ms, trigge
 ### External Dependencies
 
 - `elgato-streamdeck`: Async hardware communication via HID, image format conversion for different device types
-- `tauri-plugin-*`: Dialog (file picker), logging (to file), autostart, single-instance, deep-link (opendeck:// URLs)
+- (No Tauri dependencies remain)
 - `tokio-tungstenite`: WebSocket server for plugin communication
 - `tiny_http`: Static file server for plugin assets (icons, property inspectors)
 - `image`: Image loading/manipulation, format conversion for device displays
@@ -184,7 +163,7 @@ Flatpak uses different paths with `~/.var/app/io.github.sulrwin.riverdeck/` pref
 
 ## Testing & Debugging
 
-- Run from terminal to see live logs: `deno task tauri dev`
+- Run from terminal to see live logs: `cargo run -p riverdeck-egui`
 - Plugin logs: Check `<log_dir>/plugins/<uuid>.log` (stdout/stderr captured from plugin processes)
 - Debug logging: Uses Rust `log` crate (`log::debug!`)
 - Frontend: Tauri devtools accessible via right-click → "Inspect Element"

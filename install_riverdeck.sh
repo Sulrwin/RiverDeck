@@ -3,7 +3,7 @@ set -euo pipefail
 
 GITHUB_REPO="sulrwin/RiverDeck"
 FLATHUB_APP_ID="io.github.sulrwin.riverdeck"
-UDEV_RULES_URL="https://raw.githubusercontent.com/sulrwin/RiverDeck/main/src-tauri/bundle/40-streamdeck.rules"
+UDEV_RULES_URL="https://raw.githubusercontent.com/sulrwin/RiverDeck/main/packaging/linux/40-streamdeck.rules"
 
 if [ -t 1 ]; then
     RED="\033[0;31m"

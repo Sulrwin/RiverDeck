@@ -4866,6 +4866,7 @@ dependencies = [
  "fs2",
  "gtk",
  "image",
+ "libc",
  "log",
  "reqwest",
  "riverdeck-core",

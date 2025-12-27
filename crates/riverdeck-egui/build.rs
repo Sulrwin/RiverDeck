@@ -30,5 +30,3 @@ Or build without tray support:\n\
         }
     }
 }
-
-

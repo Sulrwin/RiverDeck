@@ -1,0 +1,45 @@
+{
+	"app-id": "io.github.sulrwin.riverdeck",
+	"runtime": "org.gnome.Platform",
+	"runtime-version": "47",
+	"sdk": "org.gnome.Sdk",
+	"sdk-extensions": ["org.freedesktop.Sdk.Extension.rust-stable"],
+	"command": "riverdeck",
+	"finish-args": [
+		"--share=network",
+		"--socket=fallback-x11",
+		"--socket=wayland",
+		"--device=all",
+		"--filesystem=xdg-config/io.github.sulrwin.riverdeck:create",
+		"--filesystem=xdg-data/io.github.sulrwin.riverdeck:create",
+		"--talk-name=org.freedesktop.Flatpak"
+	],
+	"build-options": {
+		"append-path": "/usr/lib/sdk/rust-stable/bin",
+		"env": {
+			"CARGO_HOME": "/run/build/riverdeck/cargo"
+		}
+	},
+	"modules": [
+		{
+			"name": "riverdeck",
+			"buildsystem": "simple",
+			"build-commands": [
+				"cargo build --release -p riverdeck-egui -p riverdeck-pi",
+				"install -Dm755 target/release/riverdeck /app/bin/riverdeck",
+				"install -Dm755 target/release/riverdeck-pi /app/bin/riverdeck-pi",
+				"install -Dm644 packaging/linux/riverdeck.desktop /app/share/applications/io.github.sulrwin.riverdeck.desktop",
+				"install -Dm644 packaging/linux/riverdeck.metainfo.xml /app/share/metainfo/io.github.sulrwin.riverdeck.metainfo.xml",
+				"install -Dm644 packaging/icons/icon.png /app/share/icons/hicolor/512x512/apps/io.github.sulrwin.riverdeck.png"
+			],
+			"sources": [
+				{
+					"type": "dir",
+					"path": "../.."
+				}
+			]
+		}
+	]
+}
+
+

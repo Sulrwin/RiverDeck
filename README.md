@@ -11,7 +11,7 @@ Only Elgato hardware is officially supported, but plugins are available for supp
 
 RiverDeck is made by Ethan Wright (`sulrwin`) and is forked from OpenDeck. Thanks to OpenDeck and its contributors for the original work.
 
-Special thanks go to the developers of [Tauri](https://github.com/tauri-apps/tauri), the [elgato-streamdeck](https://github.com/OpenActionAPI/rust-elgato-streamdeck) Rust library, [Wine](https://www.winehq.org/), and [Phosphor Icons](https://phosphoricons.com/).
+Special thanks go to the developers of the [elgato-streamdeck](https://github.com/OpenActionAPI/rust-elgato-streamdeck) Rust library, [Wine](https://www.winehq.org/), and [Phosphor Icons](https://phosphoricons.com/).
 
 ### Why use RiverDeck?
 
@@ -101,7 +101,7 @@ On Linux, the default `riverdeck-egui` build enables tray support, which require
 - Debian/Ubuntu: `sudo apt-get install -y libxdo-dev`
 - Or disable tray support: `cargo build -p riverdeck-egui --no-default-features`
 
-The older Tauri/Svelte UI under `src-tauri/` is considered legacy during the transition.
+RiverDeck no longer depends on Tauri.
 
 Before each commit, please ensure that all of the following are completed:
 1. Rust code has been linted using `cargo clippy` and it discovers no violations
