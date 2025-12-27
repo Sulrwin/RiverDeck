@@ -76,11 +76,25 @@ async fn send_to_plugin(plugin: &str, data: &impl Serialize) -> Result<(), anyho
 }
 
 async fn send_to_all_plugins(data: &impl Serialize) -> Result<(), anyhow::Error> {
-    let mut entries = tokio::fs::read_dir(crate::shared::config_dir().join("plugins")).await?;
+    let plugins_dir = crate::shared::config_dir().join("plugins");
+    let plugins_canon = tokio::fs::canonicalize(&plugins_dir)
+        .await
+        .unwrap_or(plugins_dir.clone());
+    let mut entries = tokio::fs::read_dir(&plugins_dir).await?;
     while let Ok(Some(entry)) = entries.next_entry().await {
-        let path = match entry.metadata().await?.is_symlink() {
-            true => tokio::fs::read_link(entry.path()).await?,
-            false => entry.path(),
+        let entry_path = entry.path();
+        let meta = tokio::fs::symlink_metadata(&entry_path).await?;
+        let path = if meta.file_type().is_symlink() {
+            let target = tokio::fs::read_link(&entry_path).await?;
+            let target_canon = tokio::fs::canonicalize(&target)
+                .await
+                .unwrap_or(target.clone());
+            if !target_canon.starts_with(&plugins_canon) {
+                continue;
+            }
+            target
+        } else {
+            entry_path
         };
         let metadata = tokio::fs::metadata(&path).await?;
         if metadata.is_dir() {

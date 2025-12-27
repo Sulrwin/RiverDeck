@@ -12,6 +12,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{fs, path};
 
+use base64::Engine as _;
 use futures::StreamExt;
 use tokio::net::{TcpListener, TcpStream};
 
@@ -19,6 +20,20 @@ use anyhow::anyhow;
 use log::{error, warn};
 use once_cell::sync::Lazy;
 use tokio::sync::{Mutex, RwLock};
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+
+fn is_safe_relative_path(p: &str) -> bool {
+    let p = std::path::Path::new(p);
+    !p.is_absolute()
+        && !p.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+}
 
 enum PluginInstance {
     Webview { label: String },
@@ -33,11 +48,33 @@ static INSTANCES: Lazy<Mutex<HashMap<String, PluginInstance>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 static PLUGIN_SERVERS_STARTED: Lazy<AtomicBool> = Lazy::new(|| AtomicBool::new(false));
 
+static PROPERTY_INSPECTOR_TOKEN: Lazy<String> = Lazy::new(|| {
+    // Random per-process token used to make it harder for other local users to impersonate
+    // property inspectors (best-effort; not a sandbox).
+    let mut bytes = [0u8; 32];
+    if getrandom::getrandom(&mut bytes).is_err() {
+        // Fallback: still produce something, but log that we couldn't get strong randomness.
+        log::warn!("getrandom failed; property inspector auth token is weak");
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        bytes[..16].copy_from_slice(&t.to_le_bytes());
+    }
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+});
+
+pub fn property_inspector_token() -> &'static str {
+    PROPERTY_INSPECTOR_TOKEN.as_str()
+}
+
 pub static PORT_BASE: Lazy<u16> = Lazy::new(|| {
     let mut base = 57116;
     loop {
-        let websocket_result = std::net::TcpListener::bind(format!("0.0.0.0:{}", base));
-        let webserver_result = std::net::TcpListener::bind(format!("0.0.0.0:{}", base + 2));
+        // These servers should only ever be reachable locally. Binding to 0.0.0.0 would expose
+        // the plugin control plane on the LAN.
+        let websocket_result = std::net::TcpListener::bind(("127.0.0.1", base));
+        let webserver_result = std::net::TcpListener::bind(("127.0.0.1", base + 2));
         if websocket_result.is_ok() && webserver_result.is_ok() {
             log::debug!("Using ports {} and {}", base, base + 2);
             break;
@@ -77,11 +114,21 @@ pub async fn initialise_plugin(path: &path::Path) -> anyhow::Result<()> {
         action.icon = convert_icon(action_icon_path.to_str().unwrap().to_owned());
 
         if !action.property_inspector.is_empty() {
-            action.property_inspector = path
-                .join(&action.property_inspector)
-                .to_string_lossy()
-                .to_string();
-        } else if let Some(ref property_inspector) = manifest.property_inspector_path {
+            if is_safe_relative_path(&action.property_inspector) {
+                action.property_inspector = path
+                    .join(&action.property_inspector)
+                    .to_string_lossy()
+                    .to_string();
+            } else {
+                warn!(
+                    "Plugin {} has unsafe PropertyInspectorPath {}; ignoring",
+                    plugin_uuid, action.property_inspector
+                );
+                action.property_inspector.clear();
+            }
+        } else if let Some(ref property_inspector) = manifest.property_inspector_path
+            && is_safe_relative_path(property_inspector)
+        {
             action.property_inspector = path.join(property_inspector).to_string_lossy().to_string();
         }
 
@@ -192,6 +239,9 @@ pub async fn initialise_plugin(path: &path::Path) -> anyhow::Result<()> {
     }
 
     let code_path = code_path.unwrap();
+    if !is_safe_relative_path(&code_path) {
+        return Err(anyhow!("unsafe plugin CodePath"));
+    }
     let port_string = PORT_BASE.to_string();
     let args = [
         "-port",
@@ -267,12 +317,13 @@ pub async fn initialise_plugin(path: &path::Path) -> anyhow::Result<()> {
             .args(&extra_args)
             .arg("--version")
             .output();
-        if version_output.is_err()
-            || String::from_utf8(version_output.unwrap().stdout)
-                .unwrap()
-                .trim()
-                < "v20.0.0"
-        {
+        let version_ok = version_output
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().trim_start_matches('v').to_owned())
+            .and_then(|s| semver::Version::parse(&s).ok())
+            .is_some_and(|v| v >= semver::Version::new(20, 0, 0));
+        if !version_ok {
             return Err(anyhow!("Node.js version 20.0.0 or higher is required"));
         }
 
@@ -289,6 +340,7 @@ pub async fn initialise_plugin(path: &path::Path) -> anyhow::Result<()> {
                 .arg(code_path)
                 .args(args)
                 .arg(serde_json::to_string(&info)?)
+                .stdin(Stdio::null())
                 .stdout(Stdio::from(log_file.try_clone()?))
                 .stderr(Stdio::from(log_file))
                 .creation_flags(0x08000000)
@@ -308,6 +360,7 @@ pub async fn initialise_plugin(path: &path::Path) -> anyhow::Result<()> {
                 .arg(code_path)
                 .args(args)
                 .arg(serde_json::to_string(&info)?)
+                .stdin(Stdio::null())
                 .stdout(Stdio::from(log_file.try_clone()?))
                 .stderr(Stdio::from(log_file))
                 .spawn()?;
@@ -351,6 +404,7 @@ pub async fn initialise_plugin(path: &path::Path) -> anyhow::Result<()> {
             .arg(code_path)
             .args(args)
             .arg(serde_json::to_string(&info)?)
+            .stdin(Stdio::null())
             .stdout(Stdio::from(log_file.try_clone()?))
             .stderr(Stdio::from(log_file));
         if get_settings()?.value.separatewine {
@@ -379,6 +433,7 @@ pub async fn initialise_plugin(path: &path::Path) -> anyhow::Result<()> {
                 .current_dir(path)
                 .args(args)
                 .arg(serde_json::to_string(&info)?)
+                .stdin(Stdio::null())
                 .stdout(Stdio::from(log_file.try_clone()?))
                 .stderr(Stdio::from(log_file))
                 .creation_flags(0x08000000)
@@ -402,6 +457,7 @@ pub async fn initialise_plugin(path: &path::Path) -> anyhow::Result<()> {
                 .current_dir(path)
                 .args(args)
                 .arg(serde_json::to_string(&info)?)
+                .stdin(Stdio::null())
                 .stdout(Stdio::from(log_file.try_clone()?))
                 .stderr(Stdio::from(log_file))
                 .spawn()?;
@@ -577,11 +633,41 @@ pub fn initialise_plugins() {
     // Iterate through all directory entries in the plugins folder and initialise them as plugins if appropriate
     for entry in entries {
         if let Ok(entry) = entry {
-            let path = match entry.metadata().unwrap().is_symlink() {
-                true => fs::read_link(entry.path()).unwrap(),
-                false => entry.path(),
+            let entry_path = entry.path();
+            let meta = match fs::symlink_metadata(&entry_path) {
+                Ok(m) => m,
+                Err(_) => continue,
             };
-            let metadata = fs::metadata(&path).unwrap();
+            let path = if meta.file_type().is_symlink() {
+                // Only follow symlinks if they stay within the plugins directory (avoid surprising escapes).
+                let target = match fs::read_link(&entry_path) {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
+                let plugins_canon = match fs::canonicalize(&plugin_dir) {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+                let target_canon = match fs::canonicalize(&target) {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+                if !target_canon.starts_with(&plugins_canon) {
+                    warn!(
+                        "Ignoring plugin symlink {} -> {} (escapes plugins dir)",
+                        entry_path.display(),
+                        target.display()
+                    );
+                    continue;
+                }
+                target
+            } else {
+                entry_path
+            };
+            let metadata = match fs::metadata(&path) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
             if metadata.is_dir() {
                 tokio::spawn(async move {
                     if let Err(error) = initialise_plugin(&path).await {
@@ -601,7 +687,7 @@ pub fn initialise_plugins() {
 
 /// Start the WebSocket server that plugins communicate with.
 async fn init_websocket_server() {
-    let listener = match TcpListener::bind(format!("0.0.0.0:{}", *PORT_BASE)).await {
+    let listener = match TcpListener::bind(("127.0.0.1", *PORT_BASE)).await {
         Ok(listener) => listener,
         Err(error) => {
             error!(
@@ -627,7 +713,15 @@ async fn init_websocket_server() {
 
 /// Handle incoming data from a WebSocket connection.
 async fn accept_connection(stream: TcpStream) {
-    let mut socket = match tokio_tungstenite::accept_async(stream).await {
+    // Put a hard cap on message sizes to mitigate trivial memory/CPU DoS.
+    // `setImage` can include a data URI, so keep this reasonably sized.
+    const MAX_WS_MESSAGE_BYTES: usize = 10 * 1024 * 1024;
+    let mut cfg = WebSocketConfig::default();
+    cfg.max_message_size = Some(MAX_WS_MESSAGE_BYTES);
+    cfg.max_frame_size = Some(MAX_WS_MESSAGE_BYTES);
+    cfg.accept_unmasked_frames = false;
+
+    let mut socket = match tokio_tungstenite::accept_async_with_config(stream, Some(cfg)).await {
         Ok(socket) => socket,
         Err(error) => {
             warn!("Failed to complete WebSocket handshake: {}", error);
@@ -635,14 +729,47 @@ async fn accept_connection(stream: TcpStream) {
         }
     };
 
-    let Ok(register_event) = socket.next().await.unwrap() else {
+    // First message must be a registration event. Never `unwrap()` here: a client can disconnect
+    // immediately, and a panic would take down the whole server task.
+    let Some(first) = socket.next().await else {
         return;
     };
-    match serde_json::from_str(&register_event.clone().into_text().unwrap()) {
+    let first = match first {
+        Ok(m) => m,
+        Err(e) => {
+            warn!("WebSocket error before registration: {}", e);
+            return;
+        }
+    };
+    let text = match first.into_text() {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+
+    match serde_json::from_str::<crate::events::inbound::RegisterEvent>(&text) {
         Ok(event) => crate::events::register_plugin(event, socket).await,
         Err(_) => {
-            let _ = crate::events::inbound::process_incoming_message(Ok(register_event), "", false)
-                .await;
+            let _ = crate::events::inbound::process_incoming_message(
+                Ok(tokio_tungstenite::tungstenite::Message::Text(text)),
+                "",
+                false,
+            )
+            .await;
         }
+    };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_safe_relative_path;
+
+    #[test]
+    fn safe_relative_path_rejects_traversal_and_absolute() {
+        assert!(is_safe_relative_path("foo/bar.exe"));
+        assert!(is_safe_relative_path("assets/propertyInspector/index.html"));
+
+        assert!(!is_safe_relative_path("../evil"));
+        assert!(!is_safe_relative_path("foo/../../evil"));
+        assert!(!is_safe_relative_path("/etc/passwd"));
     }
 }

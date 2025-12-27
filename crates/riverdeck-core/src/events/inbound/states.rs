@@ -4,6 +4,7 @@ use crate::store::profiles::{acquire_locks_mut, get_instance_mut, save_profile};
 use crate::ui::{self, UiEvent};
 
 use serde::Deserialize;
+use std::path::Component;
 
 #[derive(Deserialize)]
 pub struct SetTitlePayload {
@@ -29,10 +30,17 @@ pub async fn set_title(
 
     if let Some(instance) = get_instance_mut(&event.context, &mut locks).await? {
         if let Some(state) = event.payload.state {
-            instance.states[state as usize].text = event
-                .payload
-                .title
-                .unwrap_or(instance.action.states[state as usize].text.clone());
+            let Some(slot) = instance.states.get_mut(state as usize) else {
+                // Avoid panicking on malformed/out-of-range state indices.
+                return Ok(());
+            };
+            let fallback = instance
+                .action
+                .states
+                .get(state as usize)
+                .map(|s| s.text.clone())
+                .unwrap_or_default();
+            slot.text = event.payload.title.unwrap_or(fallback);
         } else {
             for (index, state) in instance.states.iter_mut().enumerate() {
                 state.text = event
@@ -67,23 +75,38 @@ pub async fn set_image(
             if image.trim().is_empty() {
                 event.payload.image = None;
             } else if !image.trim().starts_with("data:") {
-                event.payload.image = Some(crate::shared::convert_icon(
-                    crate::shared::config_dir()
-                        .join("plugins")
-                        .join(&instance.action.plugin)
-                        .join(image.trim())
-                        .to_str()
-                        .unwrap()
-                        .to_owned(),
-                ));
+                // Treat plugin-provided image paths as *relative to the plugin directory* and
+                // reject absolute paths / traversal.
+                let rel = std::path::Path::new(image.trim());
+                let is_unsafe = rel.is_absolute()
+                    || rel.components().any(|c| matches!(c, Component::ParentDir));
+                if is_unsafe {
+                    event.payload.image = None;
+                } else if let Some(p) = crate::shared::config_dir()
+                    .join("plugins")
+                    .join(&instance.action.plugin)
+                    .join(rel)
+                    .to_str()
+                    .map(|s| s.to_owned())
+                {
+                    event.payload.image = Some(crate::shared::convert_icon(p));
+                } else {
+                    event.payload.image = None;
+                }
             }
         }
 
         if let Some(state) = event.payload.state {
-            instance.states[state as usize].image = event
-                .payload
-                .image
-                .unwrap_or(instance.action.states[state as usize].image.clone());
+            let Some(slot) = instance.states.get_mut(state as usize) else {
+                return Ok(());
+            };
+            let fallback = instance
+                .action
+                .states
+                .get(state as usize)
+                .map(|s| s.image.clone())
+                .unwrap_or_else(|| instance.action.icon.clone());
+            slot.image = event.payload.image.unwrap_or(fallback);
         } else {
             for (index, state) in instance.states.iter_mut().enumerate() {
                 state.image = event

@@ -9,7 +9,24 @@ use std::path::PathBuf;
 use anyhow::{Context, anyhow};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
+use std::path::Component;
 use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+fn validate_profile_id(id: &str) -> Result<(), anyhow::Error> {
+    let p = std::path::Path::new(id);
+    if p.as_os_str().is_empty() {
+        return Err(anyhow!("profile id is empty"));
+    }
+    for c in p.components() {
+        match c {
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(anyhow!("invalid profile id"));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
 
 pub struct ProfileStores {
     stores: HashMap<String, Store<Profile>>,
@@ -33,6 +50,7 @@ impl ProfileStores {
         device: &DeviceInfo,
         id: &str,
     ) -> Result<&Store<Profile>, anyhow::Error> {
+        validate_profile_id(id)?;
         self.stores
             .get(&Self::canonical_id(&device.id, id))
             .ok_or_else(|| anyhow!("profile not found"))
@@ -43,6 +61,7 @@ impl ProfileStores {
         device: &DeviceInfo,
         id: &str,
     ) -> Result<&mut Store<Profile>, anyhow::Error> {
+        validate_profile_id(id)?;
         let canonical_id = Self::canonical_id(&device.id, id);
         if self.stores.contains_key(&canonical_id) {
             Ok(self.stores.get_mut(&canonical_id).unwrap())
@@ -99,10 +118,16 @@ impl ProfileStores {
     }
 
     pub fn remove_profile(&mut self, device: &str, id: &str) {
+        if validate_profile_id(id).is_err() {
+            return;
+        }
         self.stores.remove(&Self::canonical_id(device, id));
     }
 
     pub fn delete_profile(&mut self, device: &str, id: &str) {
+        if validate_profile_id(id).is_err() {
+            return;
+        }
         self.remove_profile(device, id);
         let config_dir = config_dir();
         #[cfg(target_os = "windows")]
@@ -124,6 +149,8 @@ impl ProfileStores {
         old_id: &str,
         new_id: &str,
     ) -> Result<(), anyhow::Error> {
+        validate_profile_id(old_id)?;
+        validate_profile_id(new_id)?;
         // Remove from the store but don't delete the file
         self.remove_profile(&device.id, old_id);
 
@@ -455,4 +482,20 @@ pub async fn save_profile(device: &str, locks: &mut LocksMut<'_>) -> Result<(), 
         .profile_stores
         .get_profile_store(&device, &selected_profile)?;
     store.save()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_profile_id;
+
+    #[test]
+    fn profile_id_validation_allows_folders_but_not_traversal() {
+        assert!(validate_profile_id("Default").is_ok());
+        assert!(validate_profile_id("Folder/Profile").is_ok());
+
+        assert!(validate_profile_id("").is_err());
+        assert!(validate_profile_id("../evil").is_err());
+        assert!(validate_profile_id("Folder/../evil").is_err());
+        assert!(validate_profile_id("/abs").is_err());
+    }
 }

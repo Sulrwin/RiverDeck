@@ -10,8 +10,17 @@ pub struct OpenUrlEvent {
 }
 
 pub async fn open_url(event: PayloadEvent<OpenUrlEvent>) -> Result<(), anyhow::Error> {
-    log::debug!("Opening URL {}", event.payload.url);
-    open::that_detached(event.payload.url)?;
+    // Avoid turning RiverDeck into a general-purpose local "open arbitrary thing" endpoint.
+    // Most Stream Deck plugins use this for http(s) links.
+    let url = event.payload.url.trim();
+    if url.len() > 2048 {
+        return Ok(());
+    }
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Ok(());
+    }
+    log::debug!("Opening URL {}", url);
+    open::that_detached(url)?;
     Ok(())
 }
 

@@ -77,9 +77,9 @@ An `ActionContext` extends this with an action instance index for nested actions
   - `CATEGORIES` (RwLock): Plugin actions organized by category for UI
   - `Store<T>`: Generic JSON persistence with file locking, backup, and atomic writes
   - Profile locks: Use `acquire_locks()` (read) or `acquire_locks_mut()` (write) before accessing profiles
-- **Frontend**:
-  - Svelte stores (`propertyInspector.ts`): `inspectedInstance`, `copiedContext`, `openContextMenu` for UI state
-  - Tauri `invoke()` for backend calls - returns Promises with typed results
+- **UI hosts**:
+  - `riverdeck-egui`: native egui app; listens for `ui::UiEvent` broadcast hints and pulls state from core singletons
+  - `riverdeck-pi`: separate wry/tao process that hosts plugin Property Inspectors in an `<iframe>` and bridges messaging (`postMessage` ↔ IPC) for compatibility helpers
 - **Persistence**: JSON files in config dir (see `store/mod.rs`), with `.temp` and `.bak` for crash recovery
 
 ### Plugin Communication
@@ -134,7 +134,7 @@ Auto-switching: `application_watcher.rs` polls active window every 250ms, trigge
 ### External Dependencies
 
 - `elgato-streamdeck`: Async hardware communication via HID, image format conversion for different device types
-- (No Tauri dependencies remain)
+- (No Tauri dependency: core is UI-framework agnostic via `webview::WebviewHost`)
 - `tokio-tungstenite`: WebSocket server for plugin communication
 - `tiny_http`: Static file server for plugin assets (icons, property inspectors)
 - `image`: Image loading/manipulation, format conversion for device displays
@@ -166,4 +166,4 @@ Flatpak uses different paths with `~/.var/app/io.github.sulrwin.riverdeck/` pref
 - Run from terminal to see live logs: `cargo run -p riverdeck-egui`
 - Plugin logs: Check `<log_dir>/plugins/<uuid>.log` (stdout/stderr captured from plugin processes)
 - Debug logging: Uses Rust `log` crate (`log::debug!`)
-- Frontend: Tauri devtools accessible via right-click → "Inspect Element"
+- Property inspector debugging: devtools support depends on the platform WebView backend (`riverdeck-pi`). For layout/JS debugging you can also open the PI HTML via the local plugin webserver in a browser (note: it will not receive the host `postMessage` connect flow, so it may not connect to RiverDeck)

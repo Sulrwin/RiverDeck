@@ -4881,6 +4881,7 @@ dependencies = [
  "elgato-streamdeck",
  "fs2",
  "futures",
+ "getrandom 0.2.16",
  "image",
  "json-patch",
  "log",

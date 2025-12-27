@@ -42,6 +42,8 @@ pub struct ContextAndPayloadEvent<T, C = ActionContext> {
 #[serde(tag = "event")]
 #[serde(rename_all = "camelCase")]
 pub enum InboundEventType {
+    // RiverDeck extension: property inspector authentication handshake.
+    RiverdeckAuth { uuid: String, token: String },
     RegisterDevice(PayloadEvent<crate::shared::DeviceInfo>),
     DeregisterDevice(PayloadEvent<String>),
     RerenderImages(PayloadEvent<String>),
@@ -73,6 +75,20 @@ pub async fn process_incoming_message(data: Result<Message, Error>, uuid: &str, 
             Ok(event) => event,
             Err(_) => return,
         };
+
+        // Disallow plugins from faking hardware input events. These are host->plugin events and
+        // should only originate from RiverDeck itself.
+        if matches!(
+            decoded,
+            InboundEventType::KeyDown(_)
+                | InboundEventType::KeyUp(_)
+                | InboundEventType::EncoderChange(_)
+                | InboundEventType::EncoderDown(_)
+                | InboundEventType::EncoderUp(_)
+        ) && !(uuid.is_empty() && skip_auth)
+        {
+            return;
+        }
 
         if !(uuid.is_empty() && skip_auth) {
             if let Some(context) = match &decoded {
@@ -113,6 +129,7 @@ pub async fn process_incoming_message(data: Result<Message, Error>, uuid: &str, 
         }
 
         if let Err(error) = match decoded {
+            InboundEventType::RiverdeckAuth { .. } => Ok(()),
             InboundEventType::RegisterDevice(event) => devices::register_device(uuid, event).await,
             InboundEventType::DeregisterDevice(event) => {
                 devices::deregister_device(uuid, event).await
@@ -157,6 +174,22 @@ pub async fn process_incoming_message_pi(data: Result<Message, Error>, uuid: &st
             Ok(event) => event,
             Err(_) => return,
         };
+
+        // RiverDeck extension: authenticate the PI socket (best-effort, protects against other local users).
+        if let InboundEventType::RiverdeckAuth {
+            uuid: auth_uuid,
+            token,
+        } = &decoded
+        {
+            if auth_uuid == uuid && token == crate::plugins::property_inspector_token() {
+                super::set_property_inspector_authed(uuid, true).await;
+            }
+            return;
+        }
+
+        if !super::is_property_inspector_authed(uuid).await {
+            return;
+        }
 
         if let Some(context) = match &decoded {
             InboundEventType::SetSettings(event) => Some(event.context.to_string()),

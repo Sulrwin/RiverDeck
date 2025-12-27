@@ -48,6 +48,11 @@ where
 {
     /// Validate that a file contains valid data for type T
     fn validate_file_contents(path: &Path) -> Result<T, anyhow::Error> {
+        if let Ok(meta) = fs::symlink_metadata(path)
+            && meta.file_type().is_symlink()
+        {
+            return Err(anyhow::anyhow!("refusing to read symlinked store file"));
+        }
         let file_contents = fs::read(path)?;
         let value: T = T::from_value(serde_json::from_slice(&file_contents)?, path)?;
         Ok(value)
@@ -85,6 +90,26 @@ where
 
         let temp_path = self.path.with_extension("json.temp");
         let backup_path = self.path.with_extension("json.bak");
+
+        if let Ok(meta) = fs::symlink_metadata(&temp_path)
+            && meta.file_type().is_symlink()
+        {
+            return Err(anyhow::anyhow!("refusing to write to symlinked temp file"));
+        }
+        if let Ok(meta) = fs::symlink_metadata(&backup_path)
+            && meta.file_type().is_symlink()
+        {
+            return Err(anyhow::anyhow!(
+                "refusing to write to symlinked backup file"
+            ));
+        }
+        if let Ok(meta) = fs::symlink_metadata(&self.path)
+            && meta.file_type().is_symlink()
+        {
+            return Err(anyhow::anyhow!(
+                "refusing to overwrite symlinked store file"
+            ));
+        }
 
         // Write to temporary file
         let mut temp_file = fs::OpenOptions::new()

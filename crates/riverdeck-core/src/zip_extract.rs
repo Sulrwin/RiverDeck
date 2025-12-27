@@ -10,6 +10,11 @@ use std::{fs, io};
 
 use log::{debug, trace};
 
+const MAX_ARCHIVE_FILES: usize = 20_000;
+const MAX_TOTAL_UNCOMPRESSED_BYTES: u64 = 512 * 1024 * 1024; // 512 MiB
+const MAX_SINGLE_FILE_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
+const MAX_NESTED_ZIP_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
+
 #[derive(Debug)]
 #[allow(dead_code)]
 pub enum ZipExtractError {
@@ -39,6 +44,11 @@ pub fn dir_name<S: Read + Seek>(source: S) -> Result<String, ZipExtractError> {
     if archive.len() == 1 {
         let file = archive.by_index(0)?;
         if file.is_file() {
+            if file.size() > MAX_NESTED_ZIP_BYTES {
+                return Err(ZipExtractError::Zip(
+                    zip::result::ZipError::UnsupportedArchive("nested archive too large"),
+                ));
+            }
             return dir_name(Cursor::new(
                 BufReader::new(file).bytes().flatten().collect::<Vec<u8>>(),
             ));
@@ -64,8 +74,22 @@ pub fn dir_name<S: Read + Seek>(source: S) -> Result<String, ZipExtractError> {
 }
 
 pub fn extract<S: Read + Seek>(source: S, target_dir: &Path) -> Result<(), ZipExtractError> {
-    if !target_dir.exists() {
-        fs::create_dir(target_dir)?;
+    if target_dir.exists() {
+        let meta = fs::symlink_metadata(target_dir)?;
+        if meta.file_type().is_symlink() {
+            return Err(ZipExtractError::Io(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "target_dir is a symlink",
+            )));
+        }
+        if !meta.is_dir() {
+            return Err(ZipExtractError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "target_dir is not a directory",
+            )));
+        }
+    } else {
+        fs::create_dir_all(target_dir)?;
     }
 
     let mut archive = zip::ZipArchive::new(source)?;
@@ -73,6 +97,11 @@ pub fn extract<S: Read + Seek>(source: S, target_dir: &Path) -> Result<(), ZipEx
     if archive.len() == 1 {
         let file = archive.by_index(0)?;
         if file.is_file() {
+            if file.size() > MAX_NESTED_ZIP_BYTES {
+                return Err(ZipExtractError::Zip(
+                    zip::result::ZipError::UnsupportedArchive("nested archive too large"),
+                ));
+            }
             return extract(
                 Cursor::new(BufReader::new(file).bytes().flatten().collect::<Vec<u8>>()),
                 target_dir,
@@ -81,12 +110,32 @@ pub fn extract<S: Read + Seek>(source: S, target_dir: &Path) -> Result<(), ZipEx
     }
 
     debug!("Extracting to {}", target_dir.to_string_lossy());
+    if archive.len() > MAX_ARCHIVE_FILES {
+        return Err(ZipExtractError::Zip(
+            zip::result::ZipError::UnsupportedArchive("too many files in archive"),
+        ));
+    }
+    let mut total: u64 = 0;
     for i in 0..archive.len() {
         let mut file = archive.by_index(i)?;
         let relative_path = file.mangled_name();
 
         if relative_path.to_string_lossy().is_empty() {
             continue;
+        }
+
+        // Zip bomb defense: cap by uncompressed size.
+        let sz = file.size();
+        if sz > MAX_SINGLE_FILE_BYTES {
+            return Err(ZipExtractError::Zip(
+                zip::result::ZipError::UnsupportedArchive("file too large in archive"),
+            ));
+        }
+        total = total.saturating_add(sz);
+        if total > MAX_TOTAL_UNCOMPRESSED_BYTES {
+            return Err(ZipExtractError::Zip(
+                zip::result::ZipError::UnsupportedArchive("archive too large (total uncompressed)"),
+            ));
         }
 
         let mut outpath = target_dir.to_path_buf();

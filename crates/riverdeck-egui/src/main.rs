@@ -945,8 +945,9 @@ impl RiverDeckApp {
         });
 
         let origin = format!("http://localhost:{}", port_base + 2);
+        let pi_token = riverdeck_core::plugins::property_inspector_token();
         let pi_src = format!(
-            "{origin}/{}|riverdeck_property_inspector",
+            "{origin}/{}|riverdeck_property_inspector?riverdeck_token={pi_token}",
             instance.action.property_inspector
         );
         let label = format!("pi_{}", instance.context.to_string().replace('.', "_"));

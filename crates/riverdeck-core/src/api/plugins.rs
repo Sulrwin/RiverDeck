@@ -18,7 +18,11 @@ pub struct PluginInfo {
 pub async fn list_plugins() -> Result<Vec<PluginInfo>, anyhow::Error> {
     let mut plugins = vec![];
 
-    let mut entries = fs::read_dir(&config_dir().join("plugins")).await?;
+    let plugins_dir = config_dir().join("plugins");
+    let plugins_canon = tokio::fs::canonicalize(&plugins_dir)
+        .await
+        .unwrap_or(plugins_dir.clone());
+    let mut entries = fs::read_dir(&plugins_dir).await?;
     let registered = crate::events::registered_plugins().await;
 
     let builtins: Vec<String> = crate::shared::resource_dir()
@@ -33,9 +37,19 @@ pub async fn list_plugins() -> Result<Vec<PluginInfo>, anyhow::Error> {
         .unwrap_or_default();
 
     while let Some(entry) = entries.next_entry().await? {
-        let path = match entry.metadata().await?.is_symlink() {
-            true => fs::read_link(entry.path()).await?,
-            false => entry.path(),
+        let entry_path = entry.path();
+        let meta = tokio::fs::symlink_metadata(&entry_path).await?;
+        let path = if meta.file_type().is_symlink() {
+            let target = fs::read_link(&entry_path).await?;
+            let target_canon = tokio::fs::canonicalize(&target)
+                .await
+                .unwrap_or(target.clone());
+            if !target_canon.starts_with(&plugins_canon) {
+                continue;
+            }
+            target
+        } else {
+            entry_path
         };
         let metadata = fs::metadata(&path).await?;
         if metadata.is_dir() {
@@ -68,7 +82,12 @@ pub async fn install_plugin(
 ) -> Result<(), anyhow::Error> {
     let bytes = match file {
         None => {
-            let resp = reqwest::get(url.ok_or_else(|| anyhow::anyhow!("missing url"))?).await?;
+            let url = url.ok_or_else(|| anyhow::anyhow!("missing url"))?;
+            // Best-effort scheme restriction (avoid surprising `file://` style behavior).
+            if !(url.starts_with("https://") || url.starts_with("http://")) {
+                return Err(anyhow::anyhow!("unsupported url scheme"));
+            }
+            let resp = reqwest::get(url).await?;
             use std::ops::Deref;
             resp.bytes().await?.deref().to_owned()
         }
@@ -86,22 +105,82 @@ pub async fn install_plugin(
     let _ = crate::plugins::deactivate_plugin(&id).await;
 
     let config_dir = config_dir();
-    let actual = config_dir.join("plugins").join(&id);
+    let plugins_dir = config_dir.join("plugins");
+    let actual = plugins_dir.join(&id);
 
-    if actual.exists() {
-        let _ = fs::create_dir_all(config_dir.join("temp")).await;
-    }
-    let temp = config_dir.join("temp").join(&id);
-    let _ = fs::rename(&actual, &temp).await;
+    // Extract into an isolated temp directory, then atomically move the plugin folder into place.
+    // This reduces symlink/TOCTOU footguns and ensures we don't partially clobber an existing plugin.
+    let temp_root = config_dir.join("temp");
+    fs::create_dir_all(&temp_root).await?;
+    let extract_root = temp_root.join(format!(
+        "extract_{}_{}",
+        id.replace('/', "_"),
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&extract_root).await;
+    fs::create_dir_all(&extract_root).await?;
 
-    if let Err(error) =
-        crate::zip_extract::extract(std::io::Cursor::new(bytes), &config_dir.join("plugins"))
-    {
+    if let Err(error) = crate::zip_extract::extract(std::io::Cursor::new(bytes), &extract_root) {
         log::error!("Failed to unzip file: {}", error);
-        let _ = fs::rename(&temp, &actual).await;
-        let _ = crate::plugins::initialise_plugin(&actual).await;
+        let _ = fs::remove_dir_all(&extract_root).await;
         return Err(error.into());
     }
+
+    // Find the plugin directory within the extracted tree.
+    fn find_plugin_dir(
+        root: &std::path::Path,
+        name: &str,
+        depth: usize,
+    ) -> Option<std::path::PathBuf> {
+        if depth == 0 {
+            return None;
+        }
+        let entries = std::fs::read_dir(root).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let meta = std::fs::symlink_metadata(&path).ok()?;
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            if meta.is_dir() {
+                if path.file_name().and_then(|n| n.to_str()) == Some(name) {
+                    return Some(path);
+                }
+                if let Some(found) = find_plugin_dir(&path, name, depth - 1) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+
+    let extracted_plugin = find_plugin_dir(&extract_root, &id, 6)
+        .ok_or_else(|| anyhow::anyhow!("extracted archive did not contain {id}"))?;
+
+    // Backup existing plugin dir, if present.
+    let backup = temp_root.join(format!(
+        "backup_{}_{}",
+        id.replace('/', "_"),
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&backup).await;
+    if actual.exists() {
+        fs::rename(&actual, &backup).await?;
+    }
+
+    // Ensure target parent exists.
+    fs::create_dir_all(&plugins_dir).await?;
+    if let Err(e) = fs::rename(&extracted_plugin, &actual).await {
+        // Restore backup on failure.
+        let _ = fs::remove_dir_all(&actual).await;
+        if backup.exists() {
+            let _ = fs::rename(&backup, &actual).await;
+        }
+        let _ = fs::remove_dir_all(&extract_root).await;
+        return Err(e.into());
+    }
+
+    // Initialize and rollback if initialization fails.
     if let Err(error) = crate::plugins::initialise_plugin(&actual).await {
         log::warn!(
             "Failed to initialise plugin at {}: {}",
@@ -109,12 +188,16 @@ pub async fn install_plugin(
             error
         );
         let _ = fs::remove_dir_all(&actual).await;
-        let _ = fs::rename(&temp, &actual).await;
-        let _ = crate::plugins::initialise_plugin(&actual).await;
+        if backup.exists() {
+            let _ = fs::rename(&backup, &actual).await;
+            let _ = crate::plugins::initialise_plugin(&actual).await;
+        }
+        let _ = fs::remove_dir_all(&extract_root).await;
         return Err(error);
     }
-    let _ = fs::remove_dir_all(config_dir.join("temp")).await;
 
+    let _ = fs::remove_dir_all(&backup).await;
+    let _ = fs::remove_dir_all(&extract_root).await;
     Ok(())
 }
 

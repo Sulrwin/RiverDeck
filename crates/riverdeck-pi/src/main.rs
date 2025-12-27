@@ -275,7 +275,10 @@ fn handle_ipc(req: Request<String>, proxy: EventLoopProxy<PiEvent>) {
     };
     match req {
         IpcRequest::OpenUrl { url } => {
-            let _ = open::that_detached(url);
+            let u = url.trim();
+            if u.len() <= 2048 && (u.starts_with("http://") || u.starts_with("https://")) {
+                let _ = open::that_detached(u);
+            }
         }
         IpcRequest::Fetch {
             id,
@@ -286,6 +289,25 @@ fn handle_ipc(req: Request<String>, proxy: EventLoopProxy<PiEvent>) {
             body_base64,
         } => {
             std::thread::spawn(move || {
+                let url_trim = url.trim();
+                if !(url_trim.starts_with("http://") || url_trim.starts_with("https://")) {
+                    let js = format!(
+                        "window.postMessage({{event:'riverdeckFetchResponse',payload:{}}}, '*');",
+                        serde_json::to_string(&FetchResponsePayload {
+                            id,
+                            context: &context,
+                            url: &url,
+                            status: 400,
+                            status_text: "blocked url scheme".to_owned(),
+                            headers: vec![],
+                            body_base64: String::new(),
+                        })
+                        .unwrap_or_else(|_| "null".to_owned())
+                    );
+                    let _ = proxy.send_event(PiEvent::Eval(js));
+                    return;
+                }
+
                 let client = reqwest::blocking::Client::new();
                 let mut rb = client.request(
                     method
@@ -302,6 +324,10 @@ fn handle_ipc(req: Request<String>, proxy: EventLoopProxy<PiEvent>) {
                 if let Some(body) = body_base64
                     .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
                 {
+                    // Avoid huge request bodies from untrusted PIs.
+                    if body.len() > (2 * 1024 * 1024) {
+                        return;
+                    }
                     rb = rb.body(body);
                 }
 
@@ -317,6 +343,12 @@ fn handle_ipc(req: Request<String>, proxy: EventLoopProxy<PiEvent>) {
                             })
                             .collect::<Vec<_>>();
                         let bytes = resp.bytes().unwrap_or_default();
+                        // Cap response size to avoid base64-bombing the host process.
+                        let bytes = if bytes.len() > (5 * 1024 * 1024) {
+                            bytes.slice(..(5 * 1024 * 1024))
+                        } else {
+                            bytes
+                        };
                         FetchResponsePayload {
                             id,
                             context: &context,
