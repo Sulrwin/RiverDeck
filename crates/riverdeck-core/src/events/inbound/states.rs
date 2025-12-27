@@ -1,5 +1,6 @@
 use super::ContextAndPayloadEvent;
 
+use crate::shared::DEVICES;
 use crate::store::profiles::{acquire_locks_mut, get_instance_mut, save_profile};
 use crate::ui::{self, UiEvent};
 
@@ -27,8 +28,28 @@ pub async fn set_title(
     event: ContextAndPayloadEvent<SetTitlePayload>,
 ) -> Result<(), anyhow::Error> {
     let mut locks = acquire_locks_mut().await;
+    let active_profile = locks
+        .device_stores
+        .get_selected_profile(&event.context.device)
+        .ok()
+        .is_some_and(|p| p == event.context.profile);
+    let active_page = if active_profile {
+        locks
+            .profile_stores
+            .get_profile_store_mut(
+                &DEVICES.get(&event.context.device).unwrap(),
+                &event.context.profile,
+            )
+            .await?
+            .value
+            .selected_page
+            .clone()
+    } else {
+        String::new()
+    };
 
     if let Some(instance) = get_instance_mut(&event.context, &mut locks).await? {
+        let mut affects_visible = true;
         if let Some(state) = event.payload.state {
             let Some(slot) = instance.states.get_mut(state as usize) else {
                 // Avoid panicking on malformed/out-of-range state indices.
@@ -41,6 +62,7 @@ pub async fn set_title(
                 .map(|s| s.text.clone())
                 .unwrap_or_default();
             slot.text = event.payload.title.unwrap_or(fallback);
+            affects_visible = state == instance.current_state;
         } else {
             for (index, state) in instance.states.iter_mut().enumerate() {
                 state.text = event
@@ -53,6 +75,29 @@ pub async fn set_title(
         ui::emit(UiEvent::ActionStateChanged {
             context: instance.context.clone(),
         });
+
+        // Repaint hardware immediately so dynamic titles (e.g., System Vitals) show up even if the
+        // plugin doesn't call `setImage`.
+        let apply_active =
+            active_profile && active_page == instance.context.page && affects_visible;
+        if apply_active {
+            let img = instance
+                .states
+                .get(instance.current_state as usize)
+                .map(|s| s.image.trim())
+                .filter(|s| !s.is_empty() && *s != "actionDefaultImage")
+                .map(|s| s.to_owned())
+                .unwrap_or_else(|| instance.action.icon.clone());
+            let _ = crate::events::outbound::devices::update_image(
+                (&instance.context).into(),
+                if img.trim().is_empty() {
+                    None
+                } else {
+                    Some(img)
+                },
+            )
+            .await;
+        }
     }
     save_profile(&event.context.device, &mut locks).await?;
 

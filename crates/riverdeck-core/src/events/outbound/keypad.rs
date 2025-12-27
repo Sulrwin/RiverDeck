@@ -1,6 +1,6 @@
 use super::{GenericInstancePayload, send_to_plugin};
 
-use crate::shared::{ActionContext, Context};
+use crate::shared::{ActionContext, Context, DEVICES};
 use crate::store::profiles::{acquire_locks_mut, get_slot_mut, save_profile};
 use crate::ui::{self, UiEvent};
 
@@ -20,9 +20,17 @@ struct KeyEvent {
 pub async fn key_down(device: &str, key: u8) -> Result<(), anyhow::Error> {
     let mut locks = acquire_locks_mut().await;
     let selected_profile = locks.device_stores.get_selected_profile(device)?;
+    let page = locks
+        .profile_stores
+        .get_profile_store_mut(&DEVICES.get(device).unwrap(), &selected_profile)
+        .await?
+        .value
+        .selected_page
+        .clone();
     let context = Context {
         device: device.to_owned(),
         profile: selected_profile.to_owned(),
+        page,
         controller: "Keypad".to_owned(),
         position: key,
     };
@@ -119,9 +127,17 @@ pub async fn key_down(device: &str, key: u8) -> Result<(), anyhow::Error> {
 pub async fn key_up(device: &str, key: u8) -> Result<(), anyhow::Error> {
     let mut locks = acquire_locks_mut().await;
     let selected_profile = locks.device_stores.get_selected_profile(device)?;
+    let page = locks
+        .profile_stores
+        .get_profile_store_mut(&DEVICES.get(device).unwrap(), &selected_profile)
+        .await?
+        .value
+        .selected_page
+        .clone();
     let context = Context {
         device: device.to_owned(),
         profile: selected_profile.to_owned(),
+        page,
         controller: "Keypad".to_owned(),
         position: key,
     };

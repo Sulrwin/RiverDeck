@@ -1,12 +1,12 @@
 html {
-	--sdpi-bgcolor: #2d2d2d;
-	--sdpi-background: #3d3d3d;
-	--sdpi-color: #d8d8d8;
-	--sdpi-bordercolor: #3a3a3a;
-	--sdpi-buttonbordercolor: #969696;
-	--sdpi-borderradius: 0px;
+	--sdpi-bgcolor: #1f2022;
+	--sdpi-background: #2b2c2f;
+	--sdpi-color: #e6e6e6;
+	--sdpi-bordercolor: #3a3c40;
+	--sdpi-buttonbordercolor: #666a72;
+	--sdpi-borderradius: 10px;
 	--sdpi-width: 224px;
-	--sdpi-fontweight: 600;
+	--sdpi-fontweight: 550;
 	--sdpi-letterspacing: -0.25pt;
 	--sdpi-tab-color: #969696;
 	--sdpi-tab-left-margin: 1px;
@@ -27,9 +27,9 @@ html {
 html,
 body {
 	font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol";
-	font-size: 9pt;
+	font-size: 10pt;
 	background-color: var(--sdpi-bgcolor);
-	color: #9a9a9a;
+	color: var(--sdpi-color);
 }
 
 body {
@@ -292,7 +292,7 @@ input[type="file"]::-webkit-file-upload-button,
 button,
 select {
 	color: var(--sdpi-color);
-	border: 1pt solid #303030;
+	border: 1px solid rgba(255, 255, 255, 0.10);
 	font-size: 8pt;
 	background-color: var(--sdpi-background);
 	border-radius: var(--sdpi-borderradius);
@@ -453,6 +453,7 @@ table > caption {
 	-webkit-user-select: none;
 	line-height: normal;
 	margin-left: -1px;
+	color: rgba(230, 230, 230, 0.72);
 }
 
 .win .sdpi-item-label,

@@ -391,10 +391,54 @@ fn pi_host_html(args: &PiArgs) -> String {
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Property Inspector</title>
   <style>
-    html, body {{ margin:0; padding:0; width:100%; height:100%; overflow:hidden; }}
-    #container {{ position:relative; width:100%; height:100%; }}
-    #close {{ position:absolute; top:8px; right:8px; z-index:50; display:none; }}
-    iframe {{ width:100%; height:100%; border:0; }}
+    html, body {{
+      margin:0;
+      padding:0;
+      width:100%;
+      height:100%;
+      overflow:hidden;
+      background:#1f2022;
+      color:#e6e6e6;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    }}
+    #container {{
+      position:relative;
+      width:100%;
+      height:100%;
+      padding:10px;
+      box-sizing:border-box;
+    }}
+    #close {{
+      position:absolute;
+      top:14px;
+      right:14px;
+      z-index:50;
+      display:none;
+      width:30px;
+      height:30px;
+      border-radius:10px;
+      border:1px solid rgba(255,255,255,0.14);
+      background: rgba(255,255,255,0.06);
+      color:#f0f0f0;
+      cursor:pointer;
+      font-size:16px;
+      line-height:28px;
+      text-align:center;
+    }}
+    #close:hover {{
+      background: rgba(255,255,255,0.10);
+      border-color: rgba(255,255,255,0.20);
+    }}
+    #close:active {{
+      background: rgba(255,255,255,0.14);
+    }}
+    iframe {{
+      width:100%;
+      height:100%;
+      border:0;
+      border-radius:12px;
+      background:#2b2c2f;
+    }}
   </style>
 </head>
 <body>

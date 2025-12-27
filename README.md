@@ -1,5 +1,5 @@
 
-![Logo](.github/readme/RiverDeckLogoProper.jpeg)
+![Logo](.github/readme/logotrans2.png)
 
 Linux software for your Elgato Stream Deck
 

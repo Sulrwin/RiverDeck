@@ -15,6 +15,7 @@ dashmap = { version = "6.1", features = ["serde"] }
 directories = "6.0"
 elgato-streamdeck = { version = "0.12", default-features = false, features = ["async"] }
 fs2 = "0.4"
+font8x8 = "0.3"
 futures = "0.3"
 getrandom = "0.2"
 image = { version = "0.25", default-features = false, features = ["bmp", "jpeg", "png"] }

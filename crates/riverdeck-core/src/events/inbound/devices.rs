@@ -48,6 +48,12 @@ pub async fn register_device(
         let profile = locks
             .profile_stores
             .get_profile_store(&DEVICES.get(&event.payload.id).unwrap(), &selected_profile)?;
+        let page = profile
+            .value
+            .pages
+            .iter()
+            .find(|p| p.id == profile.value.selected_page)
+            .or_else(|| profile.value.pages.first());
 
         // Stream Deck+ LCD: apply the stored background before `willAppear` so per-dial images overlay it.
         if event.payload.screen.as_ref().is_some_and(|s| {
@@ -55,18 +61,19 @@ pub async fn register_device(
                 s.placement,
                 crate::shared::ScreenPlacement::BetweenKeypadAndEncoders
             )
-        }) && let Some(bg) = profile.value.encoder_screen_background.as_deref()
+        }) && let Some(bg) = page.and_then(|p| p.encoder_screen_background.as_deref())
         {
             let _ = crate::elgato::set_lcd_background(&event.payload.id, Some(bg)).await;
         }
-        for instance in profile
-            .value
-            .keys
-            .iter()
-            .flatten()
-            .chain(profile.value.sliders.iter().flatten())
-        {
-            let _ = crate::events::outbound::will_appear::will_appear(instance).await;
+        if let Some(page) = page {
+            for instance in page
+                .keys
+                .iter()
+                .flatten()
+                .chain(page.sliders.iter().flatten())
+            {
+                let _ = crate::events::outbound::will_appear::will_appear(instance).await;
+            }
         }
 
         Ok(())
@@ -100,14 +107,21 @@ pub async fn deregister_device(
         let profile = locks
             .profile_stores
             .get_profile_store(&DEVICES.get(&event.payload).unwrap(), &selected_profile)?;
-        for instance in profile
+        let page = profile
             .value
-            .keys
+            .pages
             .iter()
-            .flatten()
-            .chain(profile.value.sliders.iter().flatten())
-        {
-            let _ = crate::events::outbound::will_appear::will_disappear(instance, false).await;
+            .find(|p| p.id == profile.value.selected_page)
+            .or_else(|| profile.value.pages.first());
+        if let Some(page) = page {
+            for instance in page
+                .keys
+                .iter()
+                .flatten()
+                .chain(page.sliders.iter().flatten())
+            {
+                let _ = crate::events::outbound::will_appear::will_disappear(instance, false).await;
+            }
         }
 
         if let Ok(profiles) = get_device_profiles(&event.payload) {

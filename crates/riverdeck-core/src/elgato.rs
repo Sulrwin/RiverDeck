@@ -9,11 +9,235 @@ use elgato_streamdeck::{
     images::{ImageRect, convert_image_with_format_async},
     info::Kind,
 };
+use font8x8::UnicodeFonts;
+use image::{Rgba, RgbaImage};
 use once_cell::sync::Lazy;
 use tokio::sync::RwLock;
 
 static ELGATO_DEVICES: Lazy<RwLock<HashMap<String, AsyncStreamDeck>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
+
+fn blend_pixel(dst: &mut Rgba<u8>, src: Rgba<u8>) {
+    let sa = src[3] as f32 / 255.0;
+    if sa <= 0.0 {
+        return;
+    }
+    let da = dst[3] as f32 / 255.0;
+    let out_a = sa + da * (1.0 - sa);
+    if out_a <= 0.0 {
+        *dst = Rgba([0, 0, 0, 0]);
+        return;
+    }
+    let blend = |sc: u8, dc: u8| -> u8 {
+        let sc = sc as f32 / 255.0;
+        let dc = dc as f32 / 255.0;
+        let out_c = (sc * sa + dc * da * (1.0 - sa)) / out_a;
+        (out_c * 255.0).round().clamp(0.0, 255.0) as u8
+    };
+    dst[0] = blend(src[0], dst[0]);
+    dst[1] = blend(src[1], dst[1]);
+    dst[2] = blend(src[2], dst[2]);
+    dst[3] = (out_a * 255.0).round().clamp(0.0, 255.0) as u8;
+}
+
+fn draw_rect(img: &mut RgbaImage, x: u32, y: u32, w: u32, h: u32, color: Rgba<u8>) {
+    let iw = img.width();
+    let ih = img.height();
+    let x1 = (x + w).min(iw);
+    let y1 = (y + h).min(ih);
+    for yy in y..y1 {
+        for xx in x..x1 {
+            let p = img.get_pixel_mut(xx, yy);
+            blend_pixel(p, color);
+        }
+    }
+}
+
+fn draw_text_8x8(img: &mut RgbaImage, x: u32, y: u32, text: &str, scale: u32, color: Rgba<u8>) {
+    let scale = scale.max(1);
+    let mut cursor_x = x;
+    for ch in text.chars() {
+        if ch == '\n' {
+            break;
+        }
+        let glyph = font8x8::BASIC_FONTS.get(ch).unwrap_or([0u8; 8]);
+        for (row, bits) in glyph.iter().enumerate() {
+            for col in 0..8 {
+                if (bits >> col) & 1 == 1 {
+                    let px = cursor_x + (7 - col) as u32 * scale;
+                    let py = y + row as u32 * scale;
+                    for dy in 0..scale {
+                        for dx in 0..scale {
+                            if px + dx < img.width() && py + dy < img.height() {
+                                let p = img.get_pixel_mut(px + dx, py + dy);
+                                blend_pixel(p, color);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        cursor_x += 8 * scale + scale; // 1px spacing (scaled)
+    }
+}
+
+fn overlay_label(
+    base: image::DynamicImage,
+    label: &str,
+    placement: crate::shared::TextPlacement,
+) -> image::DynamicImage {
+    let label = label.trim();
+    if label.is_empty() {
+        return base;
+    }
+
+    let mut img = base.to_rgba8();
+    let (w, h) = (img.width(), img.height());
+    if w == 0 || h == 0 {
+        return image::DynamicImage::ImageRgba8(img);
+    }
+
+    // Choose a scale that stays readable across common Stream Deck sizes.
+    let min_side = w.min(h).max(1);
+    let scale = (min_side / 72).clamp(1, 3);
+
+    // Truncate to fit (horizontal).
+    let max_w = w.saturating_sub(8);
+    let char_w = 8 * scale + scale;
+    let mut text = label.to_owned();
+    if (text.chars().count() as u32) * char_w > max_w && char_w > 0 {
+        let max_chars = (max_w / char_w).saturating_sub(3) as usize;
+        if max_chars > 0 {
+            text = text.chars().take(max_chars).collect::<String>() + "...";
+        } else {
+            text = "...".to_owned();
+        }
+    }
+
+    let text_w = (text.chars().count() as u32) * char_w;
+    let text_h = 8 * scale;
+
+    let mut text_img = RgbaImage::new(text_w.max(1), text_h.max(1));
+    // Background strip for contrast.
+    let bg_w = text_img.width();
+    let bg_h = text_img.height();
+    draw_rect(&mut text_img, 0, 0, bg_w, bg_h, Rgba([0, 0, 0, 140]));
+    // Shadow + text.
+    draw_text_8x8(
+        &mut text_img,
+        scale,
+        scale,
+        &text,
+        scale,
+        Rgba([0, 0, 0, 220]),
+    );
+    draw_text_8x8(
+        &mut text_img,
+        0,
+        0,
+        &text,
+        scale,
+        Rgba([255, 255, 255, 255]),
+    );
+
+    let (overlay, ox, oy) = match placement {
+        crate::shared::TextPlacement::Top => {
+            let x = (w.saturating_sub(text_img.width())) / 2;
+            (text_img, x, 2)
+        }
+        crate::shared::TextPlacement::Bottom => {
+            let x = (w.saturating_sub(text_img.width())) / 2;
+            let y = h.saturating_sub(text_img.height() + 2);
+            (text_img, x, y)
+        }
+        crate::shared::TextPlacement::Left => {
+            let rot = image::imageops::rotate270(&text_img);
+            let y = (h.saturating_sub(rot.height())) / 2;
+            (rot, 2, y)
+        }
+        crate::shared::TextPlacement::Right => {
+            let rot = image::imageops::rotate90(&text_img);
+            let x = w.saturating_sub(rot.width() + 2);
+            let y = (h.saturating_sub(rot.height())) / 2;
+            (rot, x, y)
+        }
+    };
+
+    // Composite overlay.
+    for yy in 0..overlay.height() {
+        for xx in 0..overlay.width() {
+            let dst_x = ox + xx;
+            let dst_y = oy + yy;
+            if dst_x < w && dst_y < h {
+                let src = *overlay.get_pixel(xx, yy);
+                if src[3] != 0 {
+                    let dst = img.get_pixel_mut(dst_x, dst_y);
+                    blend_pixel(dst, src);
+                }
+            }
+        }
+    }
+
+    image::DynamicImage::ImageRgba8(img)
+}
+
+fn label_for_context_nonblocking(
+    context: &crate::shared::Context,
+) -> Option<Vec<(String, crate::shared::TextPlacement)>> {
+    // IMPORTANT: do not await on `PROFILE_STORES` here.
+    // `update_image()` is called from event handlers that may already hold profile locks; awaiting
+    // would deadlock. Best-effort: if locks are contended, skip the overlay.
+    let Ok(profile_stores) = crate::store::profiles::PROFILE_STORES.try_read() else {
+        return None;
+    };
+    let dev = crate::shared::DEVICES.get(&context.device)?.value().clone();
+    let store = profile_stores
+        .get_profile_store(&dev, &context.profile)
+        .ok()?;
+    let page = store.value.pages.iter().find(|p| p.id == context.page)?;
+
+    let slot: &Option<crate::shared::ActionInstance> = match context.controller.as_str() {
+        "Encoder" => page.sliders.get(context.position as usize)?,
+        _ => page.keys.get(context.position as usize)?,
+    };
+    let instance = slot.as_ref()?;
+    let st = instance.states.get(instance.current_state as usize)?;
+
+    let title = st.text.trim().to_owned();
+    let action_name = instance.action.name.trim().to_owned();
+    let show_title = st.show && !title.is_empty();
+    let show_action_name = st.show_action_name && !action_name.is_empty();
+
+    if !show_title && !show_action_name {
+        return None;
+    }
+
+    let mut overlays: Vec<(String, crate::shared::TextPlacement)> = Vec::new();
+
+    // Keep legacy behavior: the Stream Deck "Title" uses `text_placement`.
+    if show_title {
+        overlays.push((title.clone(), st.text_placement));
+    }
+
+    // If the title already equals the action name (common default), don't render both.
+    if show_action_name && (!show_title || title.trim() != action_name.trim()) {
+        let opposite = |p: crate::shared::TextPlacement| match p {
+            crate::shared::TextPlacement::Top => crate::shared::TextPlacement::Bottom,
+            crate::shared::TextPlacement::Bottom => crate::shared::TextPlacement::Top,
+            crate::shared::TextPlacement::Left => crate::shared::TextPlacement::Right,
+            crate::shared::TextPlacement::Right => crate::shared::TextPlacement::Left,
+        };
+        let placement = if show_title {
+            opposite(st.text_placement)
+        } else {
+            // If there's no title, keep the action name in the familiar place.
+            crate::shared::TextPlacement::Bottom
+        };
+        overlays.push((action_name, placement));
+    }
+
+    Some(overlays)
+}
 
 async fn load_dynamic_image(image: &str) -> Result<image::DynamicImage, anyhow::Error> {
     if image.trim().starts_with("data:") {
@@ -61,22 +285,36 @@ pub async fn update_image(
 ) -> Result<(), anyhow::Error> {
     if let Some(device) = ELGATO_DEVICES.read().await.get(&context.device) {
         if let Some(image) = image {
+            let overlays = label_for_context_nonblocking(context);
             let dyn_img = load_dynamic_image(image).await?;
 
             if context.controller == "Encoder" {
+                // For the encoder LCD, we draw icons at 72x72; overlay after resizing for sharper text.
+                let mut final_img = dyn_img.resize(72, 72, image::imageops::FilterType::Nearest);
+                if let Some(overlays) = overlays {
+                    for (label, placement) in overlays {
+                        if !label.trim().is_empty() {
+                            final_img = overlay_label(final_img, &label, placement);
+                        }
+                    }
+                }
                 device
                     .write_lcd(
                         (context.position as u16 * 200) + 64,
                         14,
-                        &ImageRect::from_image_async(dyn_img.resize(
-                            72,
-                            72,
-                            image::imageops::FilterType::Nearest,
-                        ))?,
+                        &ImageRect::from_image_async(final_img)?,
                     )
                     .await?;
             } else {
-                device.set_button_image(context.position, dyn_img).await?;
+                let mut final_img = dyn_img;
+                if let Some(overlays) = overlays {
+                    for (label, placement) in overlays {
+                        if !label.trim().is_empty() {
+                            final_img = overlay_label(final_img, &label, placement);
+                        }
+                    }
+                }
+                device.set_button_image(context.position, final_img).await?;
             }
         } else if context.controller == "Encoder" {
             device

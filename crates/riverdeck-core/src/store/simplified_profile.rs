@@ -1,6 +1,6 @@
 //! Duplicates of many structs to facilitate saving profiles to disk in a format that can be transferred between devices or systems.
 
-use crate::shared::{Action, ActionContext, ActionInstance, ActionState, Profile};
+use crate::shared::{Action, ActionContext, ActionInstance, ActionState, Page, Profile};
 
 use std::{
     fs,
@@ -53,10 +53,11 @@ impl From<ActionContext> for DiskActionContext {
 }
 
 impl DiskActionContext {
-    fn into_action_context(self, device: String, profile: String) -> ActionContext {
+    fn into_action_context(self, device: String, profile: String, page: String) -> ActionContext {
         ActionContext {
             device,
             profile,
+            page,
             controller: self.controller,
             position: self.position,
             index: self.index,
@@ -82,6 +83,7 @@ impl From<ActionInstance> for DiskActionInstance {
             .join("images")
             .join(&value.context.device)
             .join(&value.context.profile)
+            .join(&value.context.page)
             .join(disk_context.to_string());
 
         let normalise_path = |value: &str| -> String {
@@ -165,7 +167,7 @@ impl From<ActionInstance> for DiskActionInstance {
 }
 
 impl DiskActionInstance {
-    fn into_action_instance(self, path: &Path) -> ActionInstance {
+    fn into_action_instance(self, path: &Path, page: &str) -> ActionInstance {
         let config_dir = crate::shared::config_dir();
         let mut iter = path.strip_prefix(&config_dir).unwrap().iter();
         let device = iter.nth(1).unwrap().to_string_lossy().into_owned();
@@ -194,14 +196,27 @@ impl DiskActionInstance {
         for state in states.iter_mut() {
             crate::shared::normalize_starterpack_paths(&mut state.image);
             if let Some(true) = state.image.chars().next().map(|v| v.is_numeric()) {
-                state.image = config_dir
+                // New location: images/<device>/<profile>/<page>/<context>/<file>
+                // Legacy location: images/<device>/<profile>/<context>/<file>
+                let new_path = config_dir
+                    .join("images")
+                    .join(&device)
+                    .join(&profile)
+                    .join(page)
+                    .join(self.context.to_string())
+                    .join(&state.image);
+                let legacy_path = config_dir
                     .join("images")
                     .join(&device)
                     .join(&profile)
                     .join(self.context.to_string())
-                    .join(&state.image)
-                    .to_string_lossy()
-                    .into_owned();
+                    .join(&state.image);
+                let chosen = if new_path.is_file() {
+                    new_path
+                } else {
+                    legacy_path
+                };
+                state.image = chosen.to_string_lossy().into_owned();
             } else {
                 state.image = reconstruct_path(&state.image);
             }
@@ -221,14 +236,16 @@ impl DiskActionInstance {
         crate::shared::normalize_starterpack_action(&mut action.plugin, &mut action.uuid);
 
         ActionInstance {
-            context: self.context.into_action_context(device, profile),
+            context: self
+                .context
+                .into_action_context(device, profile, page.to_owned()),
             action,
             states,
             current_state: self.current_state,
             settings: self.settings,
             children: self.children.map(|c| {
                 c.into_iter()
-                    .map(|v| v.into_action_instance(path))
+                    .map(|v| v.into_action_instance(path, page))
                     .collect()
             }),
         }
@@ -236,15 +253,16 @@ impl DiskActionInstance {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct DiskProfile {
+pub struct DiskPage {
+    pub id: String,
     pub keys: Vec<Option<DiskActionInstance>>,
     pub sliders: Vec<Option<DiskActionInstance>>,
     #[serde(default)]
     pub encoder_screen_background: Option<String>,
 }
 
-impl From<&Profile> for DiskProfile {
-    fn from(value: &Profile) -> Self {
+impl From<&Page> for DiskPage {
+    fn from(value: &Page) -> Self {
         let config_dir = crate::shared::config_dir();
         let normalise_path = |value: &str| -> String {
             let path = Path::new(value);
@@ -259,6 +277,7 @@ impl From<&Profile> for DiskProfile {
         };
 
         Self {
+            id: value.id.clone(),
             keys: value
                 .keys
                 .clone()
@@ -279,17 +298,9 @@ impl From<&Profile> for DiskProfile {
     }
 }
 
-impl DiskProfile {
-    fn into_profile(self, path: &Path) -> Profile {
+impl DiskPage {
+    fn into_page(self, path: &Path) -> Page {
         let config_dir = crate::shared::config_dir();
-        let mut iter = path.strip_prefix(&config_dir).unwrap().iter();
-        let _ = iter.nth(1);
-        let mut id = iter
-            .map(|x| x.to_string_lossy())
-            .collect::<Vec<_>>()
-            .join("/");
-        id = id[..id.len() - 5].to_owned();
-
         let reconstruct_path = |value: &str| -> String {
             if !(value.is_empty()
                 || value.starts_with("data:")
@@ -305,17 +316,18 @@ impl DiskProfile {
             }
         };
 
-        Profile {
-            id,
+        let page_id = self.id.clone();
+        Page {
+            id: self.id,
             keys: self
                 .keys
                 .into_iter()
-                .map(|x| x.map(|v| v.into_action_instance(path)))
+                .map(|x| x.map(|v| v.into_action_instance(path, &page_id)))
                 .collect(),
             sliders: self
                 .sliders
                 .into_iter()
-                .map(|x| x.map(|v| v.into_action_instance(path)))
+                .map(|x| x.map(|v| v.into_action_instance(path, &page_id)))
                 .collect(),
             encoder_screen_background: self
                 .encoder_screen_background
@@ -327,11 +339,103 @@ impl DiskProfile {
 
 impl super::FromAndIntoDiskValue for Profile {
     fn into_value(&self) -> Result<serde_json::Value, serde_json::Error> {
-        let disk: DiskProfile = self.into();
+        let disk: DiskProfileV2 = self.into();
         serde_json::to_value(disk)
     }
     fn from_value(value: serde_json::Value, path: &Path) -> Result<Profile, serde_json::Error> {
-        let disk: DiskProfile = serde_json::from_value(value)?;
-        Ok(disk.into_profile(path))
+        // Prefer the new format, but accept the legacy single-page format for backwards compatibility.
+        if let Ok(disk) = serde_json::from_value::<DiskProfileV2>(value.clone()) {
+            Ok(disk.into_profile(path))
+        } else {
+            let legacy: DiskProfileLegacy = serde_json::from_value(value)?;
+            Ok(legacy.into_profile(path))
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct DiskProfileV2 {
+    #[serde(default)]
+    pub selected_page: Option<String>,
+    pub pages: Vec<DiskPage>,
+}
+
+impl From<&Profile> for DiskProfileV2 {
+    fn from(value: &Profile) -> Self {
+        Self {
+            selected_page: Some(value.selected_page.clone()),
+            pages: value.pages.iter().map(|p| p.into()).collect(),
+        }
+    }
+}
+
+impl DiskProfileV2 {
+    fn into_profile(self, path: &Path) -> Profile {
+        let config_dir = crate::shared::config_dir();
+        let mut iter = path.strip_prefix(&config_dir).unwrap().iter();
+        let _ = iter.nth(1);
+        let mut id = iter
+            .map(|x| x.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        id = id[..id.len() - 5].to_owned();
+
+        let mut pages: Vec<Page> = self.pages.into_iter().map(|p| p.into_page(path)).collect();
+        if pages.is_empty() {
+            pages.push(Page {
+                id: "1".to_owned(),
+                keys: vec![],
+                sliders: vec![],
+                encoder_screen_background: None,
+            });
+        }
+        let selected_page = self.selected_page.unwrap_or_else(|| "1".to_owned());
+
+        Profile {
+            id,
+            pages,
+            selected_page,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct DiskProfileLegacy {
+    pub keys: Vec<Option<DiskActionInstance>>,
+    pub sliders: Vec<Option<DiskActionInstance>>,
+    #[serde(default)]
+    pub encoder_screen_background: Option<String>,
+}
+
+impl DiskProfileLegacy {
+    fn into_profile(self, path: &Path) -> Profile {
+        let config_dir = crate::shared::config_dir();
+        let mut iter = path.strip_prefix(&config_dir).unwrap().iter();
+        let _ = iter.nth(1);
+        let mut id = iter
+            .map(|x| x.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        id = id[..id.len() - 5].to_owned();
+
+        let page_id = "1".to_owned();
+        Profile {
+            id,
+            selected_page: page_id.clone(),
+            pages: vec![Page {
+                id: page_id.clone(),
+                keys: self
+                    .keys
+                    .into_iter()
+                    .map(|x| x.map(|v| v.into_action_instance(path, &page_id)))
+                    .collect(),
+                sliders: self
+                    .sliders
+                    .into_iter()
+                    .map(|x| x.map(|v| v.into_action_instance(path, &page_id)))
+                    .collect(),
+                encoder_screen_background: self.encoder_screen_background,
+            }],
+        }
     }
 }

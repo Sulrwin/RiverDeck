@@ -149,6 +149,8 @@ pub struct Settings {
     pub darktheme: bool,
     pub background: bool,
     pub autolaunch: bool,
+    /// Placeholder toggle for future screensaver integration.
+    pub screensaver: bool,
     pub updatecheck: bool,
     pub statistics: bool,
     pub separatewine: bool,
@@ -165,6 +167,7 @@ impl Default for Settings {
             darktheme: true,
             background: !is_flatpak(),
             autolaunch: false,
+            screensaver: false,
             updatecheck: option_env!("RIVERDECK_DISABLE_UPDATE_CHECK").is_none() && !is_flatpak(),
             // RiverDeck does not enable telemetry by default.
             statistics: false,

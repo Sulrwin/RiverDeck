@@ -5,6 +5,15 @@ pub fn get_profiles(device: &str) -> Result<Vec<String>, anyhow::Error> {
     get_device_profiles(device)
 }
 
+fn selected_page(profile: &crate::shared::Profile) -> &crate::shared::Page {
+    profile
+        .pages
+        .iter()
+        .find(|p| p.id == profile.selected_page)
+        .or_else(|| profile.pages.first())
+        .expect("profile must have at least one page")
+}
+
 pub async fn create_profile(
     device: String,
     id: String,
@@ -71,18 +80,19 @@ pub async fn create_profile(
             }
         }
 
-        for slot in profile.keys.iter_mut().chain(profile.sliders.iter_mut()) {
-            if let Some(inst) = slot.as_mut() {
-                rewrite_instance(inst, &id, &old_images_dir, &new_images_dir);
+        for page in profile.pages.iter_mut() {
+            for slot in page.keys.iter_mut().chain(page.sliders.iter_mut()) {
+                if let Some(inst) = slot.as_mut() {
+                    rewrite_instance(inst, &id, &old_images_dir, &new_images_dir);
+                }
             }
-        }
-
-        if let Some(bg) = profile.encoder_screen_background.as_mut() {
-            let p = Path::new(bg.trim());
-            if p.starts_with(&old_images_dir)
-                && let Ok(rel) = p.strip_prefix(&old_images_dir)
-            {
-                *bg = new_images_dir.join(rel).to_string_lossy().into_owned();
+            if let Some(bg) = page.encoder_screen_background.as_mut() {
+                let p = Path::new(bg.trim());
+                if p.starts_with(&old_images_dir)
+                    && let Ok(rel) = p.strip_prefix(&old_images_dir)
+                {
+                    *bg = new_images_dir.join(rel).to_string_lossy().into_owned();
+                }
             }
         }
 
@@ -123,6 +133,27 @@ pub async fn set_encoder_screen_background(
         .get_profile_store_mut(&DEVICES.get(&device).unwrap(), &profile)
         .await?;
 
+    // Apply to the currently selected page of this profile.
+    if store.value.pages.is_empty() {
+        store.value.pages.push(crate::shared::Page {
+            id: "1".to_owned(),
+            keys: vec![],
+            sliders: vec![],
+            encoder_screen_background: None,
+        });
+    }
+    if store.value.selected_page.trim().is_empty() {
+        store.value.selected_page = "1".to_owned();
+    }
+    let page_id = store.value.selected_page.clone();
+    let idx = store
+        .value
+        .pages
+        .iter()
+        .position(|p| p.id == page_id)
+        .unwrap_or(0);
+    let page = &mut store.value.pages[idx];
+
     let new_value = if let Some(src) = source_path {
         let srcp = Path::new(src.trim());
         if !srcp.is_file() {
@@ -141,7 +172,8 @@ pub async fn set_encoder_screen_background(
         let dst_dir = crate::shared::config_dir()
             .join("images")
             .join(&device)
-            .join(&profile);
+            .join(&profile)
+            .join(&page_id);
         tokio::fs::create_dir_all(&dst_dir).await?;
         let dst = dst_dir.join(format!("encoder_screen_background.{ext}"));
         tokio::fs::copy(srcp, &dst).await?;
@@ -150,7 +182,7 @@ pub async fn set_encoder_screen_background(
         None
     };
 
-    store.value.encoder_screen_background = new_value.clone();
+    page.encoder_screen_background = new_value.clone();
     store.save()?;
 
     // If this profile is active, apply immediately to the device.
@@ -162,7 +194,7 @@ pub async fn set_encoder_screen_background(
     if active {
         let _ = crate::elgato::set_lcd_background(&device, new_value.as_deref()).await;
         // Re-apply encoder images on top of the background (Plus LCD).
-        for instance in store.value.sliders.iter().flatten() {
+        for instance in selected_page(&store.value).sliders.iter().flatten() {
             let img = instance
                 .states
                 .get(instance.current_state as usize)
@@ -195,11 +227,12 @@ pub async fn set_selected_profile(device: String, id: String) -> Result<(), anyh
             .profile_stores
             .get_profile_store(&DEVICES.get(&device).unwrap(), &selected_profile)?
             .value;
-        for instance in old_profile
+        let old_page = selected_page(old_profile);
+        for instance in old_page
             .keys
             .iter()
             .flatten()
-            .chain(old_profile.sliders.iter().flatten())
+            .chain(old_page.sliders.iter().flatten())
         {
             if !(crate::shared::is_multi_action_uuid(instance.action.uuid.as_str())
                 || crate::shared::is_toggle_action_uuid(instance.action.uuid.as_str()))
@@ -221,17 +254,18 @@ pub async fn set_selected_profile(device: String, id: String) -> Result<(), anyh
         .get_profile_store_mut(&DEVICES.get(&device).unwrap(), &id)
         .await?;
     let new_profile = &store.value;
+    let new_page = selected_page(new_profile);
 
     // If this profile has an encoder LCD background (Stream Deck+), apply it before `willAppear`
     // so per-dial images render on top.
-    if let Some(bg) = new_profile.encoder_screen_background.as_deref() {
+    if let Some(bg) = new_page.encoder_screen_background.as_deref() {
         let _ = crate::elgato::set_lcd_background(&device, Some(bg)).await;
     }
-    for instance in new_profile
+    for instance in new_page
         .keys
         .iter()
         .flatten()
-        .chain(new_profile.sliders.iter().flatten())
+        .chain(new_page.sliders.iter().flatten())
     {
         if !(crate::shared::is_multi_action_uuid(instance.action.uuid.as_str())
             || crate::shared::is_toggle_action_uuid(instance.action.uuid.as_str()))

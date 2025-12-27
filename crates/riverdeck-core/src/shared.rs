@@ -248,10 +248,18 @@ pub struct ActionState {
     pub text: String,
     #[serde(alias = "ShowTitle")]
     pub show: bool,
+    /// Whether the action's display name should be rendered as an additional label on the button.
+    ///
+    /// This is a RiverDeck extension (not part of the Stream Deck manifest schema).
+    #[serde(default = "default_true")]
+    pub show_action_name: bool,
     #[serde(alias = "TitleColor")]
     pub colour: String,
     #[serde(alias = "TitleAlignment")]
     pub alignment: String,
+    /// Where the label text is placed on the button image.
+    #[serde(default)]
+    pub text_placement: TextPlacement,
     #[serde(alias = "FontFamily")]
     pub family: String,
     #[serde(alias = "FontStyle")]
@@ -262,6 +270,10 @@ pub struct ActionState {
     pub underline: bool,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 impl Default for ActionState {
     fn default() -> Self {
         Self {
@@ -269,14 +281,26 @@ impl Default for ActionState {
             name: String::new(),
             text: String::new(),
             show: true,
+            show_action_name: true,
             colour: "#FFFFFF".to_owned(),
             alignment: "middle".to_owned(),
+            text_placement: TextPlacement::Bottom,
             family: "Liberation Sans".to_owned(),
             style: "Regular".to_owned(),
             size: FontSize(16),
             underline: false,
         }
     }
+}
+
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TextPlacement {
+    Top,
+    #[default]
+    Bottom,
+    Left,
+    Right,
 }
 
 #[serde_inline_default]
@@ -336,6 +360,8 @@ pub struct Action {
 pub struct Context {
     pub device: String,
     pub profile: String,
+    /// Stable page id within the selected profile (e.g. "1", "2", ...).
+    pub page: String,
     pub controller: String,
     pub position: u8,
 }
@@ -347,6 +373,8 @@ pub struct Context {
 pub struct ActionContext {
     pub device: String,
     pub profile: String,
+    /// Stable page id within the selected profile (e.g. "1", "2", ...).
+    pub page: String,
     pub controller: String,
     pub position: u8,
     pub index: u16,
@@ -356,8 +384,8 @@ impl std::fmt::Display for ActionContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{}.{}.{}.{}.{}",
-            self.device, self.profile, self.controller, self.position, self.index
+            "{}.{}.{}.{}.{}.{}",
+            self.device, self.profile, self.page, self.controller, self.position, self.index
         )
     }
 }
@@ -366,17 +394,32 @@ impl std::str::FromStr for ActionContext {
     type Err = anyhow::Error;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let segments: Vec<&str> = s.split('.').collect();
+        // New format: device.profile.page.controller.position.index
+        // Legacy format: device.profile.controller.position.index (page implied to be "1")
         if segments.len() < 5 {
             return Err(anyhow::anyhow!("not enough segments"));
         }
         let device = segments[0].to_owned();
         let profile = segments[1].to_owned();
-        let controller = segments[2].to_owned();
-        let position = u8::from_str(segments[3])?;
-        let index = u16::from_str(segments[4])?;
+        let (page, controller, position, index) = if segments.len() >= 6 {
+            (
+                segments[2].to_owned(),
+                segments[3].to_owned(),
+                u8::from_str(segments[4])?,
+                u16::from_str(segments[5])?,
+            )
+        } else {
+            (
+                "1".to_owned(),
+                segments[2].to_owned(),
+                u8::from_str(segments[3])?,
+                u16::from_str(segments[4])?,
+            )
+        };
         Ok(Self {
             device,
             profile,
+            page,
             controller,
             position,
             index,
@@ -389,6 +432,7 @@ impl ActionContext {
         Self {
             device: context.device,
             profile: context.profile,
+            page: context.page,
             controller: context.controller,
             position: context.position,
             index,
@@ -401,6 +445,7 @@ impl From<ActionContext> for Context {
         Self {
             device: value.device,
             profile: value.profile,
+            page: value.page,
             controller: value.controller,
             position: value.position,
         }
@@ -425,12 +470,24 @@ pub struct ActionInstance {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-pub struct Profile {
+pub struct Page {
     pub id: String,
     pub keys: Vec<Option<ActionInstance>>,
     pub sliders: Vec<Option<ActionInstance>>,
     #[serde(default)]
     pub encoder_screen_background: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Profile {
+    pub id: String,
+    pub pages: Vec<Page>,
+    #[serde(default = "default_selected_page")]
+    pub selected_page: String,
+}
+
+fn default_selected_page() -> String {
+    "1".to_owned()
 }
 
 /// A map of category names to a list of actions in that category.

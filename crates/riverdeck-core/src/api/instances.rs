@@ -1,4 +1,6 @@
-use crate::shared::{Action, ActionContext, ActionInstance, Context, config_dir};
+use crate::shared::{
+    Action, ActionContext, ActionInstance, ActionState, Context, DEVICES, TextPlacement, config_dir,
+};
 use crate::store::profiles::{acquire_locks_mut, get_slot_mut, save_profile};
 use crate::ui::{self, UiEvent};
 
@@ -19,6 +21,15 @@ pub async fn create_instance(
     let mut locks = acquire_locks_mut().await;
     let slot = get_slot_mut(&context, &mut locks).await?;
 
+    let init_states = |mut states: Vec<ActionState>| -> Vec<ActionState> {
+        for st in states.iter_mut() {
+            if st.text.trim().is_empty() {
+                st.text = action.name.clone();
+            }
+        }
+        states
+    };
+
     if let Some(parent) = slot {
         let Some(children) = &mut parent.children else {
             return Ok(None);
@@ -31,7 +42,7 @@ pub async fn create_instance(
         let instance = ActionInstance {
             action: action.clone(),
             context: ActionContext::from_context(context.clone(), index),
-            states: action.states.clone(),
+            states: init_states(action.states.clone()),
             current_state: 0,
             settings: serde_json::Value::Object(serde_json::Map::new()),
             children: None,
@@ -58,7 +69,7 @@ pub async fn create_instance(
         let instance = ActionInstance {
             action: action.clone(),
             context: ActionContext::from_context(context.clone(), 0),
-            states: action.states.clone(),
+            states: init_states(action.states.clone()),
             current_state: 0,
             settings: serde_json::Value::Object(serde_json::Map::new()),
             children: if crate::shared::is_multi_action_uuid(action.uuid.as_str())
@@ -80,11 +91,249 @@ pub async fn create_instance(
     }
 }
 
+pub async fn set_button_label(context: ActionContext, label: String) -> Result<(), anyhow::Error> {
+    let mut locks = acquire_locks_mut().await;
+    let active_profile = locks
+        .device_stores
+        .get_selected_profile(&context.device)
+        .ok()
+        .is_some_and(|p| p == context.profile);
+    let active_page = if active_profile {
+        locks
+            .profile_stores
+            .get_profile_store_mut(&DEVICES.get(&context.device).unwrap(), &context.profile)
+            .await?
+            .value
+            .selected_page
+            .clone()
+    } else {
+        String::new()
+    };
+    let Some(instance) = crate::store::profiles::get_instance_mut(&context, &mut locks).await?
+    else {
+        return Ok(());
+    };
+    let (apply_ctx, apply_img, apply_active) = {
+        for st in instance.states.iter_mut() {
+            st.text = label.clone();
+        }
+        ui::emit(UiEvent::ActionStateChanged {
+            context: instance.context.clone(),
+        });
+        let img = instance
+            .states
+            .get(instance.current_state as usize)
+            .map(|s| s.image.trim())
+            .filter(|s| !s.is_empty() && *s != "actionDefaultImage")
+            .map(|s| s.to_owned())
+            .unwrap_or_else(|| instance.action.icon.clone());
+        (
+            instance.context.clone(),
+            img,
+            active_profile && active_page == instance.context.page,
+        )
+    };
+    save_profile(&context.device, &mut locks).await?;
+    if apply_active {
+        let _ = crate::events::outbound::devices::update_image(
+            (&apply_ctx).into(),
+            if apply_img.trim().is_empty() {
+                None
+            } else {
+                Some(apply_img)
+            },
+        )
+        .await;
+    }
+    Ok(())
+}
+
+pub async fn set_button_label_placement(
+    context: ActionContext,
+    placement: TextPlacement,
+) -> Result<(), anyhow::Error> {
+    let mut locks = acquire_locks_mut().await;
+    let active_profile = locks
+        .device_stores
+        .get_selected_profile(&context.device)
+        .ok()
+        .is_some_and(|p| p == context.profile);
+    let active_page = if active_profile {
+        locks
+            .profile_stores
+            .get_profile_store_mut(&DEVICES.get(&context.device).unwrap(), &context.profile)
+            .await?
+            .value
+            .selected_page
+            .clone()
+    } else {
+        String::new()
+    };
+    let Some(instance) = crate::store::profiles::get_instance_mut(&context, &mut locks).await?
+    else {
+        return Ok(());
+    };
+    let (apply_ctx, apply_img, apply_active) = {
+        for st in instance.states.iter_mut() {
+            st.text_placement = placement;
+        }
+        ui::emit(UiEvent::ActionStateChanged {
+            context: instance.context.clone(),
+        });
+        let img = instance
+            .states
+            .get(instance.current_state as usize)
+            .map(|s| s.image.trim())
+            .filter(|s| !s.is_empty() && *s != "actionDefaultImage")
+            .map(|s| s.to_owned())
+            .unwrap_or_else(|| instance.action.icon.clone());
+        (
+            instance.context.clone(),
+            img,
+            active_profile && active_page == instance.context.page,
+        )
+    };
+    save_profile(&context.device, &mut locks).await?;
+    if apply_active {
+        let _ = crate::events::outbound::devices::update_image(
+            (&apply_ctx).into(),
+            if apply_img.trim().is_empty() {
+                None
+            } else {
+                Some(apply_img)
+            },
+        )
+        .await;
+    }
+    Ok(())
+}
+
+pub async fn set_button_show_title(
+    context: ActionContext,
+    show_title: bool,
+) -> Result<(), anyhow::Error> {
+    let mut locks = acquire_locks_mut().await;
+    let active_profile = locks
+        .device_stores
+        .get_selected_profile(&context.device)
+        .ok()
+        .is_some_and(|p| p == context.profile);
+    let active_page = if active_profile {
+        locks
+            .profile_stores
+            .get_profile_store_mut(&DEVICES.get(&context.device).unwrap(), &context.profile)
+            .await?
+            .value
+            .selected_page
+            .clone()
+    } else {
+        String::new()
+    };
+    let Some(instance) = crate::store::profiles::get_instance_mut(&context, &mut locks).await?
+    else {
+        return Ok(());
+    };
+    let (apply_ctx, apply_img, apply_active) = {
+        for st in instance.states.iter_mut() {
+            st.show = show_title;
+        }
+        ui::emit(UiEvent::ActionStateChanged {
+            context: instance.context.clone(),
+        });
+        let img = instance
+            .states
+            .get(instance.current_state as usize)
+            .map(|s| s.image.trim())
+            .filter(|s| !s.is_empty() && *s != "actionDefaultImage")
+            .map(|s| s.to_owned())
+            .unwrap_or_else(|| instance.action.icon.clone());
+        (
+            instance.context.clone(),
+            img,
+            active_profile && active_page == instance.context.page,
+        )
+    };
+    save_profile(&context.device, &mut locks).await?;
+    if apply_active {
+        let _ = crate::events::outbound::devices::update_image(
+            (&apply_ctx).into(),
+            if apply_img.trim().is_empty() {
+                None
+            } else {
+                Some(apply_img)
+            },
+        )
+        .await;
+    }
+    Ok(())
+}
+
+pub async fn set_button_show_action_name(
+    context: ActionContext,
+    show_action_name: bool,
+) -> Result<(), anyhow::Error> {
+    let mut locks = acquire_locks_mut().await;
+    let active_profile = locks
+        .device_stores
+        .get_selected_profile(&context.device)
+        .ok()
+        .is_some_and(|p| p == context.profile);
+    let active_page = if active_profile {
+        locks
+            .profile_stores
+            .get_profile_store_mut(&DEVICES.get(&context.device).unwrap(), &context.profile)
+            .await?
+            .value
+            .selected_page
+            .clone()
+    } else {
+        String::new()
+    };
+    let Some(instance) = crate::store::profiles::get_instance_mut(&context, &mut locks).await?
+    else {
+        return Ok(());
+    };
+    let (apply_ctx, apply_img, apply_active) = {
+        for st in instance.states.iter_mut() {
+            st.show_action_name = show_action_name;
+        }
+        ui::emit(UiEvent::ActionStateChanged {
+            context: instance.context.clone(),
+        });
+        let img = instance
+            .states
+            .get(instance.current_state as usize)
+            .map(|s| s.image.trim())
+            .filter(|s| !s.is_empty() && *s != "actionDefaultImage")
+            .map(|s| s.to_owned())
+            .unwrap_or_else(|| instance.action.icon.clone());
+        (
+            instance.context.clone(),
+            img,
+            active_profile && active_page == instance.context.page,
+        )
+    };
+    save_profile(&context.device, &mut locks).await?;
+    if apply_active {
+        let _ = crate::events::outbound::devices::update_image(
+            (&apply_ctx).into(),
+            if apply_img.trim().is_empty() {
+                None
+            } else {
+                Some(apply_img)
+            },
+        )
+        .await;
+    }
+    Ok(())
+}
+
 fn instance_images_dir(context: &ActionContext) -> std::path::PathBuf {
     config_dir()
         .join("images")
         .join(&context.device)
         .join(&context.profile)
+        .join(&context.page)
         .join(format!(
             "{}.{}.{}",
             context.controller, context.position, context.index

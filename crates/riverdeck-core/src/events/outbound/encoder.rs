@@ -1,6 +1,6 @@
 use super::{Coordinates, send_to_plugin};
 
-use crate::shared::ActionContext;
+use crate::shared::{ActionContext, DEVICES};
 use crate::store::profiles::{acquire_locks_mut, get_instance_mut};
 use crate::ui::{self, UiEvent};
 
@@ -26,9 +26,17 @@ struct DialRotateEvent {
 pub async fn dial_rotate(device: &str, index: u8, ticks: i16) -> Result<(), anyhow::Error> {
     let mut locks = acquire_locks_mut().await;
     let selected_profile = locks.device_stores.get_selected_profile(device)?;
+    let page = locks
+        .profile_stores
+        .get_profile_store_mut(&DEVICES.get(device).unwrap(), &selected_profile)
+        .await?
+        .value
+        .selected_page
+        .clone();
     let context = ActionContext {
         device: device.to_owned(),
         profile: selected_profile.to_owned(),
+        page,
         controller: "Encoder".to_owned(),
         position: index,
         index: 0,
@@ -77,9 +85,17 @@ struct DialPressEvent {
 pub async fn dial_press(device: &str, event: &'static str, index: u8) -> Result<(), anyhow::Error> {
     let mut locks = acquire_locks_mut().await;
     let selected_profile = locks.device_stores.get_selected_profile(device)?;
+    let page = locks
+        .profile_stores
+        .get_profile_store_mut(&DEVICES.get(device).unwrap(), &selected_profile)
+        .await?
+        .value
+        .selected_page
+        .clone();
     let context = ActionContext {
         device: device.to_owned(),
         profile: selected_profile.to_owned(),
+        page,
         controller: "Encoder".to_owned(),
         position: index,
         index: 0,

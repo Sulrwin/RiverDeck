@@ -1,4 +1,5 @@
 pub mod instances;
+pub mod pages;
 pub mod plugins;
 pub mod profiles;
 pub mod property_inspector;
