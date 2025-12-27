@@ -91,14 +91,22 @@ To change other options, open Settings. From here, you can also view information
 > [!TIP]
 > The development guide for agents present in [AGENTS.md](AGENTS.md) also serves as a useful introduction to the codebase for humans.
 
-You'll need to ensure that all of the [prerequisites for building a Tauri application](https://tauri.app/start/prerequisites) are satisfied to build RiverDeck, as well as making sure that [Deno](https://deno.com/) is installed. On Linux, you'll also need `libudev` installed for your distribution. After running `deno install`, you can use `deno task tauri dev` and `deno task tauri build` to work with RiverDeck.
+RiverDeck's main UI is being migrated to a native Rust/egui frontend. To build/run the new UI you just need a Rust toolchain (and on Linux, `libudev` for Stream Deck access, plus WebKitGTK deps for the `riverdeck-pi` webview helper).
+
+- Run the egui app: `cargo run -p riverdeck-egui`
+- Build binaries: `cargo build -p riverdeck-egui -p riverdeck-pi`
+
+On Linux, the default `riverdeck-egui` build enables tray support, which requires the system library **`libxdo`**:
+- Arch: `sudo pacman -S --needed xdotool`
+- Debian/Ubuntu: `sudo apt-get install -y libxdo-dev`
+- Or disable tray support: `cargo build -p riverdeck-egui --no-default-features`
+
+The older Tauri/Svelte UI under `src-tauri/` is considered legacy during the transition.
 
 Before each commit, please ensure that all of the following are completed:
 1. Rust code has been linted using `cargo clippy` and it discovers no violations
 2. Rust code has been formatted using `cargo fmt`
-3. TypeScript code has been checked using `deno check` and linted using `deno lint` and they discover no violations
-4. Svelte code has been linted using `deno task check` and it discovers no violations
-5. Frontend code has been formatted using `deno fmt --unstable-component`
+3. (Legacy UI only) TypeScript/Svelte code has been checked/linted/formatted (if you touched `src/`)
 
 When submitting contributions, please adhere to the [Conventional Commits specification](https://conventionalcommits.org/) for commit messages. You will also need to [sign your commits](https://docs.github.com/en/authentication/managing-commit-signature-verification/signing-commits). Feel free to reach out on the support channels above for guidance when contributing!
 

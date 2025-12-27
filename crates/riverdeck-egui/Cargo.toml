@@ -1,0 +1,34 @@
+[package]
+name = "riverdeck-egui"
+version = "2.7.1"
+edition = "2024"
+license = "GPL-3.0-or-later"
+
+[features]
+# Tray support is enabled by default, but it depends on platform system libraries on Linux
+# (notably `libxdo`, provided by `xdotool` / `libxdo-dev`).
+default = ["tray"]
+tray = ["dep:tray-icon", "dep:image"]
+
+[dependencies]
+anyhow = "1.0"
+auto-launch = "0.5"
+eframe = "0.31"
+egui = "0.31"
+env_logger = "0.11"
+fs2 = "0.4"
+image = { version = "0.25", default-features = false, features = ["png"], optional = true }
+log = "0.4"
+reqwest = { version = "0.12", features = ["json"] }
+riverdeck-core = { path = "../riverdeck-core" }
+semver = "1.0"
+serde_json = "1.0"
+tokio = { version = "1.48", features = ["full"] }
+tray-icon = { version = "0.21", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# `tray-icon`'s Linux backend uses GTK; we call `gtk::init()` (see `src/main.rs`) to avoid
+# runtime panics when constructing menus before GTK has been initialized.
+gtk = "0.18"
+
+

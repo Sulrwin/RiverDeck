@@ -1,0 +1,10 @@
+[workspace]
+members = [
+	"crates/riverdeck-core",
+	"crates/riverdeck-egui",
+	"crates/riverdeck-pi",
+	"plugins/com.amansprojects.starterpack.sdPlugin",
+]
+resolver = "3"
+
+

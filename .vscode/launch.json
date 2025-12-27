@@ -4,6 +4,46 @@
 		{
 			"type": "lldb",
 			"request": "launch",
+			"name": "Debug (egui)",
+			"cargo": {
+				"args": [
+					"run",
+					"-p",
+					"riverdeck-egui"
+				]
+			}
+		},
+		{
+			"type": "lldb",
+			"request": "launch",
+			"name": "Debug (pi helper)",
+			"cargo": {
+				"args": [
+					"run",
+					"-p",
+					"riverdeck-pi"
+				]
+			},
+			"args": [
+				"--label",
+				"riverdeck_pi_debug",
+				"--pi-src",
+				"http://localhost:57118/index.html|riverdeck_property_inspector",
+				"--origin",
+				"http://localhost:57118",
+				"--ws-port",
+				"57116",
+				"--context",
+				"dev.Default.Keypad.0.0",
+				"--info-json",
+				"{}",
+				"--connect-json",
+				"{}"
+			]
+		},
+		{
+			"type": "lldb",
+			"request": "launch",
 			"name": "Debug (debug)",
 			"cargo": {
 				"args": [

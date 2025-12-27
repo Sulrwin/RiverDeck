@@ -66,9 +66,10 @@ async fn run_command(
 	reader.read_to_string(&mut output)?;
 
 	if let Some(path) = settings.get("file").map(|v| v.as_str().unwrap())
-		&& !path.is_empty() {
-			tokio::fs::write(path, &output).await?;
-		}
+		&& !path.is_empty()
+	{
+		tokio::fs::write(path, &output).await?;
+	}
 
 	if settings
 		.get("show")
