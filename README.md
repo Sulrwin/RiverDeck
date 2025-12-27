@@ -1,9 +1,18 @@
-# RiverDeck
 
-Linux software for your Elgato Stream Deck
+<p align="center">
+  <img src=".github/readme/logotrans2.png" alt="RiverDeck logo" />
+</p>
 
-![Main menu](.github/readme/mainmenu.png)
-[More screenshots](#showcase)
+---
+
+<p align="center">
+  <strong>Linux software for your Elgato Stream Deck</strong>
+</p>
+
+<p align="center">
+  <img src=".github/readme/mainmenu-plugins-profiles.png" alt="Main menu" /><br>
+  <a href="#showcase">More screenshots</a>
+</p>
 
 RiverDeck is a desktop application for using stream controller devices like the Elgato Stream Deck on Linux, Windows, and macOS. RiverDeck supports plugins made for the original Stream Deck SDK, allowing many plugins made for the Elgato software ecosystem to be used, or the [OpenAction](https://openaction.amankhanna.me/) API.
 
@@ -11,7 +20,7 @@ Only Elgato hardware is officially supported, but plugins are available for supp
 
 RiverDeck is made by Ethan Wright (`sulrwin`) and is forked from OpenDeck. Thanks to OpenDeck and its contributors for the original work.
 
-Special thanks go to the developers of [Tauri](https://github.com/tauri-apps/tauri), the [elgato-streamdeck](https://github.com/OpenActionAPI/rust-elgato-streamdeck) Rust library, [Wine](https://www.winehq.org/), and [Phosphor Icons](https://phosphoricons.com/).
+Special thanks go to the developers of the [elgato-streamdeck](https://github.com/OpenActionAPI/rust-elgato-streamdeck) Rust library, [Wine](https://www.winehq.org/), and [Phosphor Icons](https://phosphoricons.com/).
 
 ### Why use RiverDeck?
 
@@ -19,7 +28,7 @@ Special thanks go to the developers of [Tauri](https://github.com/tauri-apps/tau
 - **Cross-platform**: RiverDeck supports Linux alongside Windows and macOS. macOS users also benefit from switching from the first-party Elgato software as RiverDeck can run plugins only built for Windows on Linux and macOS thanks to Wine. Additionally, profile files are easily moveable between platforms with no changes to them necessary.
 - **Feature-packed**: From Multi Actions and Toggle Actions to switching profiles when you switch apps and brightness control, RiverDeck has all the features you'd expect from stream controller software.
 - **Open source**: RiverDeck source code is licensed under the GNU General Public License, allowing anyone to view it and improve it for feature, stability, privacy or security reasons.
-- **Written in Rust**: The Rust programming language, which RiverDeck is built with alongside TypeScript, is known for its performance, safety and resulting code quality.
+- **Written in Rust**: RiverDeck is built in Rust for performance and safety. (Some built-in plugin build scripts are written in TypeScript and run via Deno.)
 
 ## Installation
 
@@ -91,14 +100,21 @@ To change other options, open Settings. From here, you can also view information
 > [!TIP]
 > The development guide for agents present in [AGENTS.md](AGENTS.md) also serves as a useful introduction to the codebase for humans.
 
-You'll need to ensure that all of the [prerequisites for building a Tauri application](https://tauri.app/start/prerequisites) are satisfied to build RiverDeck, as well as making sure that [Deno](https://deno.com/) is installed. On Linux, you'll also need `libudev` installed for your distribution. After running `deno install`, you can use `deno task tauri dev` and `deno task tauri build` to work with RiverDeck.
+RiverDeck's UI is a native Rust/egui application. To build/run it you just need a Rust toolchain (and on Linux, `libudev` for Stream Deck access, plus WebKitGTK deps for the `riverdeck-pi` webview helper).
+
+- Run the egui app: `cargo run -p riverdeck-egui`
+- Build binaries: `cargo build -p riverdeck-egui -p riverdeck-pi`
+
+On Linux, the default `riverdeck-egui` build enables tray support, which requires the system library **`libxdo`**:
+- Arch: `sudo pacman -S --needed xdotool`
+- Debian/Ubuntu: `sudo apt-get install -y libxdo-dev`
+- Or disable tray support: `cargo build -p riverdeck-egui --no-default-features`
+
+RiverDeck no longer depends on Tauri.
 
 Before each commit, please ensure that all of the following are completed:
 1. Rust code has been linted using `cargo clippy` and it discovers no violations
 2. Rust code has been formatted using `cargo fmt`
-3. TypeScript code has been checked using `deno check` and linted using `deno lint` and they discover no violations
-4. Svelte code has been linted using `deno task check` and it discovers no violations
-5. Frontend code has been formatted using `deno fmt --unstable-component`
 
 When submitting contributions, please adhere to the [Conventional Commits specification](https://conventionalcommits.org/) for commit messages. You will also need to [sign your commits](https://docs.github.com/en/authentication/managing-commit-signature-verification/signing-commits). Feel free to reach out on the support channels above for guidance when contributing!
 
@@ -106,7 +122,5 @@ RiverDeck is licensed under the GNU General Public License version 3.0 or later.
 
 ## Showcase
 
-![Main menu](.github/readme/mainmenu.png)
+![Main menu](.github/readme/mainmenu-plugins-profiles.png)
 ![Multi action](.github/readme/multiaction.png)
-![Plugins](.github/readme/plugins.png)
-![Profiles](.github/readme/profiles.png)

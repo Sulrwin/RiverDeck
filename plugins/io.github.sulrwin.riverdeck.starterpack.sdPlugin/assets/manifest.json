@@ -1,0 +1,66 @@
+{
+	"Name": "RiverDeck Starter Pack",
+	"Description": "RiverDeck starter pack plugin",
+	"Author": "Aman Khanna (nekename)",
+	"Version": "2.7.1",
+	"CodePathWin": "windows/bin/riverdeck-starterpack.exe",
+	"CodePathMac": "darwin/bin/riverdeck-starterpack",
+	"CodePathLin": "linux/bin/riverdeck-starterpack",
+	"Icon": "icons/plugin",
+	"Category": "RiverDeck",
+	"OS": [
+		{
+			"Platform": "mac",
+			"MinimumVersion": "10.11"
+		},
+		{
+			"Platform": "windows",
+			"MinimumVersion": "10"
+		},
+		{
+			"Platform": "linux"
+		}
+	],
+	"Actions": [
+		{
+			"Icon": "icons/runCommand",
+			"Name": "Run Command",
+			"States": [{ "Image": "actionDefaultImage" }],
+			"Controllers": ["Keypad", "Encoder"],
+			"SupportedInMultiActions": true,
+			"Tooltip": "Run a command",
+			"UUID": "io.github.sulrwin.riverdeck.starterpack.runcommand",
+			"PropertyInspectorPath": "propertyInspector/runCommand.html"
+		},
+		{
+			"Icon": "icons/inputSimulation",
+			"Name": "Input Simulation",
+			"States": [{ "Image": "actionDefaultImage" }],
+			"Controllers": ["Keypad", "Encoder"],
+			"SupportedInMultiActions": true,
+			"Tooltip": "Simulate mouse or keyboard input",
+			"UUID": "io.github.sulrwin.riverdeck.starterpack.inputsimulation",
+			"PropertyInspectorPath": "propertyInspector/inputSimulation.html"
+		},
+		{
+			"Icon": "icons/switchProfile",
+			"Name": "Switch Profile",
+			"States": [{ "Image": "actionDefaultImage" }],
+			"Controllers": ["Keypad"],
+			"SupportedInMultiActions": true,
+			"Tooltip": "Switch the selected profile",
+			"UUID": "io.github.sulrwin.riverdeck.starterpack.switchprofile",
+			"PropertyInspectorPath": "propertyInspector/switchProfile.html"
+		},
+		{
+			"Icon": "icons/deviceBrightness",
+			"Name": "Device Brightness",
+			"States": [{ "Image": "actionDefaultImage" }],
+			"Controllers": ["Keypad", "Encoder"],
+			"SupportedInMultiActions": true,
+			"Tooltip": "Change the device brightness",
+			"UUID": "io.github.sulrwin.riverdeck.starterpack.devicebrightness",
+			"PropertyInspectorPath": "propertyInspector/deviceBrightness.html"
+		}
+	]
+}

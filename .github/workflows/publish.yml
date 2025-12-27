@@ -7,70 +7,163 @@ on:
   workflow_dispatch:
 
 jobs:
-  publish-tauri:
+  create-release:
     permissions:
       contents: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: "macos-latest"
-            args: "--target aarch64-apple-darwin"
-          - platform: "macos-latest"
-            args: "--target x86_64-apple-darwin"
-          - platform: "ubuntu-22.04"
-            args: ""
-          - platform: "ubuntu-22.04-arm"
-            args: ""
-          - platform: "windows-latest"
-            args: ""
-    runs-on: ${{ matrix.platform }}
-    env:
-      DENO_DIR: deno_cache
+    runs-on: ubuntu-22.04
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      - name: install Rust stable
+      - name: Determine version/tag
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(python - <<'PY'
+          import json, subprocess
+          md = subprocess.check_output(["cargo","metadata","--no-deps","--format-version","1"], text=True)
+          data = json.loads(md)
+          for p in data["packages"]:
+            if p["name"] == "riverdeck-egui":
+              print(p["version"])
+              raise SystemExit(0)
+          raise SystemExit("riverdeck-egui package not found")
+          PY
+          )"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Create draft GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.meta.outputs.tag }}"
+          VERSION="${{ steps.meta.outputs.version }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists"
+            exit 0
+          fi
+          gh release create "$TAG" \
+            --draft \
+            --title "RiverDeck v$VERSION" \
+            --notes "See the assets to download this version. See the README for installation instructions."
+
+  build-and-upload:
+    needs: [create-release]
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: ubuntu-22.04
+            target: linux-x86_64
+          - platform: ubuntu-22.04-arm64
+            target: linux-aarch64
+          - platform: macos-latest
+            target: aarch64-apple-darwin
+          - platform: macos-latest
+            target: x86_64-apple-darwin
+          - platform: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+          targets: ${{ startsWith(matrix.target, 'linux-') && '' || matrix.target }}
 
       - name: Rust cache
         uses: swatinem/rust-cache@v2
-        with:
-          workspaces: "./src-tauri -> target"
 
-      - name: setup Deno
-        uses: denoland/setup-deno@v1
-        with:
-          deno-version: v2.x
-
-      - name: cache Deno dependencies
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.DENO_DIR }}
-          key: ${{ hashFiles('deno.lock') }}
-
-      - name: install frontend dependencies
-        run: deno install
-
-      - name: install dependencies (ubuntu only)
-        if: matrix.platform == 'ubuntu-22.04' || matrix.platform == 'ubuntu-22.04-arm'
+      - name: Install dependencies (Linux only)
+        if: startsWith(matrix.target, 'linux-')
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libudev-dev xdg-utils
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libudev-dev xdg-utils libxdo-dev
 
-      - uses: tauri-apps/tauri-action@v0
+      - name: Install dependencies (Windows only)
+        if: contains(matrix.target, 'windows')
+        shell: pwsh
+        run: |
+          choco install wixtoolset -y
+
+      - name: Build release binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ matrix.target }}" == linux-* ]]; then
+            cargo build --release -p riverdeck-egui -p riverdeck-pi
+          else
+            cargo build --release --target "${{ matrix.target }}" -p riverdeck-egui -p riverdeck-pi
+          fi
+
+      - name: "Package artifacts (Linux: deb/rpm, others: tar.gz/zip)"
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.create-release.outputs.tag }}"
+          TARGET="${{ matrix.target }}"
+          mkdir -p dist
+
+          if [[ "$TARGET" == linux-* ]]; then
+            cargo install cargo-deb --locked
+            cargo install cargo-generate-rpm --locked
+
+            cargo deb -p riverdeck-egui --no-build
+            cargo generate-rpm -p riverdeck-egui
+
+            cp -a target/debian/*.deb dist/
+            cp -a target/generate-rpm/*.rpm dist/
+          elif [[ "$TARGET" == *"apple-darwin"* ]]; then
+            APP="dist/RiverDeck.app"
+            VERSION="${{ needs.create-release.outputs.version }}"
+            rm -rf "$APP"
+            mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+            cp "target/$TARGET/release/riverdeck" "$APP/Contents/MacOS/riverdeck"
+            cp "target/$TARGET/release/riverdeck-pi" "$APP/Contents/MacOS/riverdeck-pi"
+            cp "packaging/icons/icon.icns" "$APP/Contents/Resources/icon.icns"
+            sed "s/__VERSION__/$VERSION/g" "packaging/macos/Info.plist" > "$APP/Contents/Info.plist"
+            chmod +x "$APP/Contents/MacOS/riverdeck" "$APP/Contents/MacOS/riverdeck-pi"
+            hdiutil create -volname "RiverDeck" -srcfolder "$APP" -ov -format UDZO "dist/RiverDeck_${TARGET}.dmg"
+          elif [[ "$TARGET" == *"windows"* ]]; then
+            VERSION="${{ needs.create-release.outputs.version }}"
+            pwsh -File packaging/windows/build_msi.ps1 -Version "$VERSION" -Target "$TARGET" -OutDir "dist"
+          else
+            OUTDIR="dist/$TARGET"
+            mkdir -p "$OUTDIR"
+            cp "target/$TARGET/release/riverdeck" "$OUTDIR/riverdeck"
+            cp "target/$TARGET/release/riverdeck-pi" "$OUTDIR/riverdeck-pi"
+            (cd "dist" && tar -czf "riverdeck_${TARGET}.tar.gz" "$TARGET")
+          fi
+
+      - name: Upload artifacts to release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tauriScript: deno task tauri
-          tagName: tv__VERSION__
-          releaseName: "OpenDeck v__VERSION__"
-          releaseBody: "See the assets to download this version. See the README for installation instructions."
-          releaseDraft: true
-          prerelease: false
-          args: ${{ matrix.args }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.create-release.outputs.tag }}"
+          TARGET="${{ matrix.target }}"
+          if [[ "$TARGET" == linux-* ]]; then
+            gh release upload "$TAG" dist/*.deb dist/*.rpm --clobber
+          elif [[ "$TARGET" == *"apple-darwin"* ]]; then
+            gh release upload "$TAG" "dist/RiverDeck_${TARGET}.dmg" --clobber
+          elif [[ "$TARGET" == *"windows"* ]]; then
+            gh release upload "$TAG" dist/RiverDeck_${TARGET}.msi --clobber
+          else
+            gh release upload "$TAG" "dist/riverdeck_${TARGET}.tar.gz" --clobber
+          fi

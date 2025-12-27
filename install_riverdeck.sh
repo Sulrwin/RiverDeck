@@ -3,7 +3,11 @@ set -euo pipefail
 
 GITHUB_REPO="sulrwin/RiverDeck"
 FLATHUB_APP_ID="io.github.sulrwin.riverdeck"
-UDEV_RULES_URL="https://raw.githubusercontent.com/sulrwin/RiverDeck/main/src-tauri/bundle/40-streamdeck.rules"
+UDEV_RULES_URL_BASE="https://raw.githubusercontent.com/sulrwin/RiverDeck"
+
+# Cached GitHub release metadata (populated lazily).
+LATEST_RELEASE_JSON=""
+LATEST_TAG=""
 
 if [ -t 1 ]; then
     RED="\033[0;31m"
@@ -28,6 +32,53 @@ msg_warn() { echo -e "${YELLOW}[!] $*${RESET}"; }
 msg_error() { echo -e "${RED}[✗] $*${RESET}" >&2; }
 
 has_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+download_text() {
+    local url="$1"
+    if has_cmd curl; then
+        curl --fail --location --proto '=https' --tlsv1.2 \
+            --retry 3 --retry-delay 3 \
+            -H "Accept: application/vnd.github+json" \
+            -H "User-Agent: riverdeck-install-script" \
+            -sS "$url"
+    else
+        wget -qO- --tries=3 "$url"
+    fi
+}
+
+github_latest_release_json() {
+    if [ -n "${LATEST_RELEASE_JSON}" ]; then
+        echo "${LATEST_RELEASE_JSON}"
+        return 0
+    fi
+    local api_url="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
+    LATEST_RELEASE_JSON="$(download_text "$api_url" || true)"
+    if [ -z "${LATEST_RELEASE_JSON}" ]; then
+        msg_error "Failed to fetch GitHub release metadata"
+        return 1
+    fi
+    echo "${LATEST_RELEASE_JSON}"
+}
+
+github_latest_tag() {
+    if [ -n "${LATEST_TAG}" ]; then
+        echo "${LATEST_TAG}"
+        return 0
+    fi
+    local json
+    json="$(github_latest_release_json)" || return 1
+    if has_cmd jq; then
+        LATEST_TAG="$(echo "$json" | jq -r '.tag_name // empty' | head -n1)"
+    else
+        # Best-effort fallback if jq isn't installed.
+        LATEST_TAG="$(echo "$json" | grep -Eo '"tag_name"\s*:\s*"[^"]+"' | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')"
+    fi
+    if [ -z "${LATEST_TAG}" ]; then
+        msg_error "Failed to determine latest release tag"
+        return 1
+    fi
+    echo "${LATEST_TAG}"
+}
 
 confirm() {
     printf "%b$1 [y/N]: %b" "$YELLOW$BOLD" "$RESET"
@@ -54,7 +105,6 @@ detect_family() {
 
 fetch_latest_asset() {
     local ext="$1"
-    local api_url="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
     local arch arch_deb arch_rpm arch_pattern download_url
 
     arch="$(uname -m)"
@@ -79,14 +129,19 @@ fetch_latest_asset() {
         arch_pattern="${arch_rpm}"
     fi
 
-    if has_cmd curl; then
-        download_url=$(curl -s --retry 3 --retry-delay 3 "$api_url" |
+    local json
+    json="$(github_latest_release_json)" || return 1
+
+    if has_cmd jq; then
+        download_url="$(echo "$json" | jq -r --arg arch "${arch_pattern}" --arg ext "${ext}" '
+            .assets[].browser_download_url
+            | select(test($arch + "\\\\." + $ext + "($|\\\\?)"))
+        ' | head -n1 || true)"
+    else
+        # Fallback: parse URLs from JSON with grep. Less robust than jq but works without extra deps.
+        download_url="$(echo "$json" |
             grep -Eo "https://[^ \"]+${arch_pattern}\.${ext}([^\"]*)" |
-            head -n1 || true)
-    elif has_cmd wget; then
-        download_url=$(wget -qO- --tries=3 "$api_url" |
-            grep -Eo "https://[^ \"]+${arch_pattern}\.${ext}([^\"]*)" |
-            head -n1 || true)
+            head -n1 || true)"
     fi
 
     if [ -n "$download_url" ]; then
@@ -102,10 +157,71 @@ download_with_retry() {
     local dest="$2"
 
     if has_cmd curl; then
-        curl -L --retry 3 --retry-delay 3 -o "$dest" "$url"
+        curl --fail --location --proto '=https' --tlsv1.2 \
+            --retry 3 --retry-delay 3 \
+            -o "$dest" "$url"
     else
         wget --tries=3 -O "$dest" "$url"
     fi
+}
+
+find_sha256_asset_url() {
+    # Try to locate a checksum asset for the latest release.
+    local json
+    json="$(github_latest_release_json)" || return 1
+    if has_cmd jq; then
+        echo "$json" | jq -r '
+            .assets[].browser_download_url
+            | select(test("(SHA256SUMS|\\\\.sha256(\\\\.txt)?|\\\\.sha256sum)$"))
+        ' | head -n1
+    else
+        echo "$json" | grep -Eo 'https://[^ "]+(SHA256SUMS|\.sha256(\.txt)?|\.sha256sum)([^"]*)' | head -n1
+    fi
+}
+
+verify_sha256_if_possible() {
+    local file_path="$1"
+    local url checksum_tmp base_name
+    base_name="$(basename "$file_path")"
+
+    if ! has_cmd sha256sum; then
+        msg_warn "sha256sum not found; skipping checksum verification"
+        return 0
+    fi
+
+    url="$(find_sha256_asset_url || true)"
+    if [ -z "${url}" ]; then
+        msg_warn "No SHA256 checksum asset found for the latest release"
+        if confirm "Continue without checksum verification?"; then
+            return 0
+        fi
+        msg_error "Aborted"
+        exit 1
+    fi
+
+    checksum_tmp="$(mktemp --suffix=.sha256)"
+    download_with_retry "$url" "$checksum_tmp"
+
+    # Support either a single-line `<hash>  <file>` format or a sums file containing many entries.
+    if grep -qE "^[a-f0-9]{64}[[:space:]]+\\*?${base_name}\$" "$checksum_tmp"; then
+        (cd "$(dirname "$file_path")" && grep -E "^[a-f0-9]{64}[[:space:]]+\\*?${base_name}\$" "$checksum_tmp" | sha256sum -c -) \
+            || { msg_error "SHA256 verification failed"; exit 1; }
+        msg_ok "SHA256 verified"
+        rm -f "$checksum_tmp"
+        return 0
+    elif grep -qE "^[a-f0-9]{64}[[:space:]]+\\*?-" "$checksum_tmp"; then
+        # Not expected, but keep a generic path.
+        msg_warn "Checksum file format not recognized for ${base_name}"
+    else
+        msg_warn "No checksum entry found for ${base_name}"
+    fi
+
+    rm -f "$checksum_tmp"
+    if confirm "Continue without checksum verification for ${base_name}?"; then
+        return 0
+    fi
+    msg_error "Aborted"
+    exit 1
 }
 
 reload_udev_rules() {
@@ -136,7 +252,14 @@ install_flatpak() {
 
     msg_info "Installing udev rules"
     tmp_rules="$(mktemp --suffix=.rules)"
-    download_with_retry "$UDEV_RULES_URL" "$tmp_rules"
+    local tag
+    tag="$(github_latest_tag || true)"
+    if [ -n "${tag}" ]; then
+        download_with_retry "${UDEV_RULES_URL_BASE}/${tag}/packaging/linux/40-streamdeck.rules" "$tmp_rules"
+    else
+        # Fallback to main if tag discovery fails.
+        download_with_retry "${UDEV_RULES_URL_BASE}/main/packaging/linux/40-streamdeck.rules" "$tmp_rules"
+    fi
     sudo mv "$tmp_rules" /etc/udev/rules.d/40-streamdeck.rules
     sudo chmod 644 /etc/udev/rules.d/40-streamdeck.rules
     msg_ok "Installed udev rules"
@@ -145,38 +268,59 @@ install_flatpak() {
 }
 
 install_deb() {
-    local dl tmpf
+    local dl tmpd tmpf
     dl=$(fetch_latest_asset "deb")
     msg_info "Downloading ${dl##*/}"
-    tmpf="$(mktemp --suffix=.deb)"
+    tmpd="$(mktemp -d)"
+    tmpf="${tmpd}/${dl##*/}"
     download_with_retry "$dl" "$tmpf"
     msg_ok "Downloaded ${dl##*/}"
+    verify_sha256_if_possible "$tmpf"
 
     msg_info "Installing .deb package"
-    sudo apt-get install --fix-broken "$tmpf"
-    rm -f "$tmpf"
+    sudo apt-get install -y --fix-broken "$tmpf"
+    rm -rf "$tmpd"
     msg_ok "Installed .deb package"
 
     reload_udev_rules
 }
 
 install_rpm() {
-    local dl tmpf
+    local dl tmpd tmpf
     dl=$(fetch_latest_asset "rpm")
     msg_info "Downloading ${dl##*/}"
-    tmpf="$(mktemp --suffix=.rpm)"
+    tmpd="$(mktemp -d)"
+    tmpf="${tmpd}/${dl##*/}"
     download_with_retry "$dl" "$tmpf"
     msg_ok "Downloaded ${dl##*/}"
+    verify_sha256_if_possible "$tmpf"
 
     msg_info "Installing .rpm package"
-    if has_cmd zypper; then
-        sudo zypper install --allow-unsigned-rpm "$tmpf"
-    elif has_cmd dnf; then
-        sudo dnf install --nogpgcheck "$tmpf"
-    else
-        sudo rpm -i --nosignature "$tmpf"
+    msg_warn "For best security, prefer installing signed packages from your distro repos / AUR / Flathub."
+    if ! confirm "Proceed to install a locally downloaded RPM file?"; then
+        msg_error "Installation aborted"
+        exit 1
     fi
-    rm -f "$tmpf"
+    if has_cmd zypper; then
+        if confirm "Allow unsigned RPM install if required?"; then
+            sudo zypper install -y --allow-unsigned-rpm "$tmpf"
+        else
+            sudo zypper install -y "$tmpf"
+        fi
+    elif has_cmd dnf; then
+        if confirm "Disable GPG checks if required?"; then
+            sudo dnf install -y --nogpgcheck "$tmpf"
+        else
+            sudo dnf install -y "$tmpf"
+        fi
+    else
+        if confirm "Disable signature checks if required?"; then
+            sudo rpm -i --nosignature "$tmpf"
+        else
+            sudo rpm -i "$tmpf"
+        fi
+    fi
+    rm -rf "$tmpd"
     msg_ok "Installed .rpm package"
 
     reload_udev_rules

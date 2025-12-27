@@ -1,0 +1,10 @@
+[workspace]
+members = [
+	"crates/riverdeck-core",
+	"crates/riverdeck-egui",
+	"crates/riverdeck-pi",
+	"plugins/io.github.sulrwin.riverdeck.starterpack.sdPlugin",
+]
+resolver = "3"
+
+

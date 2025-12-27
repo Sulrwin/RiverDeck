@@ -1,0 +1,68 @@
+[package]
+name = "riverdeck-egui"
+version = "2.7.1"
+edition = "2024"
+license = "GPL-3.0-or-later"
+
+[[bin]]
+name = "riverdeck"
+path = "src/main.rs"
+
+[package.metadata.deb]
+name = "riverdeck"
+maintainer = "Ethan Wright (sulrwin)"
+license-file = ["../../LICENSE.md", "4"]
+depends = "libgtk-3-0, libwebkit2gtk-4.1-0, libudev1, xdg-utils"
+assets = [
+	["../../packaging/linux/riverdeck.desktop", "usr/share/applications/riverdeck.desktop", "644"],
+	["../../packaging/linux/riverdeck.metainfo.xml", "usr/share/metainfo/riverdeck.metainfo.xml", "644"],
+	["../../packaging/linux/40-streamdeck.rules", "etc/udev/rules.d/40-streamdeck.rules", "644"],
+	["../../packaging/icons/icon.png", "usr/share/icons/hicolor/512x512/apps/riverdeck.png", "644"],
+	["../../target/release/riverdeck-pi", "usr/bin/riverdeck-pi", "755"],
+]
+
+[package.metadata.generate-rpm]
+name = "riverdeck"
+assets = [
+	{ source = "../../packaging/linux/riverdeck.desktop", dest = "/usr/share/applications/riverdeck.desktop", mode = "644" },
+	{ source = "../../packaging/linux/riverdeck.metainfo.xml", dest = "/usr/share/metainfo/riverdeck.metainfo.xml", mode = "644" },
+	{ source = "../../packaging/linux/40-streamdeck.rules", dest = "/etc/udev/rules.d/40-streamdeck.rules", mode = "644" },
+	{ source = "../../packaging/icons/icon.png", dest = "/usr/share/icons/hicolor/512x512/apps/riverdeck.png", mode = "644" },
+	{ source = "../../target/release/riverdeck-pi", dest = "/usr/bin/riverdeck-pi", mode = "755" },
+]
+requires = { "gtk3" = "*", "webkit2gtk4.1" = "*", "udev" = "*", "xdg-utils" = "*" }
+
+[features]
+# Tray support is enabled by default, but it depends on platform system libraries on Linux
+# (notably `libxdo`, provided by `xdotool` / `libxdo-dev`).
+default = ["tray"]
+tray = ["dep:tray-icon"]
+
+[dependencies]
+anyhow = "1.0"
+auto-launch = "0.5"
+base64 = "0.22"
+eframe = "0.31"
+egui = "0.31"
+env_logger = "0.11"
+fs2 = "0.4"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+log = "0.4"
+open = "5.3"
+reqwest = { version = "0.12", features = ["json"] }
+rfd = "0.15"
+riverdeck-core = { path = "../riverdeck-core" }
+semver = "1.0"
+serde_json = "1.0"
+tokio = { version = "1.48", features = ["full"] }
+tray-icon = { version = "0.21", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# `tray-icon`'s Linux backend uses GTK; we call `gtk::init()` (see `src/main.rs`) to avoid
+# runtime panics when constructing menus before GTK has been initialized.
+gtk = "0.18"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+

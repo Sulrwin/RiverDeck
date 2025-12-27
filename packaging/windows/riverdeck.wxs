@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+	<Product
+		Id="*"
+		Name="RiverDeck"
+		Language="1033"
+		Version="$(var.Version)"
+		Manufacturer="Ethan Wright (sulrwin)"
+		UpgradeCode="1C1C7B40-8E60-4ED9-9F2C-35C2D2D4B5B7"
+	>
+		<Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine" />
+		<MajorUpgrade DowngradeErrorMessage="A newer version of RiverDeck is already installed." />
+		<MediaTemplate />
+
+		<Directory Id="TARGETDIR" Name="SourceDir">
+			<Directory Id="ProgramFilesFolder">
+				<Directory Id="INSTALLFOLDER" Name="RiverDeck" />
+			</Directory>
+		</Directory>
+
+		<DirectoryRef Id="INSTALLFOLDER">
+			<Component Id="cmpRiverDeckExe" Guid="D6EAE83A-96FA-4BFA-9A04-FA6F2D8EDC69">
+				<File Id="filRiverDeckExe" Source="$(var.RiverDeckExe)" KeyPath="yes" />
+			</Component>
+			<Component Id="cmpRiverDeckPiExe" Guid="F8D1F0E5-2A9B-4C7E-8D49-AB69BFA0D9F0">
+				<File Id="filRiverDeckPiExe" Source="$(var.RiverDeckPiExe)" KeyPath="yes" />
+			</Component>
+		</DirectoryRef>
+
+		<!-- URL protocol handlers -->
+		<Component Id="cmpUrlProtocolRiverDeck" Guid="C2E7B8E4-3C93-4A7D-9A6E-77C8C8D4B6B2">
+			<RegistryKey Root="HKCR" Key="riverdeck">
+				<RegistryValue Type="string" Value="URL:RiverDeck Protocol" />
+				<RegistryValue Name="URL Protocol" Type="string" Value="" />
+				<RegistryKey Key="shell\\open\\command">
+					<RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]riverdeck.exe&quot; &quot;%1&quot;" />
+				</RegistryKey>
+			</RegistryKey>
+		</Component>
+		<Component Id="cmpUrlProtocolOpenAction" Guid="0BDAE1A1-6C0A-4B5E-A0A0-4F1C2F9F9F52">
+			<RegistryKey Root="HKCR" Key="openaction">
+				<RegistryValue Type="string" Value="URL:OpenAction Protocol" />
+				<RegistryValue Name="URL Protocol" Type="string" Value="" />
+				<RegistryKey Key="shell\\open\\command">
+					<RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]riverdeck.exe&quot; &quot;%1&quot;" />
+				</RegistryKey>
+			</RegistryKey>
+		</Component>
+		<Component Id="cmpUrlProtocolStreamDeck" Guid="A3B8E26C-53B8-43AE-8C35-3A0D7E0C35CB">
+			<RegistryKey Root="HKCR" Key="streamdeck">
+				<RegistryValue Type="string" Value="URL:StreamDeck Protocol" />
+				<RegistryValue Name="URL Protocol" Type="string" Value="" />
+				<RegistryKey Key="shell\\open\\command">
+					<RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]riverdeck.exe&quot; &quot;%1&quot;" />
+				</RegistryKey>
+			</RegistryKey>
+		</Component>
+
+		<Feature Id="MainFeature" Title="RiverDeck" Level="1">
+			<ComponentRef Id="cmpRiverDeckExe" />
+			<ComponentRef Id="cmpRiverDeckPiExe" />
+			<ComponentRef Id="cmpUrlProtocolRiverDeck" />
+			<ComponentRef Id="cmpUrlProtocolOpenAction" />
+			<ComponentRef Id="cmpUrlProtocolStreamDeck" />
+		</Feature>
+	</Product>
+</Wix>
+
+

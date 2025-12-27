@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=RiverDeck
+Comment=Use stream controllers
+Exec=riverdeck
+Icon=riverdeck
+Terminal=false
+Categories=Utility;
+MimeType=x-scheme-handler/riverdeck;x-scheme-handler/openaction;x-scheme-handler/streamdeck;
+
+

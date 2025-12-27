@@ -4,28 +4,44 @@
 		{
 			"type": "lldb",
 			"request": "launch",
-			"name": "Debug (debug)",
+			"name": "Debug (egui)",
 			"cargo": {
 				"args": [
-					"build",
-					"--manifest-path=./src-tauri/Cargo.toml",
-					"--no-default-features"
+					"run",
+					"-p",
+					"riverdeck-egui",
+					"--",
+					"--replace"
 				]
-			},
-			"preLaunchTask": "frontend:dev"
+			}
 		},
 		{
 			"type": "lldb",
 			"request": "launch",
-			"name": "Debug (release)",
+			"name": "Debug (pi helper)",
 			"cargo": {
 				"args": [
-					"build",
-					"--release",
-					"--manifest-path=./src-tauri/Cargo.toml"
+					"run",
+					"-p",
+					"riverdeck-pi"
 				]
 			},
-			"preLaunchTask": "frontend:build"
+			"args": [
+				"--label",
+				"riverdeck_pi_debug",
+				"--pi-src",
+				"http://localhost:57118/index.html|riverdeck_property_inspector",
+				"--origin",
+				"http://localhost:57118",
+				"--ws-port",
+				"57116",
+				"--context",
+				"dev.Default.Keypad.0.0",
+				"--info-json",
+				"{}",
+				"--connect-json",
+				"{}"
+			]
 		}
 	]
 }
