@@ -374,6 +374,11 @@ struct RiverDeckApp {
     action_search: String,
     texture_cache: HashMap<String, CachedTexture>,
 
+    action_controller_filter: String,
+    drag_payload: Option<shared::Action>,
+    drag_hover_slot: Option<SelectedSlot>,
+    drag_hover_valid: bool,
+
     show_update_details: bool,
 }
 
@@ -430,7 +435,27 @@ impl RiverDeckApp {
             selected_slot: None,
             action_search: String::new(),
             texture_cache: HashMap::new(),
+            action_controller_filter: "Keypad".to_owned(),
+            drag_payload: None,
+            drag_hover_slot: None,
+            drag_hover_valid: false,
             show_update_details: false,
+        }
+    }
+
+    fn action_icon_path(action: &shared::Action) -> Option<&str> {
+        // Prefer the first state's image if present (core already expands it to a concrete file path).
+        if let Some(first) = action.states.first()
+            && !first.image.trim().is_empty()
+            && first.image != "actionDefaultImage"
+        {
+            return Some(first.image.as_str());
+        }
+        let icon = action.icon.trim();
+        if icon.is_empty() {
+            None
+        } else {
+            Some(icon)
         }
     }
 
@@ -536,6 +561,87 @@ impl RiverDeckApp {
         Some(texture)
     }
 
+    fn draw_action_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        action: &shared::Action,
+        row_size: egui::Vec2,
+        dragging: bool,
+    ) -> egui::Response {
+        let (rect, resp) = ui.allocate_exact_size(row_size, egui::Sense::click_and_drag());
+        let painter = ui.painter_at(rect);
+
+        let visuals = ui.visuals();
+        let hovered = resp.hovered();
+        let fill = if hovered {
+            visuals.widgets.hovered.bg_fill
+        } else {
+            visuals.widgets.inactive.bg_fill
+        };
+        let stroke = if dragging {
+            egui::Stroke::new(2.0, visuals.selection.stroke.color)
+        } else if hovered {
+            visuals.widgets.hovered.bg_stroke
+        } else {
+            visuals.widgets.inactive.bg_stroke
+        };
+
+        painter.rect(
+            rect,
+            egui::CornerRadius::same(10),
+            fill,
+            stroke,
+            egui::StrokeKind::Inside,
+        );
+
+        // Icon on left
+        let icon_size = 28.0;
+        let icon_rect = egui::Rect::from_center_size(
+            egui::pos2(rect.min.x + 16.0 + icon_size / 2.0, rect.center().y),
+            egui::vec2(icon_size, icon_size),
+        );
+        if let Some(path) = Self::action_icon_path(action)
+            && let Some(tex) = self.texture_for_path(ctx, path)
+        {
+            painter.image(
+                tex.id(),
+                icon_rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        } else {
+            painter.text(
+                icon_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "◻",
+                egui::FontId::proportional(14.0),
+                visuals.weak_text_color(),
+            );
+        }
+
+        // Text to the right
+        let text_left = icon_rect.max.x + 10.0;
+        let text_rect = egui::Rect::from_min_max(
+            egui::pos2(text_left, rect.min.y),
+            egui::pos2(rect.max.x - 10.0, rect.max.y),
+        );
+        painter.text(
+            egui::pos2(text_rect.min.x, text_rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            action.name.trim(),
+            egui::FontId::proportional(13.0),
+            visuals.text_color(),
+        );
+
+        let resp = if !action.tooltip.trim().is_empty() {
+            resp.on_hover_text(action.tooltip.trim())
+        } else {
+            resp
+        };
+        resp
+    }
+
     fn draw_slot_preview(
         &mut self,
         ui: &mut egui::Ui,
@@ -544,22 +650,34 @@ impl RiverDeckApp {
         slot: &SelectedSlot,
         instance: Option<&shared::ActionInstance>,
         selected: bool,
+        drag_action: Option<&shared::Action>,
     ) -> egui::Response {
         let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
         let painter = ui.painter_at(rect);
 
+        let pointer_pos = ctx.input(|i| i.pointer.latest_pos());
+        let drop_hovered = pointer_pos.is_some_and(|p| rect.contains(p));
+        let drop_valid = drag_action.is_some_and(|a| a.controllers.iter().any(|c| c == &slot.controller));
+        if drag_action.is_some() && drop_hovered {
+            self.drag_hover_slot = Some(slot.clone());
+            self.drag_hover_valid = drop_valid;
+        }
+
         let stroke = if selected {
             egui::Stroke::new(2.0, ui.visuals().selection.stroke.color)
+        } else if drag_action.is_some() && drop_hovered && drop_valid {
+            egui::Stroke::new(2.0, ui.visuals().selection.stroke.color)
+        } else if drag_action.is_some() && drop_hovered && !drop_valid {
+            egui::Stroke::new(2.0, ui.visuals().error_fg_color)
         } else {
             ui.visuals().widgets.inactive.bg_stroke
         };
-        painter.rect(
-            rect,
-            egui::CornerRadius::same(6),
-            ui.visuals().extreme_bg_color,
-            stroke,
-            egui::StrokeKind::Inside,
-        );
+        let fill = if drag_action.is_some() && drop_hovered {
+            ui.visuals().widgets.hovered.bg_fill
+        } else {
+            ui.visuals().extreme_bg_color
+        };
+        painter.rect(rect, egui::CornerRadius::same(10), fill, stroke, egui::StrokeKind::Inside);
 
         if let Some(instance) = instance {
             let state_img = instance
@@ -635,6 +753,41 @@ impl RiverDeckApp {
 
 impl eframe::App for RiverDeckApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Professional dark theme pass: aim closer to the Stream Deck dark UI.
+        ctx.style_mut(|s| {
+            s.spacing.item_spacing = egui::vec2(10.0, 10.0);
+            s.spacing.button_padding = egui::vec2(10.0, 8.0);
+            s.spacing.window_margin = egui::Margin::same(12);
+
+            let mut v = egui::Visuals::dark();
+            // Surfaces
+            v.window_fill = egui::Color32::from_rgb(24, 25, 27);
+            v.panel_fill = egui::Color32::from_rgb(28, 29, 31);
+            v.extreme_bg_color = egui::Color32::from_rgb(20, 21, 23);
+            v.faint_bg_color = egui::Color32::from_rgb(34, 35, 38);
+
+            // Widget cards
+            v.widgets.inactive.bg_fill = egui::Color32::from_rgb(33, 34, 37);
+            v.widgets.hovered.bg_fill = egui::Color32::from_rgb(41, 42, 46);
+            v.widgets.active.bg_fill = egui::Color32::from_rgb(48, 50, 55);
+            v.widgets.inactive.bg_stroke =
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(56, 58, 62));
+            v.widgets.hovered.bg_stroke =
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(82, 85, 90));
+            v.widgets.active.bg_stroke =
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(110, 114, 122));
+
+            // Accents
+            v.selection.bg_fill = egui::Color32::from_rgb(0, 120, 215);
+            v.selection.stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(0, 145, 255));
+            v.error_fg_color = egui::Color32::from_rgb(255, 95, 95);
+
+            // Rounding
+            v.window_corner_radius = egui::CornerRadius::same(12);
+            v.menu_corner_radius = egui::CornerRadius::same(10);
+            s.visuals = v;
+        });
+
         // `tray-icon` on Linux uses GTK/AppIndicator under the hood, which relies on GLib to
         // process DBus registration events. eframe/winit does not run a GTK mainloop, so we
         // pump pending GLib events once per frame when tray support is enabled.
@@ -684,6 +837,13 @@ impl eframe::App for RiverDeckApp {
 
         self.poll_ui_events();
 
+        // Reset per-frame drag hover state.
+        self.drag_hover_slot = None;
+        self.drag_hover_valid = false;
+
+        // Avoid borrow conflicts: take a local snapshot of the drag payload for this frame.
+        let drag_action = self.drag_payload.clone();
+
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             #[cfg(target_os = "linux")]
             {
@@ -726,18 +886,23 @@ impl eframe::App for RiverDeckApp {
 
         egui::SidePanel::left("devices").show(ctx, |ui| {
             ui.heading("Devices");
-
-            for entry in shared::DEVICES.iter() {
-                let id = entry.key().clone();
-                let selected = self.selected_device.as_deref() == Some(&id);
-                if ui
-                    .selectable_label(selected, format!("{} ({})", entry.value().name, id))
-                    .clicked()
-                {
-                    self.selected_device = Some(id);
-                    self.selected_slot = None;
-                }
-            }
+            ui.add_space(6.0);
+            egui::Frame::group(ui.style())
+                .corner_radius(egui::CornerRadius::same(12))
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 6.0;
+                    for entry in shared::DEVICES.iter() {
+                        let id = entry.key().clone();
+                        let selected = self.selected_device.as_deref() == Some(&id);
+                        if ui
+                            .selectable_label(selected, format!("{} ({})", entry.value().name, id))
+                            .clicked()
+                        {
+                            self.selected_device = Some(id);
+                            self.selected_slot = None;
+                        }
+                    }
+                });
         });
 
         let selected_device = self
@@ -784,40 +949,60 @@ impl eframe::App for RiverDeckApp {
                 ui.label("Select a device.");
                 return;
             };
-            let Some(slot) = self.selected_slot.clone() else {
-                ui.label("Select a key/dial in the preview to assign an action.");
-                return;
-            };
 
-            let instance = snapshot.as_ref().and_then(|s| match &slot.controller[..] {
-                "Encoder" => s
-                    .sliders
-                    .get(slot.position as usize)
-                    .and_then(|v| v.as_ref()),
-                _ => s.keys.get(slot.position as usize).and_then(|v| v.as_ref()),
-            });
+            // Optional: show selected slot and allow clearing (assignment is drag/drop only).
+            if let (Some(slot), Some(snapshot)) = (self.selected_slot.clone(), snapshot.as_ref()) {
+                let instance = match &slot.controller[..] {
+                    "Encoder" => snapshot
+                        .sliders
+                        .get(slot.position as usize)
+                        .and_then(|v| v.as_ref()),
+                    _ => snapshot.keys.get(slot.position as usize).and_then(|v| v.as_ref()),
+                };
+                ui.horizontal(|ui| {
+                    ui.monospace(format!("selected: {} {}", slot.controller, slot.position));
+                    if instance.is_some() && ui.button("Clear").clicked() {
+                        let ctx_to_clear = shared::Context {
+                            device: device.id.clone(),
+                            profile: selected_profile.clone(),
+                            controller: slot.controller.clone(),
+                            position: slot.position,
+                        };
+                        let _ = self.runtime.block_on(async {
+                            riverdeck_core::api::instances::remove_instance(
+                                shared::ActionContext::from_context(ctx_to_clear, 0),
+                            )
+                            .await
+                        });
+                    }
+                });
+                ui.separator();
+            }
 
-            ui.horizontal(|ui| {
-                ui.monospace(format!("slot: {} {}", slot.controller, slot.position));
-                if instance.is_some() && ui.button("Clear").clicked() {
-                    let ctx_to_clear = shared::Context {
-                        device: device.id.clone(),
-                        profile: selected_profile.clone(),
-                        controller: slot.controller.clone(),
-                        position: slot.position,
-                    };
-                    let _ = self.runtime.block_on(async {
-                        riverdeck_core::api::instances::remove_instance(
-                            shared::ActionContext::from_context(ctx_to_clear, 0),
-                        )
-                        .await
+            // Controller filter (Keypad/Encoder) for the action list.
+            egui::Frame::group(ui.style())
+                .corner_radius(egui::CornerRadius::same(12))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Show:");
+                        ui.selectable_value(
+                            &mut self.action_controller_filter,
+                            "Keypad".to_owned(),
+                            "Keys",
+                        );
+                        if device.encoders > 0 {
+                            ui.selectable_value(
+                                &mut self.action_controller_filter,
+                                "Encoder".to_owned(),
+                                "Dials",
+                            );
+                        }
                     });
-                }
-            });
-
-            ui.add(
-                egui::TextEdit::singleline(&mut self.action_search).hint_text("Search actions…"),
-            );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.action_search)
+                            .hint_text("Search actions…"),
+                    );
+                });
             ui.separator();
 
             let categories = self
@@ -827,16 +1012,20 @@ impl eframe::App for RiverDeckApp {
             cats.sort_by(|(a, _), (b, _)| a.cmp(b));
 
             let search = self.action_search.to_lowercase();
+            let filter_controller = self.action_controller_filter.clone();
+            let row_height = 44.0;
+
             egui::ScrollArea::vertical().show(ui, |ui| {
                 for (cat_name, cat) in cats {
                     egui::CollapsingHeader::new(cat_name)
-                        .default_open(false)
+                        .default_open(true)
                         .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.y = 8.0;
                             for action in cat.actions {
                                 if !action.visible_in_action_list {
                                     continue;
                                 }
-                                if !action.controllers.iter().any(|c| c == &slot.controller) {
+                                if !action.controllers.iter().any(|c| c == &filter_controller) {
                                     continue;
                                 }
                                 if !search.is_empty()
@@ -845,19 +1034,15 @@ impl eframe::App for RiverDeckApp {
                                     continue;
                                 }
 
-                                if ui.button(&action.name).clicked() {
-                                    let ctx_to_set = shared::Context {
-                                        device: device.id.clone(),
-                                        profile: selected_profile.clone(),
-                                        controller: slot.controller.clone(),
-                                        position: slot.position,
-                                    };
-                                    let _ = self.runtime.block_on(async {
-                                        riverdeck_core::api::instances::create_instance(
-                                            action, ctx_to_set,
-                                        )
-                                        .await
-                                    });
+                                let dragging_this = self
+                                    .drag_payload
+                                    .as_ref()
+                                    .is_some_and(|a| a.uuid == action.uuid && a.plugin == action.plugin);
+                                let row_size = egui::vec2(ui.available_width(), row_height);
+                                let resp =
+                                    self.draw_action_row(ui, ctx, &action, row_size, dragging_this);
+                                if resp.drag_started() {
+                                    self.drag_payload = Some(action.clone());
                                 }
                             }
                         });
@@ -871,27 +1056,30 @@ impl eframe::App for RiverDeckApp {
                 return;
             };
 
-            ui.heading(&device.name);
-            ui.monospace(&device.id);
+            egui::Frame::group(ui.style())
+                .corner_radius(egui::CornerRadius::same(14))
+                .show(ui, |ui| {
+                    ui.heading(&device.name);
+                    ui.monospace(&device.id);
+                    ui.add_space(8.0);
+                    ui.label(format!("Selected profile: {selected_profile}"));
+                    ui.horizontal(|ui| {
+                        if ui.button("Reload plugins").clicked() {
+                            plugins::initialise_plugins();
+                        }
+                        if ui
+                            .button("Open property inspector (first action w/ PI)")
+                            .clicked()
+                        {
+                            let result = self.open_first_property_inspector(&device.id);
+                            if let Err(err) = result {
+                                log::warn!("Failed to open property inspector: {err}");
+                            }
+                        }
+                    });
+                });
 
-            ui.separator();
-
-            ui.label(format!("Selected profile: {selected_profile}"));
-            if ui.button("Reload plugins").clicked() {
-                plugins::initialise_plugins();
-            }
-
-            if ui
-                .button("Open property inspector (first action w/ PI)")
-                .clicked()
-            {
-                let result = self.open_first_property_inspector(&device.id);
-                if let Err(err) = result {
-                    log::warn!("Failed to open property inspector: {err}");
-                }
-            }
-
-            ui.separator();
+            ui.add_space(10.0);
             ui.heading("Device preview");
 
             let Some(snapshot) = &snapshot else {
@@ -899,48 +1087,229 @@ impl eframe::App for RiverDeckApp {
                 return;
             };
 
-            let key_size = egui::vec2(72.0, 72.0);
+            let key_size = egui::vec2(84.0, 84.0);
             let cols = device.columns as usize;
             let rows = device.rows as usize;
-            for r in 0..rows {
-                ui.horizontal(|ui| {
-                    for c in 0..cols {
-                        let pos = (r * cols + c) as u8;
-                        let slot = SelectedSlot {
-                            controller: "Keypad".to_owned(),
-                            position: pos,
-                        };
-                        let instance = snapshot.keys.get(pos as usize).and_then(|v| v.as_ref());
-                        let selected = self.selected_slot.as_ref() == Some(&slot);
-                        let resp =
-                            self.draw_slot_preview(ui, ctx, key_size, &slot, instance, selected);
-                        if resp.clicked() {
-                            self.selected_slot = Some(slot);
-                        }
+            // Center the keypad grid.
+            let grid_spacing_x = ui.spacing().item_spacing.x;
+            let grid_width = cols as f32 * key_size.x + (cols.saturating_sub(1) as f32) * grid_spacing_x;
+            let left_pad = ((ui.available_width() - grid_width) * 0.5).max(0.0);
+            ui.horizontal(|ui| {
+                ui.add_space(left_pad);
+                ui.vertical(|ui| {
+                    for r in 0..rows {
+                        ui.horizontal(|ui| {
+                            for c in 0..cols {
+                                let pos = (r * cols + c) as u8;
+                                let slot = SelectedSlot {
+                                    controller: "Keypad".to_owned(),
+                                    position: pos,
+                                };
+                                let instance =
+                                    snapshot.keys.get(pos as usize).and_then(|v| v.as_ref());
+                                let selected = self.selected_slot.as_ref() == Some(&slot);
+                                let resp = self.draw_slot_preview(
+                                    ui,
+                                    ctx,
+                                    key_size,
+                                    &slot,
+                                    instance,
+                                    selected,
+                                    drag_action.as_ref(),
+                                );
+                                if resp.clicked() {
+                                    self.selected_slot = Some(slot);
+                                }
+                            }
+                        });
                     }
                 });
-            }
+            });
 
             if device.encoders > 0 {
                 ui.separator();
                 ui.heading("Encoders");
-                ui.horizontal_wrapped(|ui| {
-                    for i in 0..(device.encoders as usize) {
-                        let slot = SelectedSlot {
-                            controller: "Encoder".to_owned(),
-                            position: i as u8,
+                // Align encoders with the keypad grid start (same left padding).
+                ui.horizontal(|ui| {
+                    ui.add_space(left_pad);
+                    ui.horizontal_wrapped(|ui| {
+                        for i in 0..(device.encoders as usize) {
+                            let slot = SelectedSlot {
+                                controller: "Encoder".to_owned(),
+                                position: i as u8,
+                            };
+                            let instance = snapshot.sliders.get(i).and_then(|v| v.as_ref());
+                            let selected = self.selected_slot.as_ref() == Some(&slot);
+                            let resp = self.draw_slot_preview(
+                                ui,
+                                ctx,
+                                key_size,
+                                &slot,
+                                instance,
+                                selected,
+                                drag_action.as_ref(),
+                            );
+                            if resp.clicked() {
+                                self.selected_slot = Some(slot);
+                            }
+                        }
+                    });
+                });
+            }
+
+            // Pages (implemented via device profiles).
+            ui.add_space(10.0);
+            let mut profiles = riverdeck_core::api::profiles::get_profiles(&device.id)
+                .unwrap_or_else(|_| vec!["Default".to_owned()]);
+            // Prefer a stable, human-friendly ordering: Default first, then Page N numerically, then others.
+            profiles.sort_by(|a, b| {
+                let key = |s: &str| -> (u8, u32) {
+                    if s == "Default" {
+                        (0, 0)
+                    } else if let Some(n) =
+                        s.strip_prefix("Page ").and_then(|n| n.parse::<u32>().ok())
+                    {
+                        (1, n)
+                    } else {
+                        (2, 0)
+                    }
+                };
+                let ka = key(a);
+                let kb = key(b);
+                ka.cmp(&kb).then(a.cmp(b))
+            });
+
+            ui.horizontal(|ui| {
+                // Center the page bar under the grid by reusing the same padding.
+                ui.add_space(left_pad);
+                ui.horizontal(|ui| {
+                    ui.label("Pages:");
+
+                    for profile_id in profiles.iter() {
+                        let is_default = profile_id == "Default";
+                        let label = if is_default {
+                            "1".to_owned()
+                        } else if let Some(n) = profile_id.strip_prefix("Page ") {
+                            n.to_owned()
+                        } else {
+                            profile_id.clone()
                         };
-                        let instance = snapshot.sliders.get(i).and_then(|v| v.as_ref());
-                        let selected = self.selected_slot.as_ref() == Some(&slot);
-                        let resp =
-                            self.draw_slot_preview(ui, ctx, key_size, &slot, instance, selected);
+
+                        let selected = profile_id == &selected_profile;
+                        let resp = ui.selectable_label(selected, label);
+
                         if resp.clicked() {
-                            self.selected_slot = Some(slot);
+                            let _ = self.runtime.block_on(async {
+                                riverdeck_core::api::profiles::set_selected_profile(
+                                    device.id.clone(),
+                                    profile_id.clone(),
+                                )
+                                .await
+                            });
+                        }
+
+                        // Right-click delete only for "Page N" profiles (keep Default safe).
+                        if !is_default && profile_id.starts_with("Page ") {
+                            resp.context_menu(|ui| {
+                                if ui.button("Delete page").clicked() {
+                                    ui.close_menu();
+                                    let deleting_selected = profile_id == &selected_profile;
+                                    let device_id = device.id.clone();
+                                    let to_delete = profile_id.clone();
+                                    self.runtime.block_on(async {
+                                        riverdeck_core::api::profiles::delete_profile(
+                                            device_id.clone(),
+                                            to_delete,
+                                        )
+                                        .await;
+                                        if deleting_selected {
+                                            // Choose a remaining page deterministically.
+                                            let mut remaining = riverdeck_core::api::profiles::get_profiles(&device_id)
+                                                .unwrap_or_else(|_| vec!["Default".to_owned()]);
+                                            remaining.retain(|p| p != profile_id);
+                                            let next = if remaining.iter().any(|p| p == "Default") {
+                                                "Default".to_owned()
+                                            } else {
+                                                remaining.first().cloned().unwrap_or_else(|| "Default".to_owned())
+                                            };
+                                            let _ = riverdeck_core::api::profiles::set_selected_profile(device_id, next).await;
+                                        }
+                                    });
+                                }
+                            });
+                        }
+                    }
+
+                    if ui.button("+").clicked() {
+                        // Create next available Page N and switch to it.
+                        let mut n = 2;
+                        loop {
+                            let candidate = format!("Page {n}");
+                            if !profiles.iter().any(|p| p == &candidate) {
+                                let _ = self.runtime.block_on(async {
+                                    riverdeck_core::api::profiles::set_selected_profile(
+                                        device.id.clone(),
+                                        candidate,
+                                    )
+                                    .await
+                                });
+                                break;
+                            }
+                            n += 1;
                         }
                     }
                 });
-            }
+            });
         });
+
+        // Floating drag preview + drop handling.
+        if let Some(action) = self.drag_payload.clone() {
+            let action_preview = action.clone();
+            if let Some(pos) = ctx.input(|i| i.pointer.latest_pos()) {
+                let preview_pos = pos + egui::vec2(16.0, 16.0);
+                egui::Area::new("riverdeck_drag_preview".into())
+                    .fixed_pos(preview_pos)
+                    .interactable(false)
+                    .show(ctx, |ui| {
+                        egui::Frame::popup(ui.style())
+                            .corner_radius(egui::CornerRadius::same(10))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    let icon_size = egui::vec2(32.0, 32.0);
+                                    if let Some(path) = Self::action_icon_path(&action_preview)
+                                        && let Some(tex) = self.texture_for_path(ctx, path)
+                                    {
+                                        ui.image((tex.id(), icon_size));
+                                    }
+                                    ui.label(&action_preview.name);
+                                });
+                            });
+                    });
+            }
+
+            // On mouse/touch release: apply if hovering a valid slot, otherwise cancel.
+            if ctx.input(|i| i.pointer.any_released()) {
+                if self.drag_hover_valid
+                    && let Some(slot) = self.drag_hover_slot.clone()
+                    && let Some(device) = selected_device.as_ref()
+                {
+                    let ctx_to_set = shared::Context {
+                        device: device.id.clone(),
+                        profile: selected_profile.clone(),
+                        controller: slot.controller.clone(),
+                        position: slot.position,
+                    };
+                    let _ = self.runtime.block_on(async {
+                        riverdeck_core::api::instances::create_instance(action.clone(), ctx_to_set)
+                            .await
+                    });
+                }
+
+                self.drag_payload = None;
+                self.drag_hover_slot = None;
+                self.drag_hover_valid = false;
+            }
+        }
 
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
