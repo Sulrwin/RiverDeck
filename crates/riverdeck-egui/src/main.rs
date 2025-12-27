@@ -1172,19 +1172,25 @@ impl RiverDeckApp {
 
             // Overlay label preview (matches device behavior).
             if let Some(st) = instance.states.get(instance.current_state as usize) {
-                let label = st.text.trim();
-                if !label.is_empty() {
-                    let font = egui::FontId::proportional(11.0);
-                    let bg = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 150);
-                    let fg = ui.visuals().text_color();
-                    match st.text_placement {
+                let title = st.text.trim();
+                let action_name = instance.action.name.trim();
+                let show_title = st.show && !title.is_empty();
+                let show_action_name = st.show_action_name && !action_name.is_empty();
+
+                let font = egui::FontId::proportional(11.0);
+                let bg = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 150);
+                let fg = ui.visuals().text_color();
+
+                // Helper to render text at a placement
+                let render_text_at_placement = |text: &str, placement: shared::TextPlacement| {
+                    match placement {
                         shared::TextPlacement::Top => {
                             let r = egui::Rect::from_min_max(
                                 rect.min + egui::vec2(4.0, 4.0),
                                 egui::pos2(rect.max.x - 4.0, rect.min.y + 18.0),
                             );
                             painter.rect_filled(r, 4.0, bg);
-                            painter.text(r.center(), egui::Align2::CENTER_CENTER, label, font, fg);
+                            painter.text(r.center(), egui::Align2::CENTER_CENTER, text, font, fg);
                         }
                         shared::TextPlacement::Bottom => {
                             let r = egui::Rect::from_min_max(
@@ -1192,10 +1198,10 @@ impl RiverDeckApp {
                                 rect.max - egui::vec2(4.0, 4.0),
                             );
                             painter.rect_filled(r, 4.0, bg);
-                            painter.text(r.center(), egui::Align2::CENTER_CENTER, label, font, fg);
+                            painter.text(r.center(), egui::Align2::CENTER_CENTER, text, font, fg);
                         }
                         shared::TextPlacement::Left => {
-                            let vertical = label
+                            let vertical = text
                                 .chars()
                                 .take(10)
                                 .map(|c| c.to_string())
@@ -1215,7 +1221,7 @@ impl RiverDeckApp {
                             );
                         }
                         shared::TextPlacement::Right => {
-                            let vertical = label
+                            let vertical = text
                                 .chars()
                                 .take(10)
                                 .map(|c| c.to_string())
@@ -1235,6 +1241,28 @@ impl RiverDeckApp {
                             );
                         }
                     }
+                };
+
+                // Keep legacy behavior: the Stream Deck "Title" uses `text_placement`.
+                if show_title {
+                    render_text_at_placement(title, st.text_placement);
+                }
+
+                // If the title already equals the action name (common default), don't render both.
+                if show_action_name && (!show_title || title != action_name) {
+                    let opposite = |p: shared::TextPlacement| match p {
+                        shared::TextPlacement::Top => shared::TextPlacement::Bottom,
+                        shared::TextPlacement::Bottom => shared::TextPlacement::Top,
+                        shared::TextPlacement::Left => shared::TextPlacement::Right,
+                        shared::TextPlacement::Right => shared::TextPlacement::Left,
+                    };
+                    let placement = if show_title {
+                        opposite(st.text_placement)
+                    } else {
+                        // If there's no title, keep the action name in the familiar place.
+                        shared::TextPlacement::Bottom
+                    };
+                    render_text_at_placement(action_name, placement);
                 }
             }
         } else {
@@ -1323,19 +1351,25 @@ impl RiverDeckApp {
 
             // Overlay label preview (matches device behavior).
             if let Some(st) = instance.states.get(instance.current_state as usize) {
-                let label = st.text.trim();
-                if !label.is_empty() {
-                    let font = egui::FontId::proportional(10.0);
-                    let bg = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 150);
-                    let fg = visuals.text_color();
-                    match st.text_placement {
+                let title = st.text.trim();
+                let action_name = instance.action.name.trim();
+                let show_title = st.show && !title.is_empty();
+                let show_action_name = st.show_action_name && !action_name.is_empty();
+
+                let font = egui::FontId::proportional(10.0);
+                let bg = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 150);
+                let fg = visuals.text_color();
+
+                // Helper to render text at a placement
+                let render_text_at_placement = |text: &str, placement: shared::TextPlacement| {
+                    match placement {
                         shared::TextPlacement::Top => {
                             let r = egui::Rect::from_center_size(
                                 egui::pos2(rect.center().x, rect.min.y + 10.0),
                                 egui::vec2(rect.width() - 8.0, 16.0),
                             );
                             painter.rect_filled(r, 8.0, bg);
-                            painter.text(r.center(), egui::Align2::CENTER_CENTER, label, font, fg);
+                            painter.text(r.center(), egui::Align2::CENTER_CENTER, text, font, fg);
                         }
                         shared::TextPlacement::Bottom => {
                             let r = egui::Rect::from_center_size(
@@ -1343,10 +1377,10 @@ impl RiverDeckApp {
                                 egui::vec2(rect.width() - 8.0, 16.0),
                             );
                             painter.rect_filled(r, 8.0, bg);
-                            painter.text(r.center(), egui::Align2::CENTER_CENTER, label, font, fg);
+                            painter.text(r.center(), egui::Align2::CENTER_CENTER, text, font, fg);
                         }
                         shared::TextPlacement::Left => {
-                            let vertical = label
+                            let vertical = text
                                 .chars()
                                 .take(8)
                                 .map(|c| c.to_string())
@@ -1366,7 +1400,7 @@ impl RiverDeckApp {
                             );
                         }
                         shared::TextPlacement::Right => {
-                            let vertical = label
+                            let vertical = text
                                 .chars()
                                 .take(8)
                                 .map(|c| c.to_string())
@@ -1386,6 +1420,28 @@ impl RiverDeckApp {
                             );
                         }
                     }
+                };
+
+                // Keep legacy behavior: the Stream Deck "Title" uses `text_placement`.
+                if show_title {
+                    render_text_at_placement(title, st.text_placement);
+                }
+
+                // If the title already equals the action name (common default), don't render both.
+                if show_action_name && (!show_title || title != action_name) {
+                    let opposite = |p: shared::TextPlacement| match p {
+                        shared::TextPlacement::Top => shared::TextPlacement::Bottom,
+                        shared::TextPlacement::Bottom => shared::TextPlacement::Top,
+                        shared::TextPlacement::Left => shared::TextPlacement::Right,
+                        shared::TextPlacement::Right => shared::TextPlacement::Left,
+                    };
+                    let placement = if show_title {
+                        opposite(st.text_placement)
+                    } else {
+                        // If there's no title, keep the action name in the familiar place.
+                        shared::TextPlacement::Bottom
+                    };
+                    render_text_at_placement(action_name, placement);
                 }
             }
         } else {

@@ -1,10 +1,18 @@
 
-![Logo](.github/readme/logotrans2.png)
+<p align="center">
+  <img src=".github/readme/logotrans2.png" alt="RiverDeck logo" />
+</p>
 
-Linux software for your Elgato Stream Deck
+---
 
-![Main menu](.github/readme/mainmenu.png)
-[More screenshots](#showcase)
+<p align="center">
+  <strong>Linux software for your Elgato Stream Deck</strong>
+</p>
+
+<p align="center">
+  <img src=".github/readme/mainmenu-plugins-profiles.png" alt="Main menu" /><br>
+  <a href="#showcase">More screenshots</a>
+</p>
 
 RiverDeck is a desktop application for using stream controller devices like the Elgato Stream Deck on Linux, Windows, and macOS. RiverDeck supports plugins made for the original Stream Deck SDK, allowing many plugins made for the Elgato software ecosystem to be used, or the [OpenAction](https://openaction.amankhanna.me/) API.
 
@@ -114,7 +122,5 @@ RiverDeck is licensed under the GNU General Public License version 3.0 or later.
 
 ## Showcase
 
-![Main menu](.github/readme/mainmenu.png)
+![Main menu](.github/readme/mainmenu-plugins-profiles.png)
 ![Multi action](.github/readme/multiaction.png)
-![Plugins](.github/readme/plugins.png)
-![Profiles](.github/readme/profiles.png)
