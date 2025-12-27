@@ -1181,71 +1181,73 @@ impl RiverDeckApp {
                 let bg = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 150);
                 let fg = ui.visuals().text_color();
 
-                // Helper to render text at a placement
-                let render_text_at_placement = |text: &str, placement: shared::TextPlacement| {
-                    match placement {
-                        shared::TextPlacement::Top => {
-                            let r = egui::Rect::from_min_max(
-                                rect.min + egui::vec2(4.0, 4.0),
-                                egui::pos2(rect.max.x - 4.0, rect.min.y + 18.0),
-                            );
-                            painter.rect_filled(r, 4.0, bg);
-                            painter.text(r.center(), egui::Align2::CENTER_CENTER, text, font, fg);
+                // Helper macro to render text at a placement
+                macro_rules! render_text_at_placement {
+                    ($text:expr, $placement:expr) => {
+                        match $placement {
+                            shared::TextPlacement::Top => {
+                                let r = egui::Rect::from_min_max(
+                                    rect.min + egui::vec2(4.0, 4.0),
+                                    egui::pos2(rect.max.x - 4.0, rect.min.y + 18.0),
+                                );
+                                painter.rect_filled(r, 4.0, bg);
+                                painter.text(r.center(), egui::Align2::CENTER_CENTER, $text, font.clone(), fg);
+                            }
+                            shared::TextPlacement::Bottom => {
+                                let r = egui::Rect::from_min_max(
+                                    egui::pos2(rect.min.x + 4.0, rect.max.y - 18.0),
+                                    rect.max - egui::vec2(4.0, 4.0),
+                                );
+                                painter.rect_filled(r, 4.0, bg);
+                                painter.text(r.center(), egui::Align2::CENTER_CENTER, $text, font.clone(), fg);
+                            }
+                            shared::TextPlacement::Left => {
+                                let vertical = $text
+                                    .chars()
+                                    .take(10)
+                                    .map(|c| c.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                let r = egui::Rect::from_min_max(
+                                    rect.min + egui::vec2(4.0, 4.0),
+                                    egui::pos2(rect.min.x + 18.0, rect.max.y - 4.0),
+                                );
+                                painter.rect_filled(r, 4.0, bg);
+                                painter.text(
+                                    r.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    vertical,
+                                    font.clone(),
+                                    fg,
+                                );
+                            }
+                            shared::TextPlacement::Right => {
+                                let vertical = $text
+                                    .chars()
+                                    .take(10)
+                                    .map(|c| c.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                let r = egui::Rect::from_min_max(
+                                    egui::pos2(rect.max.x - 18.0, rect.min.y + 4.0),
+                                    rect.max - egui::vec2(4.0, 4.0),
+                                );
+                                painter.rect_filled(r, 4.0, bg);
+                                painter.text(
+                                    r.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    vertical,
+                                    font.clone(),
+                                    fg,
+                                );
+                            }
                         }
-                        shared::TextPlacement::Bottom => {
-                            let r = egui::Rect::from_min_max(
-                                egui::pos2(rect.min.x + 4.0, rect.max.y - 18.0),
-                                rect.max - egui::vec2(4.0, 4.0),
-                            );
-                            painter.rect_filled(r, 4.0, bg);
-                            painter.text(r.center(), egui::Align2::CENTER_CENTER, text, font, fg);
-                        }
-                        shared::TextPlacement::Left => {
-                            let vertical = text
-                                .chars()
-                                .take(10)
-                                .map(|c| c.to_string())
-                                .collect::<Vec<_>>()
-                                .join("\n");
-                            let r = egui::Rect::from_min_max(
-                                rect.min + egui::vec2(4.0, 4.0),
-                                egui::pos2(rect.min.x + 18.0, rect.max.y - 4.0),
-                            );
-                            painter.rect_filled(r, 4.0, bg);
-                            painter.text(
-                                r.center(),
-                                egui::Align2::CENTER_CENTER,
-                                vertical,
-                                font,
-                                fg,
-                            );
-                        }
-                        shared::TextPlacement::Right => {
-                            let vertical = text
-                                .chars()
-                                .take(10)
-                                .map(|c| c.to_string())
-                                .collect::<Vec<_>>()
-                                .join("\n");
-                            let r = egui::Rect::from_min_max(
-                                egui::pos2(rect.max.x - 18.0, rect.min.y + 4.0),
-                                rect.max - egui::vec2(4.0, 4.0),
-                            );
-                            painter.rect_filled(r, 4.0, bg);
-                            painter.text(
-                                r.center(),
-                                egui::Align2::CENTER_CENTER,
-                                vertical,
-                                font,
-                                fg,
-                            );
-                        }
-                    }
-                };
+                    };
+                }
 
                 // Keep legacy behavior: the Stream Deck "Title" uses `text_placement`.
                 if show_title {
-                    render_text_at_placement(title, st.text_placement);
+                    render_text_at_placement!(title, st.text_placement);
                 }
 
                 // If the title already equals the action name (common default), don't render both.
@@ -1262,7 +1264,7 @@ impl RiverDeckApp {
                         // If there's no title, keep the action name in the familiar place.
                         shared::TextPlacement::Bottom
                     };
-                    render_text_at_placement(action_name, placement);
+                    render_text_at_placement!(action_name, placement);
                 }
             }
         } else {
@@ -1360,71 +1362,73 @@ impl RiverDeckApp {
                 let bg = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 150);
                 let fg = visuals.text_color();
 
-                // Helper to render text at a placement
-                let render_text_at_placement = |text: &str, placement: shared::TextPlacement| {
-                    match placement {
-                        shared::TextPlacement::Top => {
-                            let r = egui::Rect::from_center_size(
-                                egui::pos2(rect.center().x, rect.min.y + 10.0),
-                                egui::vec2(rect.width() - 8.0, 16.0),
-                            );
-                            painter.rect_filled(r, 8.0, bg);
-                            painter.text(r.center(), egui::Align2::CENTER_CENTER, text, font, fg);
+                // Helper macro to render text at a placement
+                macro_rules! render_text_at_placement {
+                    ($text:expr, $placement:expr) => {
+                        match $placement {
+                            shared::TextPlacement::Top => {
+                                let r = egui::Rect::from_center_size(
+                                    egui::pos2(rect.center().x, rect.min.y + 10.0),
+                                    egui::vec2(rect.width() - 8.0, 16.0),
+                                );
+                                painter.rect_filled(r, 8.0, bg);
+                                painter.text(r.center(), egui::Align2::CENTER_CENTER, $text, font.clone(), fg);
+                            }
+                            shared::TextPlacement::Bottom => {
+                                let r = egui::Rect::from_center_size(
+                                    egui::pos2(rect.center().x, rect.max.y - 10.0),
+                                    egui::vec2(rect.width() - 8.0, 16.0),
+                                );
+                                painter.rect_filled(r, 8.0, bg);
+                                painter.text(r.center(), egui::Align2::CENTER_CENTER, $text, font.clone(), fg);
+                            }
+                            shared::TextPlacement::Left => {
+                                let vertical = $text
+                                    .chars()
+                                    .take(8)
+                                    .map(|c| c.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                let r = egui::Rect::from_center_size(
+                                    egui::pos2(rect.min.x + 10.0, rect.center().y),
+                                    egui::vec2(16.0, rect.height() - 8.0),
+                                );
+                                painter.rect_filled(r, 8.0, bg);
+                                painter.text(
+                                    r.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    vertical,
+                                    font.clone(),
+                                    fg,
+                                );
+                            }
+                            shared::TextPlacement::Right => {
+                                let vertical = $text
+                                    .chars()
+                                    .take(8)
+                                    .map(|c| c.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                let r = egui::Rect::from_center_size(
+                                    egui::pos2(rect.max.x - 10.0, rect.center().y),
+                                    egui::vec2(16.0, rect.height() - 8.0),
+                                );
+                                painter.rect_filled(r, 8.0, bg);
+                                painter.text(
+                                    r.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    vertical,
+                                    font.clone(),
+                                    fg,
+                                );
+                            }
                         }
-                        shared::TextPlacement::Bottom => {
-                            let r = egui::Rect::from_center_size(
-                                egui::pos2(rect.center().x, rect.max.y - 10.0),
-                                egui::vec2(rect.width() - 8.0, 16.0),
-                            );
-                            painter.rect_filled(r, 8.0, bg);
-                            painter.text(r.center(), egui::Align2::CENTER_CENTER, text, font, fg);
-                        }
-                        shared::TextPlacement::Left => {
-                            let vertical = text
-                                .chars()
-                                .take(8)
-                                .map(|c| c.to_string())
-                                .collect::<Vec<_>>()
-                                .join("\n");
-                            let r = egui::Rect::from_center_size(
-                                egui::pos2(rect.min.x + 10.0, rect.center().y),
-                                egui::vec2(16.0, rect.height() - 8.0),
-                            );
-                            painter.rect_filled(r, 8.0, bg);
-                            painter.text(
-                                r.center(),
-                                egui::Align2::CENTER_CENTER,
-                                vertical,
-                                font,
-                                fg,
-                            );
-                        }
-                        shared::TextPlacement::Right => {
-                            let vertical = text
-                                .chars()
-                                .take(8)
-                                .map(|c| c.to_string())
-                                .collect::<Vec<_>>()
-                                .join("\n");
-                            let r = egui::Rect::from_center_size(
-                                egui::pos2(rect.max.x - 10.0, rect.center().y),
-                                egui::vec2(16.0, rect.height() - 8.0),
-                            );
-                            painter.rect_filled(r, 8.0, bg);
-                            painter.text(
-                                r.center(),
-                                egui::Align2::CENTER_CENTER,
-                                vertical,
-                                font,
-                                fg,
-                            );
-                        }
-                    }
-                };
+                    };
+                }
 
                 // Keep legacy behavior: the Stream Deck "Title" uses `text_placement`.
                 if show_title {
-                    render_text_at_placement(title, st.text_placement);
+                    render_text_at_placement!(title, st.text_placement);
                 }
 
                 // If the title already equals the action name (common default), don't render both.
@@ -1441,7 +1445,7 @@ impl RiverDeckApp {
                         // If there's no title, keep the action name in the familiar place.
                         shared::TextPlacement::Bottom
                     };
-                    render_text_at_placement(action_name, placement);
+                    render_text_at_placement!(action_name, placement);
                 }
             }
         } else {

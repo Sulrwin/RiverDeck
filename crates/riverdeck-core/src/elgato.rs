@@ -181,64 +181,6 @@ fn overlay_label(
     image::DynamicImage::ImageRgba8(img)
 }
 
-fn label_for_context_nonblocking(
-    context: &crate::shared::Context,
-) -> Option<Vec<(String, crate::shared::TextPlacement)>> {
-    // IMPORTANT: do not await on `PROFILE_STORES` here.
-    // `update_image()` is called from event handlers that may already hold profile locks; awaiting
-    // would deadlock. Best-effort: if locks are contended, skip the overlay.
-    let Ok(profile_stores) = crate::store::profiles::PROFILE_STORES.try_read() else {
-        return None;
-    };
-    let dev = crate::shared::DEVICES.get(&context.device)?.value().clone();
-    let store = profile_stores
-        .get_profile_store(&dev, &context.profile)
-        .ok()?;
-    let page = store.value.pages.iter().find(|p| p.id == context.page)?;
-
-    let slot: &Option<crate::shared::ActionInstance> = match context.controller.as_str() {
-        "Encoder" => page.sliders.get(context.position as usize)?,
-        _ => page.keys.get(context.position as usize)?,
-    };
-    let instance = slot.as_ref()?;
-    let st = instance.states.get(instance.current_state as usize)?;
-
-    let title = st.text.trim().to_owned();
-    let action_name = instance.action.name.trim().to_owned();
-    let show_title = st.show && !title.is_empty();
-    let show_action_name = st.show_action_name && !action_name.is_empty();
-
-    if !show_title && !show_action_name {
-        return None;
-    }
-
-    let mut overlays: Vec<(String, crate::shared::TextPlacement)> = Vec::new();
-
-    // Keep legacy behavior: the Stream Deck "Title" uses `text_placement`.
-    if show_title {
-        overlays.push((title.clone(), st.text_placement));
-    }
-
-    // If the title already equals the action name (common default), don't render both.
-    if show_action_name && (!show_title || title.trim() != action_name.trim()) {
-        let opposite = |p: crate::shared::TextPlacement| match p {
-            crate::shared::TextPlacement::Top => crate::shared::TextPlacement::Bottom,
-            crate::shared::TextPlacement::Bottom => crate::shared::TextPlacement::Top,
-            crate::shared::TextPlacement::Left => crate::shared::TextPlacement::Right,
-            crate::shared::TextPlacement::Right => crate::shared::TextPlacement::Left,
-        };
-        let placement = if show_title {
-            opposite(st.text_placement)
-        } else {
-            // If there's no title, keep the action name in the familiar place.
-            crate::shared::TextPlacement::Bottom
-        };
-        overlays.push((action_name, placement));
-    }
-
-    Some(overlays)
-}
-
 async fn load_dynamic_image(image: &str) -> Result<image::DynamicImage, anyhow::Error> {
     if image.trim().starts_with("data:") {
         // Stream Deck SDK commonly uses data URLs.
@@ -282,10 +224,10 @@ async fn load_dynamic_image(image: &str) -> Result<image::DynamicImage, anyhow::
 pub async fn update_image(
     context: &crate::shared::Context,
     image: Option<&str>,
+    overlays: Option<Vec<(String, crate::shared::TextPlacement)>>,
 ) -> Result<(), anyhow::Error> {
     if let Some(device) = ELGATO_DEVICES.read().await.get(&context.device) {
         if let Some(image) = image {
-            let overlays = label_for_context_nonblocking(context);
             let dyn_img = load_dynamic_image(image).await?;
 
             if context.controller == "Encoder" {
@@ -306,6 +248,8 @@ pub async fn update_image(
                     )
                     .await?;
             } else {
+                // Apply text overlays directly to the image. The elgato-streamdeck crate handles
+                // any necessary image format conversion and resizing internally.
                 let mut final_img = dyn_img;
                 if let Some(overlays) = overlays {
                     for (label, placement) in overlays {

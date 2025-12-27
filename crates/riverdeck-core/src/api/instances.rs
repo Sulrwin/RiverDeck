@@ -113,7 +113,7 @@ pub async fn set_button_label(context: ActionContext, label: String) -> Result<(
     else {
         return Ok(());
     };
-    let (apply_ctx, apply_img, apply_active) = {
+    let (apply_ctx, apply_img, apply_overlays, apply_active) = {
         for st in instance.states.iter_mut() {
             st.text = label.clone();
         }
@@ -130,18 +130,20 @@ pub async fn set_button_label(context: ActionContext, label: String) -> Result<(
         (
             instance.context.clone(),
             img,
+            crate::events::outbound::devices::overlays_for_instance(instance),
             active_profile && active_page == instance.context.page,
         )
     };
     save_profile(&context.device, &mut locks).await?;
     if apply_active {
-        let _ = crate::events::outbound::devices::update_image(
+        let _ = crate::events::outbound::devices::update_image_with_overlays(
             (&apply_ctx).into(),
             if apply_img.trim().is_empty() {
                 None
             } else {
                 Some(apply_img)
             },
+            apply_overlays,
         )
         .await;
     }
@@ -173,7 +175,7 @@ pub async fn set_button_label_placement(
     else {
         return Ok(());
     };
-    let (apply_ctx, apply_img, apply_active) = {
+    let (apply_ctx, apply_img, apply_overlays, apply_active) = {
         for st in instance.states.iter_mut() {
             st.text_placement = placement;
         }
@@ -190,18 +192,20 @@ pub async fn set_button_label_placement(
         (
             instance.context.clone(),
             img,
+            crate::events::outbound::devices::overlays_for_instance(instance),
             active_profile && active_page == instance.context.page,
         )
     };
     save_profile(&context.device, &mut locks).await?;
     if apply_active {
-        let _ = crate::events::outbound::devices::update_image(
+        let _ = crate::events::outbound::devices::update_image_with_overlays(
             (&apply_ctx).into(),
             if apply_img.trim().is_empty() {
                 None
             } else {
                 Some(apply_img)
             },
+            apply_overlays,
         )
         .await;
     }
@@ -233,7 +237,7 @@ pub async fn set_button_show_title(
     else {
         return Ok(());
     };
-    let (apply_ctx, apply_img, apply_active) = {
+    let (apply_ctx, apply_img, apply_overlays, apply_active) = {
         for st in instance.states.iter_mut() {
             st.show = show_title;
         }
@@ -250,18 +254,20 @@ pub async fn set_button_show_title(
         (
             instance.context.clone(),
             img,
+            crate::events::outbound::devices::overlays_for_instance(instance),
             active_profile && active_page == instance.context.page,
         )
     };
     save_profile(&context.device, &mut locks).await?;
     if apply_active {
-        let _ = crate::events::outbound::devices::update_image(
+        let _ = crate::events::outbound::devices::update_image_with_overlays(
             (&apply_ctx).into(),
             if apply_img.trim().is_empty() {
                 None
             } else {
                 Some(apply_img)
             },
+            apply_overlays,
         )
         .await;
     }
@@ -293,7 +299,7 @@ pub async fn set_button_show_action_name(
     else {
         return Ok(());
     };
-    let (apply_ctx, apply_img, apply_active) = {
+    let (apply_ctx, apply_img, apply_overlays, apply_active) = {
         for st in instance.states.iter_mut() {
             st.show_action_name = show_action_name;
         }
@@ -310,18 +316,20 @@ pub async fn set_button_show_action_name(
         (
             instance.context.clone(),
             img,
+            crate::events::outbound::devices::overlays_for_instance(instance),
             active_profile && active_page == instance.context.page,
         )
     };
     save_profile(&context.device, &mut locks).await?;
     if apply_active {
-        let _ = crate::events::outbound::devices::update_image(
+        let _ = crate::events::outbound::devices::update_image_with_overlays(
             (&apply_ctx).into(),
             if apply_img.trim().is_empty() {
                 None
             } else {
                 Some(apply_img)
             },
+            apply_overlays,
         )
         .await;
     }
@@ -368,7 +376,7 @@ pub async fn set_custom_icon_from_path(
         .ok()
         .is_some_and(|p| p == context.profile);
 
-    let (apply_ctx, apply_img, apply_active) = {
+    let (apply_ctx, apply_img, apply_overlays, apply_active) = {
         let Some(instance) = crate::store::profiles::get_instance_mut(&context, &mut locks).await?
         else {
             return Ok(());
@@ -398,19 +406,21 @@ pub async fn set_custom_icon_from_path(
             .filter(|s| !s.is_empty() && *s != "actionDefaultImage")
             .map(|s| s.to_owned())
             .unwrap_or_else(|| instance.action.icon.clone());
-        (instance.context.clone(), img, apply_active)
+        let overlays = crate::events::outbound::devices::overlays_for_instance(instance);
+        (instance.context.clone(), img, overlays, apply_active)
     };
 
     save_profile(&context.device, &mut locks).await?;
 
     if apply_active {
-        let _ = crate::events::outbound::devices::update_image(
+        let _ = crate::events::outbound::devices::update_image_with_overlays(
             (&apply_ctx).into(),
             if apply_img.trim().is_empty() {
                 None
             } else {
                 Some(apply_img)
             },
+            apply_overlays,
         )
         .await;
     }
@@ -429,7 +439,7 @@ pub async fn clear_custom_icon(
         .ok()
         .is_some_and(|p| p == context.profile);
 
-    let (apply_ctx, apply_img, apply_active) = {
+    let (apply_ctx, apply_img, apply_overlays, apply_active) = {
         let Some(instance) = crate::store::profiles::get_instance_mut(&context, &mut locks).await?
         else {
             return Ok(());
@@ -455,19 +465,21 @@ pub async fn clear_custom_icon(
             .filter(|s| !s.is_empty() && *s != "actionDefaultImage")
             .map(|s| s.to_owned())
             .unwrap_or_else(|| instance.action.icon.clone());
-        (instance.context.clone(), img, apply_active)
+        let overlays = crate::events::outbound::devices::overlays_for_instance(instance);
+        (instance.context.clone(), img, overlays, apply_active)
     };
 
     save_profile(&context.device, &mut locks).await?;
 
     if apply_active {
-        let _ = crate::events::outbound::devices::update_image(
+        let _ = crate::events::outbound::devices::update_image_with_overlays(
             (&apply_ctx).into(),
             if apply_img.trim().is_empty() {
                 None
             } else {
                 Some(apply_img)
             },
+            apply_overlays,
         )
         .await;
     }
@@ -625,7 +637,11 @@ pub async fn update_image(context: Context, image: String) {
         return;
     }
 
-    if let Err(error) = crate::events::outbound::devices::update_image(context, Some(image)).await {
+    let overlays = crate::events::outbound::devices::overlays_for_context(&context).await;
+    if let Err(error) =
+        crate::events::outbound::devices::update_image_with_overlays(context, Some(image), overlays)
+            .await
+    {
         log::warn!("Failed to update device image: {}", error);
     }
 }

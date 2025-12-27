@@ -88,13 +88,9 @@ pub async fn set_title(
                 .filter(|s| !s.is_empty() && *s != "actionDefaultImage")
                 .map(|s| s.to_owned())
                 .unwrap_or_else(|| instance.action.icon.clone());
-            let _ = crate::events::outbound::devices::update_image(
-                (&instance.context).into(),
-                if img.trim().is_empty() {
-                    None
-                } else {
-                    Some(img)
-                },
+            let _ = crate::events::outbound::devices::update_image_for_instance(
+                instance,
+                if img.trim().is_empty() { None } else { Some(img) },
             )
             .await;
         }
@@ -181,16 +177,11 @@ pub async fn set_image(
                 .map(|s| s.to_owned())
                 .unwrap_or_else(|| instance.action.icon.clone());
 
-            if let Err(error) = crate::events::outbound::devices::update_image(
-                (&instance.context).into(),
-                if img.trim().is_empty() {
-                    None
-                } else {
-                    Some(img)
-                },
+            if let Err(error) = crate::events::outbound::devices::update_image_for_instance(
+                instance,
+                if img.trim().is_empty() { None } else { Some(img) },
             )
-            .await
-            {
+            .await {
                 log::warn!("Failed to update device image after setImage: {}", error);
             }
         }
@@ -228,16 +219,11 @@ pub async fn set_state(
                 .filter(|s| !s.is_empty() && *s != "actionDefaultImage")
                 .map(|s| s.to_owned())
                 .unwrap_or_else(|| instance.action.icon.clone());
-            if let Err(error) = crate::events::outbound::devices::update_image(
-                (&instance.context).into(),
-                if img.trim().is_empty() {
-                    None
-                } else {
-                    Some(img)
-                },
+            if let Err(error) = crate::events::outbound::devices::update_image_for_instance(
+                instance,
+                if img.trim().is_empty() { None } else { Some(img) },
             )
-            .await
-            {
+            .await {
                 log::warn!("Failed to update device image after setState: {}", error);
             }
         }

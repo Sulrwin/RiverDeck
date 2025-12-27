@@ -36,7 +36,7 @@ pub async fn will_appear(instance: &ActionInstance) -> Result<(), anyhow::Error>
         .map(|s| s.to_owned())
         .unwrap_or_else(|| instance.action.icon.clone());
     if let Err(error) =
-        crate::events::outbound::devices::update_image((&instance.context).into(), Some(img)).await
+        crate::events::outbound::devices::update_image_for_instance(instance, Some(img)).await
     {
         log::warn!(
             "Failed to set initial device image on willAppear: {}",
@@ -65,7 +65,7 @@ pub async fn will_disappear(
 
     if clear_on_device
         && let Err(error) =
-            crate::events::outbound::devices::update_image((&instance.context).into(), None).await
+            crate::events::outbound::devices::update_image_for_instance(instance, None).await
     {
         log::warn!("Failed to clear device image: {}", error);
     }
