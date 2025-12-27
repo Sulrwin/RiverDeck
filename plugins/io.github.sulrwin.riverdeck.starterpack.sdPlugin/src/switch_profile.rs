@@ -1,6 +1,6 @@
 use openaction::*;
 
-// Non-spec OpenDeck-specific protocols are used in this file.
+// Non-spec RiverDeck-specific protocols are used in this file.
 
 #[derive(serde::Serialize)]
 struct SwitchProfileEvent {

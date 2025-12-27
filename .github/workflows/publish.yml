@@ -66,7 +66,7 @@ jobs:
         include:
           - platform: ubuntu-22.04
             target: linux-x86_64
-          - platform: ubuntu-22.04-arm
+          - platform: ubuntu-22.04-arm64
             target: linux-aarch64
           - platform: macos-latest
             target: aarch64-apple-darwin
@@ -93,7 +93,7 @@ jobs:
         if: startsWith(matrix.target, 'linux-')
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libudev-dev xdg-utils
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libudev-dev xdg-utils libxdo-dev
 
       - name: Install dependencies (Windows only)
         if: contains(matrix.target, 'windows')
@@ -111,7 +111,7 @@ jobs:
             cargo build --release --target "${{ matrix.target }}" -p riverdeck-egui -p riverdeck-pi
           fi
 
-      - name: Package artifacts (Linux: deb/rpm, others: tar.gz/zip)
+      - name: "Package artifacts (Linux: deb/rpm, others: tar.gz/zip)"
         shell: bash
         run: |
           set -euo pipefail

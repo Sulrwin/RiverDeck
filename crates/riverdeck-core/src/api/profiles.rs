@@ -26,7 +26,10 @@ pub async fn create_profile(
         cloned = Some((src_store.value.clone(), src_id));
     }
 
-    let store = locks.profile_stores.get_profile_store_mut(&dev, &id).await?;
+    let store = locks
+        .profile_stores
+        .get_profile_store_mut(&dev, &id)
+        .await?;
 
     if let Some((mut profile, src_id)) = cloned {
         let old_images_dir = crate::shared::config_dir()
@@ -55,10 +58,10 @@ pub async fn create_profile(
             inst.context.profile = new_profile.to_owned();
             for state in inst.states.iter_mut() {
                 let p = Path::new(state.image.trim());
-                if p.starts_with(old_images_dir) {
-                    if let Ok(rel) = p.strip_prefix(old_images_dir) {
-                        state.image = new_images_dir.join(rel).to_string_lossy().into_owned();
-                    }
+                if p.starts_with(old_images_dir)
+                    && let Ok(rel) = p.strip_prefix(old_images_dir)
+                {
+                    state.image = new_images_dir.join(rel).to_string_lossy().into_owned();
                 }
             }
             if let Some(children) = inst.children.as_mut() {
@@ -76,10 +79,10 @@ pub async fn create_profile(
 
         if let Some(bg) = profile.encoder_screen_background.as_mut() {
             let p = Path::new(bg.trim());
-            if p.starts_with(&old_images_dir) {
-                if let Ok(rel) = p.strip_prefix(&old_images_dir) {
-                    *bg = new_images_dir.join(rel).to_string_lossy().into_owned();
-                }
+            if p.starts_with(&old_images_dir)
+                && let Ok(rel) = p.strip_prefix(&old_images_dir)
+            {
+                *bg = new_images_dir.join(rel).to_string_lossy().into_owned();
             }
         }
 
@@ -167,7 +170,11 @@ pub async fn set_encoder_screen_background(
                 .filter(|s| !s.is_empty() && *s != "actionDefaultImage")
                 .map(|s| s.to_owned())
                 .unwrap_or_else(|| instance.action.icon.clone());
-            let _ = crate::events::outbound::devices::update_image((&instance.context).into(), Some(img)).await;
+            let _ = crate::events::outbound::devices::update_image(
+                (&instance.context).into(),
+                Some(img),
+            )
+            .await;
         }
     }
 

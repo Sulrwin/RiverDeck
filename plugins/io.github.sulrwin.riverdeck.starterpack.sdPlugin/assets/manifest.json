@@ -29,7 +29,7 @@
 			"Controllers": ["Keypad", "Encoder"],
 			"SupportedInMultiActions": true,
 			"Tooltip": "Run a command",
-			"UUID": "com.amansprojects.starterpack.runcommand",
+			"UUID": "io.github.sulrwin.riverdeck.starterpack.runcommand",
 			"PropertyInspectorPath": "propertyInspector/runCommand.html"
 		},
 		{
@@ -39,7 +39,7 @@
 			"Controllers": ["Keypad", "Encoder"],
 			"SupportedInMultiActions": true,
 			"Tooltip": "Simulate mouse or keyboard input",
-			"UUID": "com.amansprojects.starterpack.inputsimulation",
+			"UUID": "io.github.sulrwin.riverdeck.starterpack.inputsimulation",
 			"PropertyInspectorPath": "propertyInspector/inputSimulation.html"
 		},
 		{
@@ -49,7 +49,7 @@
 			"Controllers": ["Keypad"],
 			"SupportedInMultiActions": true,
 			"Tooltip": "Switch the selected profile",
-			"UUID": "com.amansprojects.starterpack.switchprofile",
+			"UUID": "io.github.sulrwin.riverdeck.starterpack.switchprofile",
 			"PropertyInspectorPath": "propertyInspector/switchProfile.html"
 		},
 		{
@@ -59,7 +59,7 @@
 			"Controllers": ["Keypad", "Encoder"],
 			"SupportedInMultiActions": true,
 			"Tooltip": "Change the device brightness",
-			"UUID": "com.amansprojects.starterpack.devicebrightness",
+			"UUID": "io.github.sulrwin.riverdeck.starterpack.devicebrightness",
 			"PropertyInspectorPath": "propertyInspector/deviceBrightness.html"
 		}
 	]

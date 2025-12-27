@@ -17,6 +17,13 @@ pub const BUILTIN_PLUGIN_ID: &str = "riverdeck";
 pub const MULTI_ACTION_UUID: &str = "riverdeck.multiaction";
 pub const TOGGLE_ACTION_UUID: &str = "riverdeck.toggleaction";
 
+// Built-in plugin IDs / UUID namespaces that we want to keep stable, even if older versions used
+// upstream identifiers.
+pub const STARTERPACK_PLUGIN_ID: &str = "io.github.sulrwin.riverdeck.starterpack.sdPlugin";
+pub const LEGACY_STARTERPACK_PLUGIN_ID: &str = "com.amansprojects.starterpack.sdPlugin";
+pub const STARTERPACK_UUID_PREFIX: &str = "io.github.sulrwin.riverdeck.starterpack.";
+pub const LEGACY_STARTERPACK_UUID_PREFIX: &str = "com.amansprojects.starterpack.";
+
 pub fn is_multi_action_uuid(uuid: &str) -> bool {
     uuid == MULTI_ACTION_UUID || uuid == "opendeck.multiaction"
 }
@@ -35,6 +42,35 @@ pub fn normalize_builtin_action(plugin: &mut String, uuid: &mut String) {
         "opendeck.toggleaction" => *uuid = TOGGLE_ACTION_UUID.to_owned(),
         _ => {}
     }
+}
+
+/// Normalize legacy starter pack identifiers to canonical RiverDeck identifiers.
+///
+/// This keeps old profiles/settings working when the bundled starter pack plugin was renamed from
+/// `com.amansprojects.starterpack` to `io.github.sulrwin.riverdeck.starterpack`.
+pub fn normalize_starterpack_action(plugin: &mut String, uuid: &mut String) {
+    if plugin.as_str() == LEGACY_STARTERPACK_PLUGIN_ID {
+        *plugin = STARTERPACK_PLUGIN_ID.to_owned();
+    }
+    if let Some(rest) = uuid.strip_prefix(LEGACY_STARTERPACK_UUID_PREFIX) {
+        *uuid = format!("{STARTERPACK_UUID_PREFIX}{rest}");
+    }
+}
+
+/// Rewrite legacy starter pack paths (absolute or relative) to the canonical plugin folder.
+///
+/// This primarily matters for older profiles that stored absolute icon/PI paths under
+/// `.../plugins/com.amansprojects.starterpack.sdPlugin/...`.
+pub fn normalize_starterpack_paths(value: &mut String) {
+    // Handle both unix-style and windows-style separators. We only touch the plugin segment.
+    *value = value.replace(
+        &format!("/plugins/{LEGACY_STARTERPACK_PLUGIN_ID}/"),
+        &format!("/plugins/{STARTERPACK_PLUGIN_ID}/"),
+    );
+    *value = value.replace(
+        &format!("\\plugins\\{LEGACY_STARTERPACK_PLUGIN_ID}\\"),
+        &format!("\\plugins\\{STARTERPACK_PLUGIN_ID}\\"),
+    );
 }
 
 #[derive(Debug, Clone)]

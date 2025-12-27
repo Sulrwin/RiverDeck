@@ -115,7 +115,11 @@ pub async fn set_image(
 
             if let Err(error) = crate::events::outbound::devices::update_image(
                 (&instance.context).into(),
-                if img.trim().is_empty() { None } else { Some(img) },
+                if img.trim().is_empty() {
+                    None
+                } else {
+                    Some(img)
+                },
             )
             .await
             {
@@ -158,7 +162,11 @@ pub async fn set_state(
                 .unwrap_or_else(|| instance.action.icon.clone());
             if let Err(error) = crate::events::outbound::devices::update_image(
                 (&instance.context).into(),
-                if img.trim().is_empty() { None } else { Some(img) },
+                if img.trim().is_empty() {
+                    None
+                } else {
+                    Some(img)
+                },
             )
             .await
             {

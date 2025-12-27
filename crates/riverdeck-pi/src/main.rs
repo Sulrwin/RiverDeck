@@ -17,27 +17,52 @@ fn main() -> anyhow::Result<()> {
 
     let args = Args::parse(std::env::args().skip(1).collect())?;
 
-    let html = pi_host_html(&args);
-
     let event_loop = EventLoopBuilder::<PiEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
 
-    let mut wb = WindowBuilder::new().with_title(&args.label);
-    if let Some(decorations) = args.decorations {
+    let (title, x, y, w, h, decorations, always_on_top) = match &args {
+        Args::Pi(a) => (
+            a.label.clone(),
+            a.x,
+            a.y,
+            a.w,
+            a.h,
+            a.decorations,
+            a.always_on_top,
+        ),
+        Args::Url(a) => (
+            a.label.clone(),
+            a.x,
+            a.y,
+            a.w,
+            a.h,
+            a.decorations,
+            a.always_on_top,
+        ),
+    };
+
+    let mut wb = WindowBuilder::new().with_title(&title);
+    if let Some(decorations) = decorations {
         wb = wb.with_decorations(decorations);
     }
-    if let Some(always_on_top) = args.always_on_top {
+    if let Some(always_on_top) = always_on_top {
         wb = wb.with_always_on_top(always_on_top);
     }
-    if let (Some(w), Some(h)) = (args.w, args.h) {
+    if let (Some(w), Some(h)) = (w, h) {
         wb = wb.with_inner_size(tao::dpi::LogicalSize::new(w as f64, h as f64));
     }
-    if let (Some(x), Some(y)) = (args.x, args.y) {
+    if let (Some(x), Some(y)) = (x, y) {
         wb = wb.with_position(tao::dpi::LogicalPosition::new(x as f64, y as f64));
     }
     let window = wb.build(&event_loop)?;
 
-    let webview = build_webview(&window, html, proxy)?;
+    let webview = match &args {
+        Args::Pi(a) => {
+            let html = pi_host_html(a);
+            build_pi_webview(&window, html, proxy)?
+        }
+        Args::Url(a) => build_url_webview(&window, &a.url)?,
+    };
 
     event_loop.run(move |event, _target, control_flow| {
         *control_flow = ControlFlow::Wait;
@@ -57,7 +82,7 @@ fn main() -> anyhow::Result<()> {
     });
 }
 
-fn build_webview(
+fn build_pi_webview(
     window: &tao::window::Window,
     html: String,
     proxy: EventLoopProxy<PiEvent>,
@@ -82,8 +107,30 @@ fn build_webview(
     Ok(builder.build(window)?)
 }
 
+fn build_url_webview(window: &tao::window::Window, url: &str) -> anyhow::Result<WebView> {
+    let builder = WebViewBuilder::new()
+        .with_url(url)
+        .with_navigation_handler(|url: String| {
+            if url.starts_with("openaction://")
+                || url.starts_with("streamdeck://")
+                || url.starts_with("riverdeck://")
+            {
+                let _ = open::that_detached(url);
+                return false;
+            }
+            true
+        });
+    Ok(builder.build(window)?)
+}
+
 #[derive(Debug)]
-struct Args {
+enum Args {
+    Pi(PiArgs),
+    Url(UrlArgs),
+}
+
+#[derive(Debug)]
+struct PiArgs {
     label: String,
     pi_src: String,
     origin: String,
@@ -114,14 +161,6 @@ impl Args {
             Ok(value)
         }
 
-        let label = take(&mut argv, "--label")?;
-        let pi_src = take(&mut argv, "--pi-src")?;
-        let origin = take(&mut argv, "--origin")?;
-        let ws_port: u16 = take(&mut argv, "--ws-port")?.parse()?;
-        let context = take(&mut argv, "--context")?;
-        let info_json = take(&mut argv, "--info-json")?;
-        let connect_json = take(&mut argv, "--connect-json")?;
-
         // Optional docking geometry.
         fn take_opt(argv: &mut Vec<String>, key: &str) -> Option<String> {
             let idx = argv.iter().position(|v| v == key)?;
@@ -147,7 +186,32 @@ impl Args {
             _ => None,
         });
 
-        Ok(Self {
+        // URL/web mode (used for marketplace, docs, etc.).
+        if argv.iter().any(|v| v == "--url") {
+            let label = take(&mut argv, "--label")?;
+            let url = take(&mut argv, "--url")?;
+            return Ok(Args::Url(UrlArgs {
+                label,
+                url,
+                x,
+                y,
+                w,
+                h,
+                decorations,
+                always_on_top,
+            }));
+        }
+
+        // PI mode (existing behavior).
+        let label = take(&mut argv, "--label")?;
+        let pi_src = take(&mut argv, "--pi-src")?;
+        let origin = take(&mut argv, "--origin")?;
+        let ws_port: u16 = take(&mut argv, "--ws-port")?.parse()?;
+        let context = take(&mut argv, "--context")?;
+        let info_json = take(&mut argv, "--info-json")?;
+        let connect_json = take(&mut argv, "--connect-json")?;
+
+        Ok(Args::Pi(PiArgs {
             label,
             pi_src,
             origin,
@@ -161,8 +225,20 @@ impl Args {
             h,
             decorations,
             always_on_top,
-        })
+        }))
     }
+}
+
+#[derive(Debug)]
+struct UrlArgs {
+    label: String,
+    url: String,
+    x: Option<i32>,
+    y: Option<i32>,
+    w: Option<i32>,
+    h: Option<i32>,
+    decorations: Option<bool>,
+    always_on_top: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -272,7 +348,7 @@ fn handle_ipc(req: Request<String>, proxy: EventLoopProxy<PiEvent>) {
     }
 }
 
-fn pi_host_html(args: &Args) -> String {
+fn pi_host_html(args: &PiArgs) -> String {
     let origin_json = serde_json::to_string(&args.origin).unwrap_or_else(|_| "\"*\"".to_owned());
     let context_json = serde_json::to_string(&args.context).unwrap_or_else(|_| "\"\"".to_owned());
     format!(

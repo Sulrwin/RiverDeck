@@ -21,14 +21,14 @@ fn mime(extension: &str) -> String {
 /// Start a simple webserver to serve files of plugins that run in a browser environment.
 pub async fn init_webserver(prefix: PathBuf) {
     let server = {
-        let listener = match std::net::TcpListener::bind(format!("0.0.0.0:{}", *super::PORT_BASE + 2))
-        {
-            Ok(l) => l,
-            Err(err) => {
-                error!("Failed to bind plugin webserver socket: {}", err);
-                return;
-            }
-        };
+        let listener =
+            match std::net::TcpListener::bind(format!("0.0.0.0:{}", *super::PORT_BASE + 2)) {
+                Ok(l) => l,
+                Err(err) => {
+                    error!("Failed to bind plugin webserver socket: {}", err);
+                    return;
+                }
+            };
 
         #[cfg(windows)]
         {

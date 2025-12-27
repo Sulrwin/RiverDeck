@@ -10,6 +10,7 @@ pub async fn create_instance(
 ) -> Result<Option<ActionInstance>, anyhow::Error> {
     let mut action = action;
     crate::shared::normalize_builtin_action(&mut action.plugin, &mut action.uuid);
+    crate::shared::normalize_starterpack_action(&mut action.plugin, &mut action.uuid);
 
     if !action.controllers.contains(&context.controller) {
         return Ok(None);
@@ -119,8 +120,7 @@ pub async fn set_custom_icon_from_path(
         .is_some_and(|p| p == context.profile);
 
     let (apply_ctx, apply_img, apply_active) = {
-        let Some(instance) =
-            crate::store::profiles::get_instance_mut(&context, &mut locks).await?
+        let Some(instance) = crate::store::profiles::get_instance_mut(&context, &mut locks).await?
         else {
             return Ok(());
         };
@@ -169,7 +169,10 @@ pub async fn set_custom_icon_from_path(
     Ok(())
 }
 
-pub async fn clear_custom_icon(context: ActionContext, state: Option<u16>) -> Result<(), anyhow::Error> {
+pub async fn clear_custom_icon(
+    context: ActionContext,
+    state: Option<u16>,
+) -> Result<(), anyhow::Error> {
     let mut locks = acquire_locks_mut().await;
     let active = locks
         .device_stores
@@ -178,8 +181,7 @@ pub async fn clear_custom_icon(context: ActionContext, state: Option<u16>) -> Re
         .is_some_and(|p| p == context.profile);
 
     let (apply_ctx, apply_img, apply_active) = {
-        let Some(instance) =
-            crate::store::profiles::get_instance_mut(&context, &mut locks).await?
+        let Some(instance) = crate::store::profiles::get_instance_mut(&context, &mut locks).await?
         else {
             return Ok(());
         };

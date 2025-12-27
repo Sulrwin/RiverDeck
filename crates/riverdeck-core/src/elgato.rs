@@ -50,8 +50,7 @@ async fn load_dynamic_image(image: &str) -> Result<image::DynamicImage, anyhow::
             }
         }
 
-        let path =
-            candidate.ok_or_else(|| anyhow::anyhow!("image path not found: {image}"))?;
+        let path = candidate.ok_or_else(|| anyhow::anyhow!("image path not found: {image}"))?;
         Ok(image::open(path)?)
     }
 }
@@ -102,8 +101,11 @@ pub async fn set_lcd_background(id: &str, image: Option<&str>) -> Result<(), any
         }
         let fmt = device.kind().lcd_image_format().unwrap();
         let dyn_img = if let Some(image) = image {
-            load_dynamic_image(image).await?
-                .resize_exact(800, 100, image::imageops::FilterType::Nearest)
+            load_dynamic_image(image).await?.resize_exact(
+                800,
+                100,
+                image::imageops::FilterType::Nearest,
+            )
         } else {
             image::DynamicImage::new_rgb8(800, 100)
         };
@@ -172,7 +174,10 @@ async fn init(device: AsyncStreamDeck, device_id: String) {
     // those initial image writes are silently skipped.
     let name = device.product().await.unwrap();
     let reader = device.get_reader();
-    ELGATO_DEVICES.write().await.insert(device_id.clone(), device);
+    ELGATO_DEVICES
+        .write()
+        .await
+        .insert(device_id.clone(), device);
 
     crate::events::inbound::devices::register_device(
         "",

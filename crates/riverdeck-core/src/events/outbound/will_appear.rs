@@ -38,7 +38,10 @@ pub async fn will_appear(instance: &ActionInstance) -> Result<(), anyhow::Error>
     if let Err(error) =
         crate::events::outbound::devices::update_image((&instance.context).into(), Some(img)).await
     {
-        log::warn!("Failed to set initial device image on willAppear: {}", error);
+        log::warn!(
+            "Failed to set initial device image on willAppear: {}",
+            error
+        );
     }
 
     Ok(())

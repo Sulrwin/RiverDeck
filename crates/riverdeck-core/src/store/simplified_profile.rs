@@ -192,6 +192,7 @@ impl DiskActionInstance {
 
         let mut states = self.states.clone();
         for state in states.iter_mut() {
+            crate::shared::normalize_starterpack_paths(&mut state.image);
             if let Some(true) = state.image.chars().next().map(|v| v.is_numeric()) {
                 state.image = config_dir
                     .join("images")
@@ -207,13 +208,17 @@ impl DiskActionInstance {
         }
         let mut action = self.action.clone();
         for state in action.states.iter_mut() {
+            crate::shared::normalize_starterpack_paths(&mut state.image);
             state.image = reconstruct_path(&state.image);
         }
+        crate::shared::normalize_starterpack_paths(&mut action.icon);
         action.icon = reconstruct_path(&action.icon);
+        crate::shared::normalize_starterpack_paths(&mut action.property_inspector);
         action.property_inspector = reconstruct_path(&action.property_inspector);
 
         // Normalize legacy OpenDeck built-in actions to RiverDeck equivalents.
         crate::shared::normalize_builtin_action(&mut action.plugin, &mut action.uuid);
+        crate::shared::normalize_starterpack_action(&mut action.plugin, &mut action.uuid);
 
         ActionInstance {
             context: self.context.into_action_context(device, profile),

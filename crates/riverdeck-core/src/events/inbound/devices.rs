@@ -50,12 +50,12 @@ pub async fn register_device(
             .get_profile_store(&DEVICES.get(&event.payload.id).unwrap(), &selected_profile)?;
 
         // Stream Deck+ LCD: apply the stored background before `willAppear` so per-dial images overlay it.
-        if event
-            .payload
-            .screen
-            .as_ref()
-            .is_some_and(|s| matches!(s.placement, crate::shared::ScreenPlacement::BetweenKeypadAndEncoders))
-            && let Some(bg) = profile.value.encoder_screen_background.as_deref()
+        if event.payload.screen.as_ref().is_some_and(|s| {
+            matches!(
+                s.placement,
+                crate::shared::ScreenPlacement::BetweenKeypadAndEncoders
+            )
+        }) && let Some(bg) = profile.value.encoder_screen_background.as_deref()
         {
             let _ = crate::elgato::set_lcd_background(&event.payload.id, Some(bg)).await;
         }
