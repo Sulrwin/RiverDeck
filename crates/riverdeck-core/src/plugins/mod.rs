@@ -9,6 +9,7 @@ use crate::webview;
 
 use std::collections::HashMap;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{fs, path};
 
 use futures::StreamExt;
@@ -30,6 +31,7 @@ pub static DEVICE_NAMESPACES: Lazy<RwLock<HashMap<String, String>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 static INSTANCES: Lazy<Mutex<HashMap<String, PluginInstance>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
+static PLUGIN_SERVERS_STARTED: Lazy<AtomicBool> = Lazy::new(|| AtomicBool::new(false));
 
 pub static PORT_BASE: Lazy<u16> = Lazy::new(|| {
     let mut base = 57116;
@@ -51,6 +53,15 @@ pub async fn initialise_plugin(path: &path::Path) -> anyhow::Result<()> {
     let target = std::env::var("TARGET").unwrap_or_default();
 
     let mut manifest = manifest::read_manifest(path)?;
+
+    // RiverDeck branding: treat legacy OpenDeck categories as our built-in category.
+    // This covers plugins installed under the user's config dir that still declare `"Category": "OpenDeck"`.
+    if manifest.category.trim() == "OpenDeck" {
+        manifest.category = crate::shared::PRODUCT_NAME.to_owned();
+    }
+    if manifest.name.trim() == "OpenDeck Starter Pack" {
+        manifest.name = "RiverDeck Starter Pack".to_owned();
+    }
 
     if let Some(icon) = manifest.category_icon {
         let category_icon_path = path.join(icon);
@@ -473,12 +484,32 @@ pub async fn deactivate_plugins() {
 
 /// Initialise plugins from the plugins directory.
 pub fn initialise_plugins() {
-    tokio::spawn(init_websocket_server());
-    tokio::spawn(webserver::init_webserver(config_dir()));
+    // Servers should be started only once; reloading plugins should not rebind ports.
+    if !PLUGIN_SERVERS_STARTED.swap(true, Ordering::SeqCst) {
+        tokio::spawn(init_websocket_server());
+        tokio::spawn(webserver::init_webserver(config_dir()));
+    } else {
+        log::debug!("Plugin servers already running; skipping server init");
+    }
 
     let plugin_dir = config_dir().join("plugins");
     let _ = fs::create_dir_all(&plugin_dir);
     let _ = fs::create_dir_all(log_dir().join("plugins"));
+
+    // Remove any legacy OpenDeck category bucket so reloading doesn't keep showing it.
+    // (Reload will re-add actions under `PRODUCT_NAME` via the normalization in `initialise_plugin`.)
+    tokio::spawn(async {
+        let mut cats = crate::shared::CATEGORIES.write().await;
+        if let Some(mut open) = cats.remove("OpenDeck") {
+            let target = cats
+                .entry(crate::shared::PRODUCT_NAME.to_owned())
+                .or_insert(crate::shared::Category {
+                    icon: None,
+                    actions: vec![],
+                });
+            target.actions.append(&mut open.actions);
+        }
+    });
 
     if let Some(resource_dir) = crate::shared::resource_dir() {
         let builtin_plugins_dir = resource_dir.join("plugins");

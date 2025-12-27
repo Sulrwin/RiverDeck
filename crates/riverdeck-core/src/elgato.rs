@@ -15,49 +15,54 @@ use tokio::sync::RwLock;
 static ELGATO_DEVICES: Lazy<RwLock<HashMap<String, AsyncStreamDeck>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 
+async fn load_dynamic_image(image: &str) -> Result<image::DynamicImage, anyhow::Error> {
+    if image.trim().starts_with("data:") {
+        // Stream Deck SDK commonly uses data URLs.
+        // Support both base64 and "raw" (non-base64) payloads.
+        let bytes = if image.contains(";base64,") {
+            let (_meta, b64) = image
+                .split_once(";base64,")
+                .ok_or_else(|| anyhow::anyhow!("invalid data url (missing ';base64,')"))?;
+            base64::engine::general_purpose::STANDARD.decode(b64)?
+        } else {
+            let (_meta, raw) = image
+                .split_once(',')
+                .ok_or_else(|| anyhow::anyhow!("invalid data url (missing ',')"))?;
+            raw.as_bytes().to_vec()
+        };
+        Ok(image::load_from_memory(&bytes)?)
+    } else {
+        // RiverDeck stores images as filesystem paths in profiles (including decoded `data:` images).
+        // Also allow built-in relative paths like `riverdeck/...` by resolving against config/resource dirs.
+        let mut candidate: Option<std::path::PathBuf> = None;
+        let p = Path::new(image.trim());
+        if p.is_file() {
+            candidate = Some(p.to_path_buf());
+        } else if image.starts_with("riverdeck/") || image.starts_with("opendeck/") {
+            let cfg = crate::shared::config_dir().join(image.trim());
+            if cfg.is_file() {
+                candidate = Some(cfg);
+            } else if let Some(res) = crate::shared::resource_dir() {
+                let rp = res.join(image.trim());
+                if rp.is_file() {
+                    candidate = Some(rp);
+                }
+            }
+        }
+
+        let path =
+            candidate.ok_or_else(|| anyhow::anyhow!("image path not found: {image}"))?;
+        Ok(image::open(path)?)
+    }
+}
+
 pub async fn update_image(
     context: &crate::shared::Context,
     image: Option<&str>,
 ) -> Result<(), anyhow::Error> {
     if let Some(device) = ELGATO_DEVICES.read().await.get(&context.device) {
         if let Some(image) = image {
-            let dyn_img = if image.trim().starts_with("data:") {
-                // Stream Deck SDK commonly uses data URLs.
-                // Support both base64 and "raw" (non-base64) payloads.
-                let bytes = if image.contains(";base64,") {
-                    let (_meta, b64) = image
-                        .split_once(";base64,")
-                        .ok_or_else(|| anyhow::anyhow!("invalid data url (missing ';base64,')"))?;
-                    base64::engine::general_purpose::STANDARD.decode(b64)?
-                } else {
-                    let (_meta, raw) = image
-                        .split_once(',')
-                        .ok_or_else(|| anyhow::anyhow!("invalid data url (missing ',')"))?;
-                    raw.as_bytes().to_vec()
-                };
-                image::load_from_memory(&bytes)?
-            } else {
-                // RiverDeck stores images as filesystem paths in profiles (including decoded `data:` images).
-                // Also allow built-in relative paths like `riverdeck/...` by resolving against config/resource dirs.
-                let mut candidate: Option<std::path::PathBuf> = None;
-                let p = Path::new(image.trim());
-                if p.is_file() {
-                    candidate = Some(p.to_path_buf());
-                } else if image.starts_with("riverdeck/") || image.starts_with("opendeck/") {
-                    let cfg = crate::shared::config_dir().join(image.trim());
-                    if cfg.is_file() {
-                        candidate = Some(cfg);
-                    } else if let Some(res) = crate::shared::resource_dir() {
-                        let rp = res.join(image.trim());
-                        if rp.is_file() {
-                            candidate = Some(rp);
-                        }
-                    }
-                }
-
-                let path = candidate.ok_or_else(|| anyhow::anyhow!("image path not found: {image}"))?;
-                image::open(path)?
-            };
+            let dyn_img = load_dynamic_image(image).await?;
 
             if context.controller == "Encoder" {
                 device
@@ -85,6 +90,27 @@ pub async fn update_image(
         } else {
             device.clear_button_image(context.position).await?;
         }
+        device.flush().await?;
+    }
+    Ok(())
+}
+
+pub async fn set_lcd_background(id: &str, image: Option<&str>) -> Result<(), anyhow::Error> {
+    if let Some(device) = ELGATO_DEVICES.read().await.get(id) {
+        if device.kind() != Kind::Plus {
+            return Ok(());
+        }
+        let fmt = device.kind().lcd_image_format().unwrap();
+        let dyn_img = if let Some(image) = image {
+            load_dynamic_image(image).await?
+                .resize_exact(800, 100, image::imageops::FilterType::Nearest)
+        } else {
+            image::DynamicImage::new_rgb8(800, 100)
+        };
+
+        device
+            .write_lcd_fill(&convert_image_with_format_async(fmt, dyn_img)?)
+            .await?;
         device.flush().await?;
     }
     Ok(())
@@ -139,28 +165,42 @@ async fn init(device: AsyncStreamDeck, device_id: String) {
         let _ = device.set_brightness(settings.value.brightness).await;
     }
     let _ = device.flush().await;
+
+    // IMPORTANT: register the physical device handle before we emit `willAppear`.
+    // `register_device()` triggers `will_appear()` for each instance, which pushes initial
+    // images to hardware via `elgato::update_image()`. If we haven't inserted the device yet,
+    // those initial image writes are silently skipped.
+    let name = device.product().await.unwrap();
+    let reader = device.get_reader();
+    ELGATO_DEVICES.write().await.insert(device_id.clone(), device);
+
     crate::events::inbound::devices::register_device(
         "",
         crate::events::inbound::PayloadEvent {
             payload: crate::shared::DeviceInfo {
                 id: device_id.clone(),
                 plugin: String::new(),
-                name: device.product().await.unwrap(),
+                name,
                 rows: kind.row_count(),
                 columns: kind.column_count(),
                 encoders: kind.encoder_count(),
                 r#type: device_type,
+                screen: if kind == Kind::Plus {
+                    Some(crate::shared::DeviceScreenInfo {
+                        width_px: 800,
+                        height_px: 100,
+                        segments: kind.encoder_count(),
+                        placement: crate::shared::ScreenPlacement::BetweenKeypadAndEncoders,
+                    })
+                } else {
+                    None
+                },
             },
         },
     )
     .await
     .unwrap();
 
-    let reader = device.get_reader();
-    ELGATO_DEVICES
-        .write()
-        .await
-        .insert(device_id.clone(), device);
     loop {
         let updates = match reader.read(100.0).await {
             Ok(updates) => updates,

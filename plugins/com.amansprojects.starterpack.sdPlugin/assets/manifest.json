@@ -1,13 +1,13 @@
 {
-	"Name": "OpenDeck Starter Pack",
-	"Description": "OpenDeck starter pack plugin",
+	"Name": "RiverDeck Starter Pack",
+	"Description": "RiverDeck starter pack plugin",
 	"Author": "Aman Khanna (nekename)",
 	"Version": "2.7.1",
-	"CodePathWin": "windows/bin/opendeck-starterpack.exe",
-	"CodePathMac": "darwin/bin/opendeck-starterpack",
-	"CodePathLin": "linux/bin/opendeck-starterpack",
+	"CodePathWin": "windows/bin/riverdeck-starterpack.exe",
+	"CodePathMac": "darwin/bin/riverdeck-starterpack",
+	"CodePathLin": "linux/bin/riverdeck-starterpack",
 	"Icon": "icons/plugin",
-	"Category": "OpenDeck",
+	"Category": "RiverDeck",
 	"OS": [
 		{
 			"Platform": "mac",

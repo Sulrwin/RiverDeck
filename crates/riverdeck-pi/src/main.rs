@@ -22,9 +22,20 @@ fn main() -> anyhow::Result<()> {
     let event_loop = EventLoopBuilder::<PiEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
 
-    let window = WindowBuilder::new()
-        .with_title(&args.label)
-        .build(&event_loop)?;
+    let mut wb = WindowBuilder::new().with_title(&args.label);
+    if let Some(decorations) = args.decorations {
+        wb = wb.with_decorations(decorations);
+    }
+    if let Some(always_on_top) = args.always_on_top {
+        wb = wb.with_always_on_top(always_on_top);
+    }
+    if let (Some(w), Some(h)) = (args.w, args.h) {
+        wb = wb.with_inner_size(tao::dpi::LogicalSize::new(w as f64, h as f64));
+    }
+    if let (Some(x), Some(y)) = (args.x, args.y) {
+        wb = wb.with_position(tao::dpi::LogicalPosition::new(x as f64, y as f64));
+    }
+    let window = wb.build(&event_loop)?;
 
     let webview = build_webview(&window, html, proxy)?;
 
@@ -68,6 +79,12 @@ struct Args {
     context: String,
     info_json: String,
     connect_json: String,
+    x: Option<i32>,
+    y: Option<i32>,
+    w: Option<i32>,
+    h: Option<i32>,
+    decorations: Option<bool>,
+    always_on_top: Option<bool>,
 }
 
 impl Args {
@@ -93,6 +110,31 @@ impl Args {
         let info_json = take(&mut argv, "--info-json")?;
         let connect_json = take(&mut argv, "--connect-json")?;
 
+        // Optional docking geometry.
+        fn take_opt(argv: &mut Vec<String>, key: &str) -> Option<String> {
+            let idx = argv.iter().position(|v| v == key)?;
+            if idx + 1 >= argv.len() {
+                return None;
+            }
+            let value = argv.remove(idx + 1);
+            argv.remove(idx);
+            Some(value)
+        }
+        let x = take_opt(&mut argv, "--x").and_then(|v| v.parse::<i32>().ok());
+        let y = take_opt(&mut argv, "--y").and_then(|v| v.parse::<i32>().ok());
+        let w = take_opt(&mut argv, "--w").and_then(|v| v.parse::<i32>().ok());
+        let h = take_opt(&mut argv, "--h").and_then(|v| v.parse::<i32>().ok());
+        let decorations = take_opt(&mut argv, "--decorations").and_then(|v| match v.as_str() {
+            "1" | "true" | "True" | "TRUE" => Some(true),
+            "0" | "false" | "False" | "FALSE" => Some(false),
+            _ => None,
+        });
+        let always_on_top = take_opt(&mut argv, "--always-on-top").and_then(|v| match v.as_str() {
+            "1" | "true" | "True" | "TRUE" => Some(true),
+            "0" | "false" | "False" | "FALSE" => Some(false),
+            _ => None,
+        });
+
         Ok(Self {
             label,
             pi_src,
@@ -101,6 +143,12 @@ impl Args {
             context,
             info_json,
             connect_json,
+            x,
+            y,
+            w,
+            h,
+            decorations,
+            always_on_top,
         })
     }
 }

@@ -8,6 +8,9 @@ pub async fn create_instance(
     action: Action,
     context: Context,
 ) -> Result<Option<ActionInstance>, anyhow::Error> {
+    let mut action = action;
+    crate::shared::normalize_builtin_action(&mut action.plugin, &mut action.uuid);
+
     if !action.controllers.contains(&context.controller) {
         return Ok(None);
     }
@@ -34,10 +37,8 @@ pub async fn create_instance(
         };
         children.push(instance.clone());
 
-        if matches!(
-            parent.action.uuid.as_str(),
-            "riverdeck.toggleaction" | "opendeck.toggleaction"
-        ) && parent.states.len() < children.len()
+        if crate::shared::is_toggle_action_uuid(parent.action.uuid.as_str())
+            && parent.states.len() < children.len()
         {
             parent.states.push(crate::shared::ActionState {
                 image: "riverdeck/toggle-action.png".to_owned(),
@@ -59,13 +60,9 @@ pub async fn create_instance(
             states: action.states.clone(),
             current_state: 0,
             settings: serde_json::Value::Object(serde_json::Map::new()),
-            children: if matches!(
-                action.uuid.as_str(),
-                "riverdeck.multiaction"
-                    | "riverdeck.toggleaction"
-                    | "opendeck.multiaction"
-                    | "opendeck.toggleaction"
-            ) {
+            children: if crate::shared::is_multi_action_uuid(action.uuid.as_str())
+                || crate::shared::is_toggle_action_uuid(action.uuid.as_str())
+            {
                 Some(vec![])
             } else {
                 None
@@ -91,6 +88,140 @@ fn instance_images_dir(context: &ActionContext) -> std::path::PathBuf {
             "{}.{}.{}",
             context.controller, context.position, context.index
         ))
+}
+
+pub async fn set_custom_icon_from_path(
+    context: ActionContext,
+    state: Option<u16>,
+    source_path: String,
+) -> Result<(), anyhow::Error> {
+    use std::path::Path;
+
+    let src = Path::new(source_path.trim());
+    if !src.is_file() {
+        return Err(anyhow::anyhow!("icon path not found"));
+    }
+    let ext = src
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("png")
+        .to_lowercase();
+    let ext = match ext.as_str() {
+        "png" | "jpg" | "jpeg" => ext,
+        _ => return Err(anyhow::anyhow!("unsupported image type (use png/jpg/jpeg)")),
+    };
+
+    let mut locks = acquire_locks_mut().await;
+    let active = locks
+        .device_stores
+        .get_selected_profile(&context.device)
+        .ok()
+        .is_some_and(|p| p == context.profile);
+
+    let (apply_ctx, apply_img, apply_active) = {
+        let Some(instance) =
+            crate::store::profiles::get_instance_mut(&context, &mut locks).await?
+        else {
+            return Ok(());
+        };
+
+        let dst_dir = instance_images_dir(&context);
+        tokio::fs::create_dir_all(&dst_dir).await?;
+        let dst = dst_dir.join(format!("custom_icon.{ext}"));
+        tokio::fs::copy(src, &dst).await?;
+        let dst_str = dst.to_string_lossy().into_owned();
+
+        let target_state = state.unwrap_or(instance.current_state);
+        if (target_state as usize) < instance.states.len() {
+            instance.states[target_state as usize].image = dst_str.clone();
+        }
+
+        ui::emit(UiEvent::ActionStateChanged {
+            context: context.clone(),
+        });
+
+        // Prepare device update after we drop the mutable borrow.
+        let apply_active = active && target_state == instance.current_state;
+        let img = instance
+            .states
+            .get(instance.current_state as usize)
+            .map(|s| s.image.trim())
+            .filter(|s| !s.is_empty() && *s != "actionDefaultImage")
+            .map(|s| s.to_owned())
+            .unwrap_or_else(|| instance.action.icon.clone());
+        (instance.context.clone(), img, apply_active)
+    };
+
+    save_profile(&context.device, &mut locks).await?;
+
+    if apply_active {
+        let _ = crate::events::outbound::devices::update_image(
+            (&apply_ctx).into(),
+            if apply_img.trim().is_empty() {
+                None
+            } else {
+                Some(apply_img)
+            },
+        )
+        .await;
+    }
+
+    Ok(())
+}
+
+pub async fn clear_custom_icon(context: ActionContext, state: Option<u16>) -> Result<(), anyhow::Error> {
+    let mut locks = acquire_locks_mut().await;
+    let active = locks
+        .device_stores
+        .get_selected_profile(&context.device)
+        .ok()
+        .is_some_and(|p| p == context.profile);
+
+    let (apply_ctx, apply_img, apply_active) = {
+        let Some(instance) =
+            crate::store::profiles::get_instance_mut(&context, &mut locks).await?
+        else {
+            return Ok(());
+        };
+
+        let target_state = state.unwrap_or(instance.current_state);
+        if let (Some(s), Some(def)) = (
+            instance.states.get_mut(target_state as usize),
+            instance.action.states.get(target_state as usize),
+        ) {
+            s.image = def.image.clone();
+        }
+
+        ui::emit(UiEvent::ActionStateChanged {
+            context: context.clone(),
+        });
+
+        let apply_active = active && target_state == instance.current_state;
+        let img = instance
+            .states
+            .get(instance.current_state as usize)
+            .map(|s| s.image.trim())
+            .filter(|s| !s.is_empty() && *s != "actionDefaultImage")
+            .map(|s| s.to_owned())
+            .unwrap_or_else(|| instance.action.icon.clone());
+        (instance.context.clone(), img, apply_active)
+    };
+
+    save_profile(&context.device, &mut locks).await?;
+
+    if apply_active {
+        let _ = crate::events::outbound::devices::update_image(
+            (&apply_ctx).into(),
+            if apply_img.trim().is_empty() {
+                None
+            } else {
+                Some(apply_img)
+            },
+        )
+        .await;
+    }
+
+    Ok(())
 }
 
 pub async fn move_instance(
@@ -196,10 +327,7 @@ pub async fn remove_instance(context: ActionContext) -> Result<(), anyhow::Error
                 break;
             }
         }
-        if matches!(
-            instance.action.uuid.as_str(),
-            "riverdeck.toggleaction" | "opendeck.toggleaction"
-        ) {
+        if crate::shared::is_toggle_action_uuid(instance.action.uuid.as_str()) {
             if instance.current_state as usize >= children.len() {
                 instance.current_state = if children.is_empty() {
                     0

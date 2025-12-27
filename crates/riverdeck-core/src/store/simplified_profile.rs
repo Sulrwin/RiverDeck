@@ -212,6 +212,9 @@ impl DiskActionInstance {
         action.icon = reconstruct_path(&action.icon);
         action.property_inspector = reconstruct_path(&action.property_inspector);
 
+        // Normalize legacy OpenDeck built-in actions to RiverDeck equivalents.
+        crate::shared::normalize_builtin_action(&mut action.plugin, &mut action.uuid);
+
         ActionInstance {
             context: self.context.into_action_context(device, profile),
             action,
@@ -231,10 +234,25 @@ impl DiskActionInstance {
 pub struct DiskProfile {
     pub keys: Vec<Option<DiskActionInstance>>,
     pub sliders: Vec<Option<DiskActionInstance>>,
+    #[serde(default)]
+    pub encoder_screen_background: Option<String>,
 }
 
 impl From<&Profile> for DiskProfile {
     fn from(value: &Profile) -> Self {
+        let config_dir = crate::shared::config_dir();
+        let normalise_path = |value: &str| -> String {
+            let path = Path::new(value);
+            if path.starts_with(&config_dir) {
+                path.strip_prefix(&config_dir)
+                    .unwrap()
+                    .to_slash_lossy()
+                    .into_owned()
+            } else {
+                path.to_slash_lossy().into_owned()
+            }
+        };
+
         Self {
             keys: value
                 .keys
@@ -248,6 +266,10 @@ impl From<&Profile> for DiskProfile {
                 .into_iter()
                 .map(|x| x.map(|v| v.into()))
                 .collect(),
+            encoder_screen_background: value
+                .encoder_screen_background
+                .as_deref()
+                .map(normalise_path),
         }
     }
 }
@@ -255,13 +277,29 @@ impl From<&Profile> for DiskProfile {
 impl DiskProfile {
     fn into_profile(self, path: &Path) -> Profile {
         let config_dir = crate::shared::config_dir();
-        let mut iter = path.strip_prefix(config_dir).unwrap().iter();
+        let mut iter = path.strip_prefix(&config_dir).unwrap().iter();
         let _ = iter.nth(1);
         let mut id = iter
             .map(|x| x.to_string_lossy())
             .collect::<Vec<_>>()
             .join("/");
         id = id[..id.len() - 5].to_owned();
+
+        let reconstruct_path = |value: &str| -> String {
+            if !(value.is_empty()
+                || value.starts_with("data:")
+                || value.starts_with("riverdeck/")
+                || value.starts_with("opendeck/"))
+            {
+                config_dir
+                    .join(PathBuf::from_slash(value))
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                value.to_owned()
+            }
+        };
+
         Profile {
             id,
             keys: self
@@ -274,6 +312,10 @@ impl DiskProfile {
                 .into_iter()
                 .map(|x| x.map(|v| v.into_action_instance(path)))
                 .collect(),
+            encoder_screen_background: self
+                .encoder_screen_background
+                .as_deref()
+                .map(reconstruct_path),
         }
     }
 }

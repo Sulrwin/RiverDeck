@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use log::error;
 use tiny_http::{Header, Response, Server};
 
 const RIVERDECK_PROPERTY_INSPECTOR_SUFFIX: &str = "|riverdeck_property_inspector";
@@ -20,8 +21,14 @@ fn mime(extension: &str) -> String {
 /// Start a simple webserver to serve files of plugins that run in a browser environment.
 pub async fn init_webserver(prefix: PathBuf) {
     let server = {
-        let listener =
-            std::net::TcpListener::bind(format!("0.0.0.0:{}", *super::PORT_BASE + 2)).unwrap();
+        let listener = match std::net::TcpListener::bind(format!("0.0.0.0:{}", *super::PORT_BASE + 2))
+        {
+            Ok(l) => l,
+            Err(err) => {
+                error!("Failed to bind plugin webserver socket: {}", err);
+                return;
+            }
+        };
 
         #[cfg(windows)]
         {
@@ -31,7 +38,13 @@ pub async fn init_webserver(prefix: PathBuf) {
             unsafe { SetHandleInformation(listener.as_raw_socket() as _, HANDLE_FLAG_INHERIT, 0) };
         }
 
-        Server::from_listener(listener, None).unwrap()
+        match Server::from_listener(listener, None) {
+            Ok(s) => s,
+            Err(err) => {
+                error!("Failed to start plugin webserver: {}", err);
+                return;
+            }
+        }
     };
 
     for request in server.incoming_requests() {

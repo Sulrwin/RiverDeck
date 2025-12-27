@@ -35,10 +35,7 @@ pub async fn key_down(device: &str, key: u8) -> Result<(), anyhow::Error> {
     let Some(instance) = get_slot_mut(&context, &mut locks).await? else {
         return Ok(());
     };
-    if matches!(
-        instance.action.uuid.as_str(),
-        "riverdeck.multiaction" | "opendeck.multiaction"
-    ) {
+    if crate::shared::is_multi_action_uuid(instance.action.uuid.as_str()) {
         for child in instance.children.as_mut().unwrap() {
             send_to_plugin(
                 &child.action.plugin,
@@ -85,10 +82,7 @@ pub async fn key_down(device: &str, key: u8) -> Result<(), anyhow::Error> {
         }
 
         save_profile(device, &mut locks).await?;
-    } else if matches!(
-        instance.action.uuid.as_str(),
-        "riverdeck.toggleaction" | "opendeck.toggleaction"
-    ) {
+    } else if crate::shared::is_toggle_action_uuid(instance.action.uuid.as_str()) {
         let children = instance.children.as_ref().unwrap();
         if children.is_empty() {
             return Ok(());
@@ -140,10 +134,7 @@ pub async fn key_up(device: &str, key: u8) -> Result<(), anyhow::Error> {
     let slot = get_slot_mut(&context, &mut locks).await?;
     let Some(instance) = slot else { return Ok(()) };
 
-    if matches!(
-        instance.action.uuid.as_str(),
-        "riverdeck.toggleaction" | "opendeck.toggleaction"
-    ) {
+    if crate::shared::is_toggle_action_uuid(instance.action.uuid.as_str()) {
         let index = instance.current_state as usize;
         let children = instance.children.as_ref().unwrap();
         if children.is_empty() {
@@ -162,10 +153,7 @@ pub async fn key_up(device: &str, key: u8) -> Result<(), anyhow::Error> {
         )
         .await?;
         instance.current_state = ((index + 1) % instance.children.as_ref().unwrap().len()) as u16;
-    } else if !matches!(
-        instance.action.uuid.as_str(),
-        "riverdeck.multiaction" | "opendeck.multiaction"
-    ) {
+    } else if !crate::shared::is_multi_action_uuid(instance.action.uuid.as_str()) {
         if instance.states.len() == 2 && !instance.action.disable_automatic_states {
             instance.current_state = (instance.current_state + 1) % (instance.states.len() as u16);
         }

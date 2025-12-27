@@ -12,6 +12,31 @@ use tokio::sync::RwLock;
 
 pub const PRODUCT_NAME: &str = include_str!("../../../product_name.txt").trim_ascii();
 
+// Built-in actions (canonical RiverDeck identifiers).
+pub const BUILTIN_PLUGIN_ID: &str = "riverdeck";
+pub const MULTI_ACTION_UUID: &str = "riverdeck.multiaction";
+pub const TOGGLE_ACTION_UUID: &str = "riverdeck.toggleaction";
+
+pub fn is_multi_action_uuid(uuid: &str) -> bool {
+    uuid == MULTI_ACTION_UUID || uuid == "opendeck.multiaction"
+}
+
+pub fn is_toggle_action_uuid(uuid: &str) -> bool {
+    uuid == TOGGLE_ACTION_UUID || uuid == "opendeck.toggleaction"
+}
+
+pub fn normalize_builtin_action(plugin: &mut String, uuid: &mut String) {
+    // Treat legacy OpenDeck built-in actions as RiverDeck built-ins.
+    if plugin.as_str() == "opendeck" {
+        *plugin = BUILTIN_PLUGIN_ID.to_owned();
+    }
+    match uuid.as_str() {
+        "opendeck.multiaction" => *uuid = MULTI_ACTION_UUID.to_owned(),
+        "opendeck.toggleaction" => *uuid = TOGGLE_ACTION_UUID.to_owned(),
+        _ => {}
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Paths {
     pub config_dir: PathBuf,
@@ -75,6 +100,21 @@ pub struct DeviceInfo {
     pub columns: u8,
     pub encoders: u8,
     pub r#type: u8,
+    #[serde(default)]
+    pub screen: Option<DeviceScreenInfo>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum ScreenPlacement {
+    BetweenKeypadAndEncoders,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceScreenInfo {
+    pub width_px: u16,
+    pub height_px: u16,
+    pub segments: u8,
+    pub placement: ScreenPlacement,
 }
 
 pub static DEVICES: Lazy<DashMap<String, DeviceInfo>> = Lazy::new(DashMap::new);
@@ -108,11 +148,16 @@ pub fn is_flatpak() -> bool {
 
 /// Convert an icon specified in a plugin manifest to its full path.
 pub fn convert_icon(path: String) -> String {
-    if Path::new(&(path.clone() + ".svg")).exists() {
-        path + ".svg"
-    } else if Path::new(&(path.clone() + "@2x.png")).exists() {
+    // Prefer raster formats first so physical devices (which need pixels) can render icons reliably.
+    // Many plugins ship both `.svg` and `.png` variants; UI/webviews can use SVG, but devices can't.
+    if Path::new(&(path.clone() + "@2x.png")).exists() {
         path + "@2x.png"
+    } else if Path::new(&(path.clone() + ".png")).exists() {
+        path + ".png"
+    } else if Path::new(&(path.clone() + ".svg")).exists() {
+        path + ".svg"
     } else {
+        // Default to PNG (most common in Stream Deck plugins).
         path + ".png"
     }
 }
@@ -348,6 +393,8 @@ pub struct Profile {
     pub id: String,
     pub keys: Vec<Option<ActionInstance>>,
     pub sliders: Vec<Option<ActionInstance>>,
+    #[serde(default)]
+    pub encoder_screen_background: Option<String>,
 }
 
 /// A map of category names to a list of actions in that category.

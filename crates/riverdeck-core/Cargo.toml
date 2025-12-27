@@ -16,7 +16,7 @@ directories = "6.0"
 elgato-streamdeck = { version = "0.12", default-features = false, features = ["async"] }
 fs2 = "0.4"
 futures = "0.3"
-image = { version = "0.25", default-features = false, features = ["bmp", "jpeg"] }
+image = { version = "0.25", default-features = false, features = ["bmp", "jpeg", "png"] }
 json-patch = "4.1"
 log = "0.4"
 once_cell = "1.21"

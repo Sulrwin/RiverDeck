@@ -51,6 +51,7 @@ impl ProfileStores {
                 id: id.to_owned(),
                 keys: Vec::new(),
                 sliders: Vec::new(),
+                encoder_screen_background: None,
             };
 
             let mut store =
@@ -72,7 +73,6 @@ impl ProfileStores {
             let registered = crate::events::registered_plugins().await;
             let keep_instance = |instance: &ActionInstance| -> bool {
                 instance.action.plugin == "riverdeck"
-                    || instance.action.plugin == "opendeck"
                     || (plugins_dir.join(&instance.action.plugin).exists()
                         && (!registered.contains(&instance.action.plugin)
                             || actions.iter().any(|v| v.uuid == instance.action.uuid)))
