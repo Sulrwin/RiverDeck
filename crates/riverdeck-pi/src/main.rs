@@ -65,6 +65,18 @@ fn build_webview(
     let proxy_for_ipc = proxy.clone();
     let builder = WebViewBuilder::new()
         .with_html(html)
+        .with_navigation_handler(|url: String| {
+            // Allow regular browsing, but hand off deep-links to the OS.
+            // This is important for things like Elgato Marketplace "Open in Stream Deck" links.
+            if url.starts_with("openaction://")
+                || url.starts_with("streamdeck://")
+                || url.starts_with("riverdeck://")
+            {
+                let _ = open::that_detached(url);
+                return false;
+            }
+            true
+        })
         .with_ipc_handler(move |req: Request<String>| handle_ipc(req, proxy_for_ipc.clone()));
 
     Ok(builder.build(window)?)

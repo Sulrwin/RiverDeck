@@ -1,4 +1,5 @@
-# RiverDeck
+
+![Logo](.github/readme/RiverDeckLogoProper.jpeg)
 
 Linux software for your Elgato Stream Deck
 

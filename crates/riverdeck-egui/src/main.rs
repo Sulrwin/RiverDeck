@@ -387,6 +387,10 @@ struct RiverDeckApp {
     pi_for_context: Option<shared::ActionContext>,
     pi_last_error: Option<String>,
 
+    // Marketplace window state (a simple webview window via `riverdeck-pi`).
+    marketplace_child: Option<std::process::Child>,
+    marketplace_last_error: Option<String>,
+
     // Profile management UI.
     show_profile_editor: bool,
     profile_name_input: String,
@@ -459,6 +463,8 @@ impl RiverDeckApp {
             pi_child: None,
             pi_for_context: None,
             pi_last_error: None,
+            marketplace_child: None,
+            marketplace_last_error: None,
             show_profile_editor: false,
             profile_name_input: String::new(),
             profile_error: None,
@@ -774,6 +780,53 @@ impl RiverDeckApp {
             let _ = child.wait();
         }
         self.pi_for_context = None;
+    }
+
+    fn close_marketplace(&mut self) {
+        if let Some(mut child) = self.marketplace_child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    fn compute_marketplace_geometry(ctx: &egui::Context) -> Option<(i32, i32, i32, i32)> {
+        let outer = ctx.input(|i| i.viewport().outer_rect)?;
+        let desired_w: f32 = 980.0;
+        let desired_h: f32 = 720.0;
+        let w = desired_w.min(outer.width().max(300.0)).round() as i32;
+        let h = desired_h.min(outer.height().max(240.0)).round() as i32;
+        let x = (outer.center().x - (w as f32 / 2.0)).round() as i32;
+        let y = (outer.center().y - (h as f32 / 2.0)).round() as i32;
+        Some((x.max(0), y.max(0), w.max(300), h.max(240)))
+    }
+
+    fn open_marketplace(&mut self, ctx: &egui::Context) -> anyhow::Result<()> {
+        // If already open, do nothing (best effort).
+        if self.marketplace_child.is_some() {
+            return Ok(());
+        }
+
+        // Open the marketplace in a dedicated webview window.
+        // Note: the Elgato marketplace uses `streamdeck://...` deep links. We rely on the
+        // webview's navigation handler (in `riverdeck-pi`) + RiverDeck's startup arg handler.
+        let marketplace_url = "https://marketplace.elgato.com/stream-deck/plugins";
+        let dock = Self::compute_marketplace_geometry(ctx);
+
+        // `riverdeck-pi` expects PI-ish args; we pass inert placeholders.
+        let child = spawn_pi_process(
+            "Elgato Marketplace",
+            marketplace_url,
+            "*",
+            0,
+            "marketplace",
+            "null",
+            "null",
+            dock,
+        )?;
+
+        self.marketplace_child = Some(child);
+        self.marketplace_last_error = None;
+        Ok(())
     }
 
     fn compute_pi_dock_geometry(ctx: &egui::Context, desired_h: i32) -> Option<(i32, i32, i32, i32)> {
@@ -1337,24 +1390,39 @@ impl eframe::App for RiverDeckApp {
         }
 
         egui::SidePanel::left("devices").show(ctx, |ui| {
-            ui.heading("Devices");
-            ui.add_space(6.0);
-            egui::Frame::group(ui.style())
-                .corner_radius(egui::CornerRadius::same(12))
-                .show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.y = 6.0;
-                    for entry in shared::DEVICES.iter() {
-                        let id = entry.key().clone();
-                        let selected = self.selected_device.as_deref() == Some(&id);
-                        if ui
-                            .selectable_label(selected, format!("{} ({})", entry.value().name, id))
-                            .clicked()
-                        {
-                            self.selected_device = Some(id);
-                            self.selected_slot = None;
-                        }
+            ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+                // Bottom-left: Marketplace button.
+                if let Some(err) = self.marketplace_last_error.as_ref() {
+                    ui.colored_label(ui.visuals().error_fg_color, err);
+                }
+                ui.add_space(6.0);
+                if ui.button("Elgato Marketplace").clicked() {
+                    if let Err(err) = self.open_marketplace(ctx) {
+                        self.marketplace_last_error = Some(err.to_string());
                     }
-                });
+                }
+                ui.separator();
+
+                // Top: devices list.
+                egui::Frame::group(ui.style())
+                    .corner_radius(egui::CornerRadius::same(12))
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 6.0;
+                        for entry in shared::DEVICES.iter() {
+                            let id = entry.key().clone();
+                            let selected = self.selected_device.as_deref() == Some(&id);
+                            if ui
+                                .selectable_label(selected, format!("{} ({})", entry.value().name, id))
+                                .clicked()
+                            {
+                                self.selected_device = Some(id);
+                                self.selected_slot = None;
+                            }
+                        }
+                    });
+                ui.add_space(6.0);
+                ui.heading("Devices");
+            });
         });
 
         let selected_device = self
@@ -2028,6 +2096,13 @@ impl eframe::App for RiverDeckApp {
     }
 }
 
+impl Drop for RiverDeckApp {
+    fn drop(&mut self) {
+        self.close_pi();
+        self.close_marketplace();
+    }
+}
+
 #[cfg(target_os = "linux")]
 impl RiverDeckApp {
     fn draw_custom_titlebar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -2040,30 +2115,66 @@ impl RiverDeckApp {
         let rect = resp.rect;
 
         ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
-                // Only this label acts as the drag handle, so clicks on the window buttons work reliably.
-                let drag = ui.add(
-                    egui::Label::new(egui::RichText::new("RiverDeck").strong())
-                        .sense(egui::Sense::click_and_drag()),
-                );
-                if drag.drag_started() || drag.dragged() {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-                }
-                ui.label(format!("devices: {}", shared::DEVICES.len()));
+            // Split into three clipped regions so the title can be centered reliably.
+            let buttons_w = 120.0;
+            let gap = 6.0;
 
-                if let Some(info) = self.update_info.lock().unwrap().as_ref() {
-                    ui.separator();
-                    ui.label(format!("Update available: {}", info.tag));
-                    if ui.button("Details").clicked() {
-                        self.show_update_details = true;
+            let right_x0 = rect.right() - buttons_w;
+            let available_for_title = (right_x0 - gap) - rect.left();
+            let title_w = 200.0f32.min(available_for_title.max(60.0));
+            let title_x0 = (rect.center().x - title_w / 2.0).max(rect.left());
+            let title_x1 = (title_x0 + title_w).min(right_x0 - gap);
+
+            let left_rect = egui::Rect::from_min_max(
+                rect.left_top(),
+                egui::pos2((title_x0 - gap).max(rect.left()), rect.bottom()),
+            );
+            let title_rect = egui::Rect::from_min_max(
+                egui::pos2(title_x0, rect.top()),
+                egui::pos2(title_x1, rect.bottom()),
+            );
+            let right_rect = egui::Rect::from_min_max(
+                egui::pos2(right_x0, rect.top()),
+                rect.right_bottom(),
+            );
+
+            // Left: status/info.
+            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(left_rect), |ui| {
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    ui.label(format!("devices: {}", shared::DEVICES.len()));
+
+                    if let Some(info) = self.update_info.lock().unwrap().as_ref() {
+                        ui.separator();
+                        ui.label(format!("Update available: {}", info.tag));
+                        if ui.button("Details").clicked() {
+                            self.show_update_details = true;
+                        }
                     }
-                }
+                });
+            });
 
+            // Center: window title (drag handle).
+            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(title_rect), |ui| {
+                ui.with_layout(egui::Layout::centered_and_justified(egui::Direction::LeftToRight), |ui| {
+                    // Only this label acts as the drag handle, so clicks on the window buttons work reliably.
+                    let drag = ui.add(
+                        egui::Label::new(egui::RichText::new("RiverDeck").strong())
+                            .sense(egui::Sense::click_and_drag()),
+                    );
+                    if drag.drag_started() || drag.dragged() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                    }
+                });
+            });
+
+            // Right: window buttons.
+            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(right_rect), |ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 4.0;
 
-                    let close = ui.button("✕");
+                    // Use plain ASCII so it renders reliably even when the active font lacks the ✕ glyph.
+                    let close = ui.button("X");
                     if close.clicked() {
                         // Hide to tray when available; otherwise close.
                         #[cfg(feature = "tray")]
