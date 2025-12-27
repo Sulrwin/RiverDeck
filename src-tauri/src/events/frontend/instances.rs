@@ -32,9 +32,9 @@ pub async fn create_instance(app: AppHandle, action: Action, context: Context) -
 		};
 		children.push(instance.clone());
 
-		if parent.action.uuid == "opendeck.toggleaction" && parent.states.len() < children.len() {
+		if matches!(parent.action.uuid.as_str(), "riverdeck.toggleaction" | "opendeck.toggleaction") && parent.states.len() < children.len() {
 			parent.states.push(crate::shared::ActionState {
-				image: "opendeck/toggle-action.png".to_owned(),
+				image: "riverdeck/toggle-action.png".to_owned(),
 				..Default::default()
 			});
 			let _ = update_state(&app, parent.context.clone(), &mut locks).await;
@@ -51,7 +51,7 @@ pub async fn create_instance(app: AppHandle, action: Action, context: Context) -
 			states: action.states.clone(),
 			current_state: 0,
 			settings: serde_json::Value::Object(serde_json::Map::new()),
-			children: if matches!(action.uuid.as_str(), "opendeck.multiaction" | "opendeck.toggleaction") {
+			children: if matches!(action.uuid.as_str(), "riverdeck.multiaction" | "riverdeck.toggleaction" | "opendeck.multiaction" | "opendeck.toggleaction") {
 				Some(vec![])
 			} else {
 				None
@@ -172,7 +172,7 @@ pub async fn remove_instance(context: ActionContext) -> Result<(), Error> {
 				break;
 			}
 		}
-		if instance.action.uuid == "opendeck.toggleaction" {
+		if matches!(instance.action.uuid.as_str(), "riverdeck.toggleaction" | "opendeck.toggleaction") {
 			if instance.current_state as usize >= children.len() {
 				instance.current_state = if children.is_empty() { 0 } else { children.len() as u16 - 1 };
 			}

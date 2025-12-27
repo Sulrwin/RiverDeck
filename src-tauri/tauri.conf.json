@@ -12,23 +12,23 @@
 		"resources": { "target/plugins/": "plugins/" },
 		"linux": {
 			"deb": {
-				"desktopTemplate": "bundle/opendeck.desktop",
+				"desktopTemplate": "bundle/riverdeck.desktop",
 				"files": {
 					"/etc/udev/rules.d/40-streamdeck.rules": "bundle/40-streamdeck.rules",
-					"/usr/share/metainfo/opendeck.metainfo.xml": "bundle/opendeck.metainfo.xml"
+					"/usr/share/metainfo/riverdeck.metainfo.xml": "bundle/riverdeck.metainfo.xml"
 				}
 			},
 			"rpm": {
-				"desktopTemplate": "bundle/opendeck.desktop",
+				"desktopTemplate": "bundle/riverdeck.desktop",
 				"files": {
 					"/etc/udev/rules.d/40-streamdeck.rules": "bundle/40-streamdeck.rules",
-					"/usr/share/metainfo/opendeck.metainfo.xml": "bundle/opendeck.metainfo.xml"
+					"/usr/share/metainfo/riverdeck.metainfo.xml": "bundle/riverdeck.metainfo.xml"
 				}
 			}
 		},
-		"publisher": "Aman Khanna (nekename)",
+		"publisher": "Ethan Wright (sulrwin)",
 		"shortDescription": "Use stream controllers",
-		"longDescription": "OpenDeck is a desktop application for using stream controller devices like the Elgato Stream Deck. OpenDeck supports plugins made for the original Stream Deck SDK, allowing many plugins made for the Elgato software ecosystem to be used.",
+		"longDescription": "RiverDeck is a desktop application for using stream controller devices like the Elgato Stream Deck. RiverDeck is forked from OpenDeck and supports plugins made for the original Stream Deck SDK, allowing many plugins made for the Elgato software ecosystem to be used.",
 		"category": "Productivity",
 		"icon": [
 			"icons/icon.png",
@@ -40,20 +40,20 @@
 			"signingIdentity": "-"
 		}
 	},
-	"productName": "OpenDeck",
-	"mainBinaryName": "opendeck",
-	"identifier": "opendeck",
+	"productName": "RiverDeck",
+	"mainBinaryName": "riverdeck",
+	"identifier": "io.github.sulrwin.riverdeck",
 	"plugins": {
 		"deep-link": {
 			"desktop": {
-				"schemes": ["opendeck", "openaction", "streamdeck"]
+				"schemes": ["riverdeck", "openaction", "streamdeck"]
 			}
 		}
 	},
 	"app": {
 		"windows": [
 			{
-				"title": "OpenDeck",
+				"title": "RiverDeck",
 				"fullscreen": false,
 				"resizable": true,
 				"width": 800,

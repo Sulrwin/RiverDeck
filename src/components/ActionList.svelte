@@ -50,7 +50,11 @@
 			<summary class="text-xl font-semibold dark:text-neutral-300">
 				{#if icon || (actions[0] && plugins.find((x) => x.id == actions[0].plugin) && categories[name].actions.every((x) => x.plugin == actions[0].plugin))}
 					<img
-						src={icon ? (!icon.startsWith("opendeck/") ? getWebserverUrl(icon) : icon.replace("opendeck", "")) : getWebserverUrl(plugins.find((x) => x.id == actions[0].plugin).icon)}
+						src={icon
+							? (!icon.startsWith("opendeck/") && !icon.startsWith("riverdeck/")
+								? getWebserverUrl(icon)
+								: icon.replace(icon.startsWith("riverdeck/") ? "riverdeck" : "opendeck", ""))
+							: getWebserverUrl(plugins.find((x) => x.id == actions[0].plugin).icon)}
 						alt={name}
 						class="w-5 h-5 rounded-xs ml-1 -mt-1 inline"
 					/>
@@ -70,7 +74,9 @@
 					}}
 				>
 					<img
-						src={!action.icon.startsWith("opendeck/") ? getWebserverUrl(action.icon) : action.icon.replace("opendeck", "")}
+						src={!action.icon.startsWith("opendeck/") && !action.icon.startsWith("riverdeck/")
+							? getWebserverUrl(action.icon)
+							: action.icon.replace(action.icon.startsWith("riverdeck/") ? "riverdeck" : "opendeck", "")}
 						alt={$localisations?.[action.plugin]?.[action.uuid]?.Tooltip ?? action.tooltip}
 						class="w-12 h-12 rounded-xs pointer-events-none"
 					/>

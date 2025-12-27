@@ -1,11 +1,11 @@
 [package]
-name = "opendeck"
+name = "riverdeck"
 version = "2.7.1"
 description = "Use stream controllers"
-authors = ["Aman Khanna (nekename)"]
+authors = ["Ethan Wright (sulrwin)"]
 license = "GPL-3.0-or-later"
-repository = "https://github.com/nekename/OpenDeck"
-default-run = "opendeck"
+repository = "https://github.com/sulrwin/RiverDeck"
+default-run = "riverdeck"
 edition = "2024"
 
 [build-dependencies]

@@ -1,9 +1,9 @@
 {
-	"name": "opendeck",
+	"name": "riverdeck",
 	"description": "Use stream controllers",
-	"author": "Aman Khanna (nekename)",
+	"author": "Ethan Wright (sulrwin)",
 	"license": "GPL-3.0-or-later",
-	"repository": "https://github.com/nekename/OpenDeck",
+	"repository": "https://github.com/sulrwin/RiverDeck",
 	"scripts": {
 		"dev": "vite dev",
 		"build": "vite build",

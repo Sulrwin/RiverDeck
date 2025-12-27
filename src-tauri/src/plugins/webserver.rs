@@ -2,6 +2,9 @@ use std::path::{Path, PathBuf};
 
 use tiny_http::{Header, Response, Server};
 
+const RIVERDECK_PROPERTY_INSPECTOR_SUFFIX: &str = "|riverdeck_property_inspector";
+const RIVERDECK_PROPERTY_INSPECTOR_CHILD_SUFFIX: &str = "|riverdeck_property_inspector_child";
+
 fn mime(extension: &str) -> String {
 	match extension {
 		"htm" | "html" | "xhtml" => "text/html".to_owned(),
@@ -63,8 +66,7 @@ pub async fn init_webserver(prefix: PathBuf) {
 		// Instead, we have to inject a replacement window.open implementation that creates an IFrame element
 		// and requests the Svelte frontend to maximise the property inspector.
 
-		if url.ends_with("|opendeck_property_inspector") {
-			let path = &url[..url.len() - 28];
+		if let Some(path) = url.strip_suffix(RIVERDECK_PROPERTY_INSPECTOR_SUFFIX) {
 			if !matches!(tokio::fs::try_exists(path).await, Ok(true)) {
 				let _ = request.respond(Response::empty(404).with_header(access_control_allow_origin));
 				continue;
@@ -72,10 +74,10 @@ pub async fn init_webserver(prefix: PathBuf) {
 
 			let mut content = tokio::fs::read_to_string(path).await.unwrap_or_default();
 			content += r#"
-				<div id="opendeck_iframe_container" style="position: absolute; z-index: 100; top: 0; left: 0; width: 100%; height: 100%; display: none;"></div>
+				<div id="riverdeck_iframe_container" style="position: absolute; z-index: 100; top: 0; left: 0; width: 100%; height: 100%; display: none;"></div>
 				<script>
-					const opendeck_window_open = window.open;
-					const opendeck_iframe_container = document.getElementById("opendeck_iframe_container");
+					const riverdeck_window_open = window.open;
+					const riverdeck_iframe_container = document.getElementById("riverdeck_iframe_container");
 
 					window.addEventListener("message", ({ data }) => {
 						if (data.event == "connect") {
@@ -84,8 +86,8 @@ pub async fn init_webserver(prefix: PathBuf) {
 							else connectElgatoStreamDeckSocket(...data.payload);
 						} else if (data.event == "windowClosed") {
 							event.stopImmediatePropagation();
-							if (opendeck_iframe_container.firstElementChild) opendeck_iframe_container.firstElementChild.remove();
-							opendeck_iframe_container.style.display = "none";
+							if (riverdeck_iframe_container.firstElementChild) riverdeck_iframe_container.firstElementChild.remove();
+							riverdeck_iframe_container.style.display = "none";
 						}
 					});
 
@@ -102,34 +104,34 @@ pub async fn init_webserver(prefix: PathBuf) {
 							iframe.contentWindow.close = () => { iframe.contentWindow.onbeforeunload(); iframe.remove(); };
 							iframe.contentWindow.document.body.style.overflowY = "auto";
 						};
-						iframe.src = url.startsWith("http") ? url : url + "|opendeck_property_inspector_child";
-						if (opendeck_iframe_container.firstElementChild) opendeck_iframe_container.firstElementChild.remove();
-						opendeck_iframe_container.appendChild(iframe);
-						opendeck_iframe_container.style.display = "flex";
+						iframe.src = url.startsWith("http") ? url : url + "|riverdeck_property_inspector_child";
+						if (riverdeck_iframe_container.firstElementChild) riverdeck_iframe_container.firstElementChild.remove();
+						riverdeck_iframe_container.appendChild(iframe);
+						riverdeck_iframe_container.style.display = "flex";
 						top.postMessage({ event: "windowOpened", payload: window.name }, "*");
 						return iframe.contentWindow;
 					};
 
-					const opendeck_window_fetch = window.fetch;
-					let opendeck_fetch_count = 0;
-					let opendeck_fetch_promises = {};
+					const riverdeck_window_fetch = window.fetch;
+					let riverdeck_fetch_count = 0;
+					let riverdeck_fetch_promises = {};
 					window.addEventListener("message", ({ data }) => {
 						if (data.event == "fetchResponse") {
 							event.stopImmediatePropagation();
 							const response = new Response(data.payload.response.body, data.payload.response);
 							Object.defineProperty(response, "url", { value: data.payload.response.url });
-							opendeck_fetch_promises[data.payload.id].resolve(response);
-							delete opendeck_fetch_promises[data.payload.id];
+							riverdeck_fetch_promises[data.payload.id].resolve(response);
+							delete riverdeck_fetch_promises[data.payload.id];
 						} else if (data.event == "fetchError") {
 							event.stopImmediatePropagation();
-							opendeck_fetch_promises[data.payload.id].reject(data.payload.error);
-							delete opendeck_fetch_promises[data.payload.id];
+							riverdeck_fetch_promises[data.payload.id].reject(data.payload.error);
+							delete riverdeck_fetch_promises[data.payload.id];
 						}
 					});
 					window.fetch = (...args) => {
 						if (args.length) args[0] = new URL(args[0], window.location.href).href;
-						top.postMessage({ event: "fetch", payload: { args, context: window.name, id: ++opendeck_fetch_count }}, "*");
-						return new Promise((resolve, reject) => { opendeck_fetch_promises[opendeck_fetch_count] = { resolve, reject }; });
+						top.postMessage({ event: "fetch", payload: { args, context: window.name, id: ++riverdeck_fetch_count }}, "*");
+						return new Promise((resolve, reject) => { riverdeck_fetch_promises[riverdeck_fetch_count] = { resolve, reject }; });
 					};
 				</script>
 			"#;
@@ -141,8 +143,7 @@ pub async fn init_webserver(prefix: PathBuf) {
 				value: "text/html".parse().unwrap(),
 			});
 			let _ = request.respond(response);
-		} else if url.ends_with("|opendeck_property_inspector_child") {
-			let path = &url[..url.len() - 34];
+		} else if let Some(path) = url.strip_suffix(RIVERDECK_PROPERTY_INSPECTOR_CHILD_SUFFIX) {
 			if !matches!(tokio::fs::try_exists(path).await, Ok(true)) {
 				let _ = request.respond(Response::empty(404).with_header(access_control_allow_origin));
 				continue;

@@ -48,7 +48,7 @@ impl ProfileStores {
 			let plugins_dir = config_dir().join("plugins");
 			let registered = crate::events::registered_plugins().await;
 			let keep_instance = |instance: &ActionInstance| -> bool {
-				instance.action.plugin == "opendeck"
+				instance.action.plugin == "riverdeck" || instance.action.plugin == "opendeck"
 					|| (plugins_dir.join(&instance.action.plugin).exists() && (!registered.contains(&instance.action.plugin) || actions.iter().any(|v| v.uuid == instance.action.uuid)))
 			};
 			for slot in store.value.keys.iter_mut().chain(store.value.sliders.iter_mut()) {

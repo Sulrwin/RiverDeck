@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-GITHUB_REPO="nekename/OpenDeck"
-FLATHUB_APP_ID="me.amankhanna.opendeck"
-UDEV_RULES_URL="https://raw.githubusercontent.com/nekename/OpenDeck/refs/heads/release/src-tauri/bundle/40-streamdeck.rules"
+GITHUB_REPO="sulrwin/RiverDeck"
+FLATHUB_APP_ID="io.github.sulrwin.riverdeck"
+UDEV_RULES_URL="https://raw.githubusercontent.com/sulrwin/RiverDeck/main/src-tauri/bundle/40-streamdeck.rules"
 
 if [ -t 1 ]; then
     RED="\033[0;31m"
@@ -20,7 +20,7 @@ else
     RESET=""
 fi
 
-trap 'echo -e "${YELLOW}Need help? Join the Discord: ${BLUE}https://discord.gg/26Nf8rHvaj${RESET}"' EXIT
+trap 'echo -e "${YELLOW}Need help? Open an issue: ${BLUE}https://github.com/'"${GITHUB_REPO}"'/issues${RESET}"' EXIT
 
 msg_info() { echo -e "${BLUE}[*]${RESET} $*"; }
 msg_ok() { echo -e "${GREEN}[✓] $*${RESET}"; }
@@ -119,7 +119,7 @@ reload_udev_rules() {
 
 install_flatpak() {
     msg_info "Installing ${FLATHUB_APP_ID} from Flathub"
-    if confirm "Install OpenDeck system-wide? (No = user install)"; then
+    if confirm "Install RiverDeck system-wide? (No = user install)"; then
         if ! flatpak remote-list | grep -q flathub; then
             msg_error "Flathub remote not found; please add Flathub before running this script"
             exit 1
@@ -185,18 +185,18 @@ install_rpm() {
 install_aur() {
     msg_info "Installing from AUR"
     msg_info "${BOLD}This script will attempt to use yay, paru, aura, pikaur, or trizen, in that order"
-    confirm "If you use another AUR helper, you should install OpenDeck manually. Continue?"
+    confirm "If you use another AUR helper, you should install RiverDeck manually. Continue?"
 
     if has_cmd yay; then
-        yay -Sy opendeck
+        yay -Sy riverdeck
     elif has_cmd paru; then
-        paru -Sy opendeck
+        paru -Sy riverdeck
     elif has_cmd aura; then
-        aura -Ak opendeck
+        aura -Ak riverdeck
     elif has_cmd pikaur; then
-        pikaur -Sy opendeck
+        pikaur -Sy riverdeck
     elif has_cmd trizen; then
-        trizen -Sy opendeck
+        trizen -Sy riverdeck
     else
         msg_error "No AUR helper found; install yay, paru, aura, pikaur, or trizen, or install manually"
         return 1
@@ -261,7 +261,7 @@ ublue)
 unknown)
     if has_cmd flatpak; then
         msg_warn "No native package method found"
-        msg_info "You can continue by installing with Flatpak; if you experience issues, manually install OpenDeck natively"
+        msg_info "You can continue by installing with Flatpak; if you experience issues, manually install RiverDeck natively"
         if confirm "Install with Flatpak?"; then
             install_flatpak
         else
@@ -269,7 +269,7 @@ unknown)
             exit 1
         fi
     else
-        msg_error "No usable installation method found; please install OpenDeck manually"
+        msg_error "No usable installation method found; please install RiverDeck manually"
         exit 1
     fi
     ;;
@@ -278,21 +278,23 @@ esac
 install_wine_if_needed
 
 msg_ok "Installation complete!"
-echo -e "${YELLOW}If you enjoy OpenDeck, please consider starring the project on GitHub: ${BLUE}https://github.com/${GITHUB_REPO}${RESET}"
+echo -e "${YELLOW}If you enjoy RiverDeck, please consider starring the project on GitHub: ${BLUE}https://github.com/${GITHUB_REPO}${RESET}"
 
-if confirm "Launch OpenDeck now?"; then
+if confirm "Launch RiverDeck now?"; then
     if [[ "$PKG_FAMILY" == "ublue" ]] || { [[ "$PKG_FAMILY" == "unknown" ]] && has_cmd flatpak; }; then
         flatpak run "${FLATHUB_APP_ID}" &
-        msg_ok "Launched OpenDeck using Flatpak"
+        msg_ok "Launched RiverDeck using Flatpak"
     else
-        if [ -x /bin/opendeck ]; then
-            /bin/opendeck &
-            msg_ok "Launched OpenDeck from /bin"
-        elif has_cmd opendeck; then
-            opendeck &
-            msg_ok "Launched OpenDeck from PATH"
+        if [ -x /bin/riverdeck ]; then
+            /bin/riverdeck &
+            msg_ok "Launched RiverDeck from /bin"
+        elif has_cmd riverdeck; then
+            riverdeck &
+            msg_ok "Launched RiverDeck from PATH"
         else
-            msg_warn "OpenDeck executable not found"
+            msg_warn "RiverDeck executable not found"
         fi
     fi
 fi
+
+

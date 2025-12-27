@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+	<id>riverdeck</id>
+
+	<name>RiverDeck</name>
+	<summary>Use stream controllers</summary>
+	<developer id="io.github.sulrwin"><name>Ethan Wright</name></developer>
+	<launchable type="desktop-id">riverdeck.desktop</launchable>
+
+	<url type="vcs-browser">https://github.com/sulrwin/RiverDeck</url>
+	<url type="homepage">https://github.com/sulrwin/RiverDeck</url>
+	<url type="bugtracker">https://github.com/sulrwin/RiverDeck/issues</url>
+	<url type="faq">https://github.com/sulrwin/RiverDeck?tab=readme-ov-file#support</url>
+	<url type="contribute">https://github.com/sulrwin/RiverDeck?tab=readme-ov-file#building-from-source--contributing</url>
+	<url type="contact">https://github.com/sulrwin/RiverDeck</url>
+
+	<metadata_license>CC-BY-SA-4.0</metadata_license>
+	<project_license>GPL-3.0-or-later</project_license>
+	<content_rating type="oars-1.1" />
+
+	<description>
+		<p>RiverDeck is an application for using stream controller devices like the Elgato Stream Deck.</p>
+		<p>RiverDeck is forked from OpenDeck and supports the majority of the original Stream Deck plugins, unlike other third-party options which are often more limited.</p>
+		<p>Please note that you may need to install udev subsystem rules for your device to be detected. For more information, see the Installation section of the project README on GitHub.</p>
+		<p>Many plugins are not compiled for Linux, so you may need to have Wine (and Wine Mono) installed on your system (natively, as the Wine Flatpak is not supported).</p>
+	</description>
+</component>
+
+

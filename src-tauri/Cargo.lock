@@ -3246,51 +3246,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "opendeck"
-version = "2.7.1"
-dependencies = [
- "active-win-pos-rs",
- "anyhow",
- "base64 0.22.1",
- "built",
- "dashmap",
- "elgato-streamdeck",
- "fix-path-env",
- "fs2",
- "futures",
- "image",
- "json-patch 4.1.0",
- "log",
- "log-panics",
- "once_cell",
- "open",
- "os_info",
- "path-slash",
- "reqwest",
- "semver",
- "serde",
- "serde-inline-default",
- "serde_json",
- "serde_with",
- "sysinfo",
- "tauri",
- "tauri-build",
- "tauri-plugin-aptabase",
- "tauri-plugin-autostart",
- "tauri-plugin-cors-fetch",
- "tauri-plugin-deep-link",
- "tauri-plugin-dialog",
- "tauri-plugin-log",
- "tauri-plugin-single-instance",
- "tiny_http",
- "tokio",
- "tokio-tungstenite",
- "urlencoding",
- "windows-sys 0.61.2",
- "zip",
-]
-
-[[package]]
 name = "openssl"
 version = "0.10.75"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4214,6 +4169,51 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "riverdeck"
+version = "2.7.1"
+dependencies = [
+ "active-win-pos-rs",
+ "anyhow",
+ "base64 0.22.1",
+ "built",
+ "dashmap",
+ "elgato-streamdeck",
+ "fix-path-env",
+ "fs2",
+ "futures",
+ "image",
+ "json-patch 4.1.0",
+ "log",
+ "log-panics",
+ "once_cell",
+ "open",
+ "os_info",
+ "path-slash",
+ "reqwest",
+ "semver",
+ "serde",
+ "serde-inline-default",
+ "serde_json",
+ "serde_with",
+ "sysinfo",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-aptabase",
+ "tauri-plugin-autostart",
+ "tauri-plugin-cors-fetch",
+ "tauri-plugin-deep-link",
+ "tauri-plugin-dialog",
+ "tauri-plugin-log",
+ "tauri-plugin-single-instance",
+ "tiny_http",
+ "tokio",
+ "tokio-tungstenite",
+ "urlencoding",
+ "windows-sys 0.61.2",
+ "zip",
 ]
 
 [[package]]

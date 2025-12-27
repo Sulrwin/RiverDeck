@@ -26,6 +26,170 @@ use tauri_plugin_log::{Target, TargetKind};
 
 static APP_HANDLE: OnceCell<AppHandle> = OnceCell::new();
 
+fn is_empty_dir(path: &std::path::Path) -> bool {
+	match std::fs::read_dir(path) {
+		Ok(mut it) => it.next().is_none(),
+		Err(_) => true,
+	}
+}
+
+fn rewrite_opendeck_profile_json(value: &mut serde_json::Value) -> bool {
+	let mut changed = false;
+	match value {
+		serde_json::Value::Object(map) => {
+			for (k, v) in map.iter_mut() {
+				if k == "plugin" {
+					if let serde_json::Value::String(s) = v {
+						if s == "opendeck" {
+							*s = "riverdeck".to_owned();
+							changed = true;
+						}
+					}
+				} else if k == "uuid" {
+					if let serde_json::Value::String(s) = v {
+						if s == "opendeck.multiaction" {
+							*s = "riverdeck.multiaction".to_owned();
+							changed = true;
+						} else if s == "opendeck.toggleaction" {
+							*s = "riverdeck.toggleaction".to_owned();
+							changed = true;
+						}
+					}
+				}
+
+				changed |= rewrite_opendeck_profile_json(v);
+			}
+		}
+		serde_json::Value::Array(arr) => {
+			for v in arr.iter_mut() {
+				changed |= rewrite_opendeck_profile_json(v);
+			}
+		}
+		serde_json::Value::String(s) => {
+			if let Some(rest) = s.strip_prefix("opendeck/") {
+				*s = format!("riverdeck/{rest}");
+				changed = true;
+			}
+		}
+		_ => {}
+	}
+	changed
+}
+
+fn rewrite_profiles_on_disk(profiles_dir: &std::path::Path) -> Result<(), std::io::Error> {
+	fn visit_dir(dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>, std::io::Error> {
+		let mut files = vec![];
+		for entry in std::fs::read_dir(dir)? {
+			let entry = entry?;
+			let path = entry.path();
+			if entry.file_type()?.is_dir() {
+				files.extend(visit_dir(&path)?);
+			} else {
+				files.push(path);
+			}
+		}
+		Ok(files)
+	}
+
+	if !profiles_dir.exists() {
+		return Ok(());
+	}
+
+	for path in visit_dir(profiles_dir)? {
+		let name = path.file_name().and_then(|v| v.to_str()).unwrap_or("");
+		if !(name.ends_with(".json") || name.ends_with(".json.bak") || name.ends_with(".json.temp")) {
+			continue;
+		}
+		let Ok(contents) = std::fs::read_to_string(&path) else { continue };
+		let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&contents) else { continue };
+		if rewrite_opendeck_profile_json(&mut json) {
+			// Best-effort: preserve readability, but don't fail migration if this fails.
+			if let Ok(updated) = serde_json::to_string_pretty(&json) {
+				let _ = std::fs::write(&path, updated);
+			}
+		}
+	}
+	Ok(())
+}
+
+fn migrate_opendeck_to_riverdeck(app: &tauri::App) {
+	let Ok(new_config_dir) = app.path().app_config_dir() else { return };
+	let Ok(new_log_dir) = app.path().app_log_dir() else { return };
+
+	let marker = new_config_dir.join("migrated_from_opendeck");
+	if marker.exists() {
+		return;
+	}
+
+	let mut migrated_anything = false;
+
+	let config_base = app.path().config_dir().ok();
+	let data_base = app.path().data_dir().ok();
+	let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+
+	let mut old_candidates: Vec<std::path::PathBuf> = vec![];
+	if let Some(config_base) = &config_base {
+		old_candidates.extend([
+			config_base.join("opendeck"),
+			config_base.join("com.amansprojects.opendeck"),
+			config_base.join("me.amankhanna.opendeck"),
+		]);
+	}
+	// Legacy Linux XDG hardcoded paths (in case config_base isn't available or differs)
+	if let Some(home) = &home {
+		old_candidates.extend([
+			home.join(".config/opendeck"),
+			home.join(".config/com.amansprojects.opendeck"),
+			home.join(".config/me.amankhanna.opendeck"),
+		]);
+	}
+
+	let old_config_dir = old_candidates.into_iter().find(|p| p.exists());
+
+	// Copy config first (profiles, settings, plugins, etc)
+	if let Some(old_config_dir) = old_config_dir {
+		let _ = std::fs::create_dir_all(&new_config_dir);
+		if is_empty_dir(&new_config_dir) {
+			if let Err(err) = crate::shared::copy_dir(&old_config_dir, &new_config_dir) {
+				log::warn!("Failed to migrate config dir from {:?} to {:?}: {err}", old_config_dir, new_config_dir);
+			} else {
+				log::info!("Migrated config dir from {:?} to {:?}", old_config_dir, new_config_dir);
+				migrated_anything = true;
+			}
+		}
+	}
+
+	// Copy logs/data if present (best-effort)
+	let mut old_log_candidates: Vec<std::path::PathBuf> = vec![];
+	if let Some(data_base) = &data_base {
+		old_log_candidates.extend([data_base.join("opendeck").join("logs"), data_base.join("opendeck")]);
+	}
+	if let Some(home) = &home {
+		old_log_candidates.extend([home.join(".local/share/opendeck/logs"), home.join(".local/share/opendeck")]);
+	}
+
+	if let Some(old_log_dir) = old_log_candidates.into_iter().find(|p| p.exists()) {
+		let _ = std::fs::create_dir_all(&new_log_dir);
+		if is_empty_dir(&new_log_dir) {
+			if let Err(err) = crate::shared::copy_dir(&old_log_dir, &new_log_dir) {
+				log::warn!("Failed to migrate log dir from {:?} to {:?}: {err}", old_log_dir, new_log_dir);
+			} else {
+				log::info!("Migrated log dir from {:?} to {:?}", old_log_dir, new_log_dir);
+				migrated_anything = true;
+			}
+		}
+	}
+
+	// Mark migration as done (even if partial), to avoid repeatedly copying.
+	if migrated_anything {
+		// Rewrite migrated profiles so RiverDeck's built-in actions still work.
+		let _ = rewrite_profiles_on_disk(&new_config_dir.join("profiles"));
+
+		let _ = std::fs::create_dir_all(&new_config_dir);
+		let _ = std::fs::write(&marker, b"ok\n");
+	}
+}
+
 fn show_window(app: &AppHandle) -> Result<(), tauri::Error> {
 	#[cfg(target_os = "macos")]
 	{
@@ -108,10 +272,8 @@ async fn main() {
 				let _ = hide_window(app.handle());
 			}
 
-			let old = app.path().config_dir().unwrap().join("com.amansprojects.opendeck");
-			if old.exists() {
-				let _ = std::fs::rename(old, app.path().app_config_dir().unwrap());
-			}
+			// One-time migration from OpenDeck → RiverDeck.
+			migrate_opendeck_to_riverdeck(app);
 
 			let mut settings = store::get_settings()?;
 			use std::cmp::Ordering;
@@ -172,10 +334,13 @@ If you have already donated, thank you so much for your support!"#,
 			}
 
 			use tauri_plugin_aptabase::{Builder, EventTracker, InitOptions};
+			// Telemetry is opt-in and requires RiverDeck-owned env vars; otherwise this stays disabled.
+			let aptabase_app_key = if settings.value.statistics { std::env::var("RIVERDECK_APTABASE_APP_KEY").unwrap_or_default() } else { String::new() };
+			let aptabase_host = std::env::var("RIVERDECK_APTABASE_HOST").ok();
 			app.handle().plugin(
-				Builder::new(if settings.value.statistics { "A-SH-3841489320" } else { "" })
+				Builder::new(&aptabase_app_key)
 					.with_options(InitOptions {
-						host: Some("https://aptabase.amankhanna.me".to_owned()),
+						host: aptabase_host,
 						flush_interval: None,
 					})
 					.build(),
@@ -236,9 +401,9 @@ If you have already donated, thank you so much for your support!"#,
 
 			async fn update() -> Result<(), anyhow::Error> {
 				let res = reqwest::Client::new()
-					.get("https://api.github.com/repos/nekename/OpenDeck/releases/latest")
+					.get("https://api.github.com/repos/sulrwin/RiverDeck/releases/latest")
 					.header("Accept", "application/vnd.github+json")
-					.header("User-Agent", "OpenDeck")
+					.header("User-Agent", "RiverDeck")
 					.send()
 					.await?
 					.json::<serde_json::Value>()
@@ -273,7 +438,7 @@ If you have already donated, thank you so much for your support!"#,
 			tauri_plugin_log::Builder::default()
 				.targets([Target::new(TargetKind::LogDir { file_name: None }), Target::new(TargetKind::Stdout)])
 				.level(log::LevelFilter::Info)
-				.level_for("opendeck", log::LevelFilter::Trace)
+				.level_for("riverdeck", log::LevelFilter::Trace)
 				.build(),
 		)
 		.plugin(tauri_plugin_cors_fetch::init())

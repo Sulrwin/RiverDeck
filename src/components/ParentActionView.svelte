@@ -25,10 +25,13 @@
 		if (dataTransfer?.getData("action")) {
 			let action = JSON.parse(dataTransfer?.getData("action"));
 			if (
-				(parentUuid == "opendeck.multiaction" && !action.supported_in_multi_actions) ||
+				((parentUuid == "riverdeck.multiaction" || parentUuid == "opendeck.multiaction") && !action.supported_in_multi_actions) ||
 				(
-					parentUuid == "opendeck.toggleaction" &&
-					(action.uuid == "opendeck.multiaction" || action.uuid == "opendeck.toggleaction")
+					(parentUuid == "riverdeck.toggleaction" || parentUuid == "opendeck.toggleaction") &&
+					(
+						action.uuid == "riverdeck.multiaction" || action.uuid == "riverdeck.toggleaction" ||
+						action.uuid == "opendeck.multiaction" || action.uuid == "opendeck.toggleaction"
+					)
 				)
 			) {
 				return;
@@ -53,7 +56,7 @@
 
 <div class="px-6 pt-6 pb-4 dark:text-neutral-300">
 	<button class="float-right text-xl" on:click={() => $inspectedParentAction = null}>✕</button>
-	<h1 class="font-semibold text-2xl">{parentUuid == "opendeck.toggleaction" ? "Toggle Action" : "Multi Action"}</h1>
+	<h1 class="font-semibold text-2xl">{(parentUuid == "riverdeck.toggleaction" || parentUuid == "opendeck.toggleaction") ? "Toggle Action" : "Multi Action"}</h1>
 </div>
 
 <!-- svelte-ignore a11y-no-static-element-interactions -->

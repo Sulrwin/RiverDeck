@@ -307,12 +307,12 @@ pub static CATEGORIES: Lazy<RwLock<HashMap<String, Category>>> = Lazy::new(|| {
 				serde_json::from_value(serde_json::json!(
 					{
 						"name": "Multi Action",
-						"icon": "opendeck/multi-action.png",
-						"plugin": "opendeck",
-						"uuid": "opendeck.multiaction",
+						"icon": "riverdeck/multi-action.png",
+						"plugin": "riverdeck",
+						"uuid": "riverdeck.multiaction",
 						"tooltip": "Execute multiple actions",
 						"controllers": [ "Keypad" ],
-						"states": [ { "image": "opendeck/multi-action.png" } ],
+						"states": [ { "image": "riverdeck/multi-action.png" } ],
 						"supported_in_multi_actions": false
 					}
 				))
@@ -320,12 +320,12 @@ pub static CATEGORIES: Lazy<RwLock<HashMap<String, Category>>> = Lazy::new(|| {
 				serde_json::from_value(serde_json::json!(
 					{
 						"name": "Toggle Action",
-						"icon": "opendeck/toggle-action.png",
-						"plugin": "opendeck",
-						"uuid": "opendeck.toggleaction",
+						"icon": "riverdeck/toggle-action.png",
+						"plugin": "riverdeck",
+						"uuid": "riverdeck.toggleaction",
 						"tooltip": "Cycle through multiple actions",
 						"controllers": [ "Keypad" ],
-						"states": [ { "image": "opendeck/toggle-action.png" } ],
+						"states": [ { "image": "riverdeck/toggle-action.png" } ],
 						"supported_in_multi_actions": false
 					}
 				))

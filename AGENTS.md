@@ -1,15 +1,15 @@
-# OpenDeck Development Guide
+# RiverDeck Development Guide
 
 ## Architecture Overview
 
-OpenDeck is a Tauri desktop application for controlling Elgato Stream Deck devices. It's built with:
+RiverDeck is a Tauri desktop application for controlling Elgato Stream Deck devices. RiverDeck is forked from OpenDeck. It's built with:
 - **Backend**: Rust (Tauri v2) - device communication, plugin management, WebSocket/HTTP servers
 - **Frontend**: SvelteKit + TypeScript + Tailwind CSS v4 - UI rendered in webview
 - **Build Tool**: Deno (not Node.js) - manages tasks and dependencies
 
 ### Core Architecture Pattern
 
-OpenDeck acts as a **host application** that communicates with **plugins** (separate processes):
+RiverDeck acts as a **host application** that communicates with **plugins** (separate processes):
 1. Plugins connect via WebSocket (port dynamically allocated, starting from 57116)
 2. Static assets served via `tiny_http` webserver (port = WebSocket port + 2)
 3. Plugin property inspectors (HTML/JS) run in iframes and use separate WebSocket connections
@@ -65,7 +65,7 @@ These are project standards, not suggestions.
 
 ### Built-in Plugins
 
-Built-in plugins included in OpenDeck are Rust binaries. The `build.ts` script in each plugin compiles for multiple targets (x86_64/aarch64) and organizes binaries by OS.
+Built-in plugins included in RiverDeck are Rust binaries. The `build.ts` script in each plugin compiles for multiple targets (x86_64/aarch64) and organizes binaries by OS.
 
 ## Key Conventions
 
@@ -175,12 +175,12 @@ Port allocation: `PORT_BASE` (WebSocket), `PORT_BASE + 2` (HTTP static files)
 ### File Locations
 
 ```
-Config: ~/.config/opendeck/ (Linux) / ~/Library/Application Support/opendeck/ (macOS)
-Logs:   ~/.local/share/opendeck/logs/ (Linux) / ~/Library/Logs/opendeck/ (macOS)
+Config: ~/.config/io.github.sulrwin.riverdeck/ (Linux) / ~/Library/Application Support/io.github.sulrwin.riverdeck/ (macOS)
+Logs:   ~/.local/share/io.github.sulrwin.riverdeck/logs/ (Linux) / ~/Library/Logs/io.github.sulrwin.riverdeck/ (macOS)
 Plugins: <config_dir>/plugins/
 ```
 
-Flatpak uses different paths with `~/.var/app/me.amankhanna.opendeck/` prefix.
+Flatpak uses different paths with `~/.var/app/io.github.sulrwin.riverdeck/` prefix.
 
 ## Testing & Debugging
 

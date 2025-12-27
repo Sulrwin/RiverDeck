@@ -7,6 +7,7 @@ import { invoke } from "@tauri-apps/api/core";
 
 export function getImage(image: string | undefined, fallback: string | undefined): string {
 	if (!image) return fallback ? getImage(fallback, undefined) : "/alert.png";
+	if (image.startsWith("riverdeck/")) return image.replace("riverdeck", "");
 	if (image.startsWith("opendeck/")) return image.replace("opendeck", "");
 	if (!image.startsWith("data:")) return getWebserverUrl(image);
 	const svgxmlre = /^data:image\/svg\+xml(?!.*?;base64.*?)(?:;[\w=]*)*,(.+)/;
