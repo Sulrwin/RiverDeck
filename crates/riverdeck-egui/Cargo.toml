@@ -41,6 +41,7 @@ tray = ["dep:tray-icon"]
 [dependencies]
 anyhow = "1.0"
 auto-launch = "0.5"
+base64 = "0.22"
 eframe = "0.31"
 egui = "0.31"
 env_logger = "0.11"

@@ -26,6 +26,21 @@ pub async fn will_appear(instance: &ActionInstance) -> Result<(), anyhow::Error>
 
     super::states::title_parameters_did_change(instance, instance.current_state).await?;
 
+    // Ensure something visible is pushed to the device immediately.
+    // Many plugins rely on the host to show the manifest icon until they call `setImage`.
+    let img = instance
+        .states
+        .get(instance.current_state as usize)
+        .map(|s| s.image.trim())
+        .filter(|s| !s.is_empty() && *s != "actionDefaultImage")
+        .map(|s| s.to_owned())
+        .unwrap_or_else(|| instance.action.icon.clone());
+    if let Err(error) =
+        crate::events::outbound::devices::update_image((&instance.context).into(), Some(img)).await
+    {
+        log::warn!("Failed to set initial device image on willAppear: {}", error);
+    }
+
     Ok(())
 }
 

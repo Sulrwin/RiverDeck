@@ -55,6 +55,12 @@ pub async fn set_image(
     mut event: ContextAndPayloadEvent<SetImagePayload>,
 ) -> Result<(), anyhow::Error> {
     let mut locks = acquire_locks_mut().await;
+    // Compute before we take a mutable borrow into `locks` for the instance.
+    let active = locks
+        .device_stores
+        .get_selected_profile(&event.context.device)
+        .ok()
+        .is_some_and(|p| p == event.context.profile);
 
     if let Some(instance) = get_instance_mut(&event.context, &mut locks).await? {
         if let Some(image) = &event.payload.image {
@@ -90,6 +96,32 @@ pub async fn set_image(
         ui::emit(UiEvent::ActionStateChanged {
             context: instance.context.clone(),
         });
+
+        // Stream Deck SDK: if `state` is provided, only that state's image should change.
+        // We should only repaint the physical device if the *visible* state is affected.
+        let affects_visible = match event.payload.state {
+            None => true,
+            Some(s) => s == instance.current_state,
+        };
+
+        if active && affects_visible {
+            let img = instance
+                .states
+                .get(instance.current_state as usize)
+                .map(|s| s.image.trim())
+                .filter(|s| !s.is_empty() && *s != "actionDefaultImage")
+                .map(|s| s.to_owned())
+                .unwrap_or_else(|| instance.action.icon.clone());
+
+            if let Err(error) = crate::events::outbound::devices::update_image(
+                (&instance.context).into(),
+                if img.trim().is_empty() { None } else { Some(img) },
+            )
+            .await
+            {
+                log::warn!("Failed to update device image after setImage: {}", error);
+            }
+        }
     }
     save_profile(&event.context.device, &mut locks).await?;
 
@@ -100,6 +132,12 @@ pub async fn set_state(
     event: ContextAndPayloadEvent<SetStatePayload>,
 ) -> Result<(), anyhow::Error> {
     let mut locks = acquire_locks_mut().await;
+    // Compute before we take a mutable borrow into `locks` for the instance.
+    let active = locks
+        .device_stores
+        .get_selected_profile(&event.context.device)
+        .ok()
+        .is_some_and(|p| p == event.context.profile);
 
     if let Some(instance) = get_instance_mut(&event.context, &mut locks).await? {
         if event.payload.state >= instance.states.len() as u16 {
@@ -109,6 +147,24 @@ pub async fn set_state(
         ui::emit(UiEvent::ActionStateChanged {
             context: instance.context.clone(),
         });
+
+        if active {
+            let img = instance
+                .states
+                .get(instance.current_state as usize)
+                .map(|s| s.image.trim())
+                .filter(|s| !s.is_empty() && *s != "actionDefaultImage")
+                .map(|s| s.to_owned())
+                .unwrap_or_else(|| instance.action.icon.clone());
+            if let Err(error) = crate::events::outbound::devices::update_image(
+                (&instance.context).into(),
+                if img.trim().is_empty() { None } else { Some(img) },
+            )
+            .await
+            {
+                log::warn!("Failed to update device image after setState: {}", error);
+            }
+        }
     }
     save_profile(&event.context.device, &mut locks).await?;
 

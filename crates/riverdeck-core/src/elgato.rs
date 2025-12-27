@@ -1,6 +1,7 @@
 use crate::events::outbound::{encoder, keypad};
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use base64::Engine as _;
 use elgato_streamdeck::{
@@ -20,14 +21,50 @@ pub async fn update_image(
 ) -> Result<(), anyhow::Error> {
     if let Some(device) = ELGATO_DEVICES.read().await.get(&context.device) {
         if let Some(image) = image {
-            let data = image.split_once(',').unwrap().1;
-            let bytes = base64::engine::general_purpose::STANDARD.decode(data)?;
+            let dyn_img = if image.trim().starts_with("data:") {
+                // Stream Deck SDK commonly uses data URLs.
+                // Support both base64 and "raw" (non-base64) payloads.
+                let bytes = if image.contains(";base64,") {
+                    let (_meta, b64) = image
+                        .split_once(";base64,")
+                        .ok_or_else(|| anyhow::anyhow!("invalid data url (missing ';base64,')"))?;
+                    base64::engine::general_purpose::STANDARD.decode(b64)?
+                } else {
+                    let (_meta, raw) = image
+                        .split_once(',')
+                        .ok_or_else(|| anyhow::anyhow!("invalid data url (missing ',')"))?;
+                    raw.as_bytes().to_vec()
+                };
+                image::load_from_memory(&bytes)?
+            } else {
+                // RiverDeck stores images as filesystem paths in profiles (including decoded `data:` images).
+                // Also allow built-in relative paths like `riverdeck/...` by resolving against config/resource dirs.
+                let mut candidate: Option<std::path::PathBuf> = None;
+                let p = Path::new(image.trim());
+                if p.is_file() {
+                    candidate = Some(p.to_path_buf());
+                } else if image.starts_with("riverdeck/") || image.starts_with("opendeck/") {
+                    let cfg = crate::shared::config_dir().join(image.trim());
+                    if cfg.is_file() {
+                        candidate = Some(cfg);
+                    } else if let Some(res) = crate::shared::resource_dir() {
+                        let rp = res.join(image.trim());
+                        if rp.is_file() {
+                            candidate = Some(rp);
+                        }
+                    }
+                }
+
+                let path = candidate.ok_or_else(|| anyhow::anyhow!("image path not found: {image}"))?;
+                image::open(path)?
+            };
+
             if context.controller == "Encoder" {
                 device
                     .write_lcd(
                         (context.position as u16 * 200) + 64,
                         14,
-                        &ImageRect::from_image_async(image::load_from_memory(&bytes)?.resize(
+                        &ImageRect::from_image_async(dyn_img.resize(
                             72,
                             72,
                             image::imageops::FilterType::Nearest,
@@ -35,9 +72,7 @@ pub async fn update_image(
                     )
                     .await?;
             } else {
-                device
-                    .set_button_image(context.position, image::load_from_memory(&bytes)?)
-                    .await?;
+                device.set_button_image(context.position, dyn_img).await?;
             }
         } else if context.controller == "Encoder" {
             device

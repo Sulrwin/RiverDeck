@@ -3,7 +3,12 @@ use riverdeck_core::{application_watcher, elgato, plugins, shared, ui};
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
-use std::{fs, fs::OpenOptions, path::Path, sync::Mutex};
+use std::{
+    fs,
+    fs::OpenOptions,
+    path::{Path, PathBuf},
+    sync::Mutex,
+};
 
 use fs2::FileExt;
 use tokio::runtime::Runtime;
@@ -361,6 +366,8 @@ struct RiverDeckApp {
 
     #[cfg(feature = "tray")]
     tray: Option<TrayState>,
+    #[cfg(feature = "tray")]
+    hide_to_tray_requested: bool,
     selected_device: Option<String>,
 
     selected_slot: Option<SelectedSlot>,
@@ -417,6 +424,8 @@ impl RiverDeckApp {
             update_info,
             #[cfg(feature = "tray")]
             tray,
+            #[cfg(feature = "tray")]
+            hide_to_tray_requested: false,
             selected_device: None,
             selected_slot: None,
             action_search: String::new(),
@@ -425,33 +434,100 @@ impl RiverDeckApp {
         }
     }
 
+    fn resolve_icon_path(&self, path: &str) -> Option<PathBuf> {
+        let p = Path::new(path);
+        if p.is_file() {
+            return Some(p.to_path_buf());
+        }
+
+        if path.starts_with("riverdeck/") || path.starts_with("opendeck/") {
+            let cfg = shared::config_dir().join(path);
+            if cfg.is_file() {
+                return Some(cfg);
+            }
+            if let Some(res) = shared::resource_dir() {
+                let rp = res.join(path);
+                if rp.is_file() {
+                    return Some(rp);
+                }
+            }
+        }
+
+        None
+    }
+
     fn texture_for_path(&mut self, ctx: &egui::Context, path: &str) -> Option<egui::TextureHandle> {
+        let path = path.trim();
+
+        // Support plugin-provided data URLs (common for `setImage`).
+        if path.starts_with("data:") {
+            use base64::Engine as _;
+            use std::hash::{Hash, Hasher};
+
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            path.hash(&mut hasher);
+            let key = format!("riverdeck_data:{:x}", hasher.finish());
+
+            if let Some(cached) = self.texture_cache.get(&key) {
+                return Some(cached.texture.clone());
+            }
+
+            let bytes = if path.contains(";base64,") {
+                let (_meta, b64) = path.split_once(";base64,")?;
+                base64::engine::general_purpose::STANDARD.decode(b64).ok()?
+            } else {
+                let (_meta, raw) = path.split_once(',')?;
+                raw.as_bytes().to_vec()
+            };
+
+            let img = image::load_from_memory(&bytes).ok()?.into_rgba8();
+            let size = [img.width() as usize, img.height() as usize];
+            let color_image = egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw());
+
+            let texture = ctx.load_texture(
+                format!("riverdeck_image:{key}"),
+                color_image,
+                egui::TextureOptions::LINEAR,
+            );
+            self.texture_cache.insert(
+                key,
+                CachedTexture {
+                    modified: None,
+                    texture: texture.clone(),
+                },
+            );
+            return Some(texture);
+        }
+
         if !(path.ends_with(".png") || path.ends_with(".jpg") || path.ends_with(".jpeg")) {
             return None;
         }
-        if !Path::new(path).is_file() {
-            self.texture_cache.remove(path);
+
+        let resolved = self.resolve_icon_path(path)?;
+        let cache_key = resolved.to_string_lossy().into_owned();
+        if !resolved.is_file() {
+            self.texture_cache.remove(&cache_key);
             return None;
         }
 
-        let modified = fs::metadata(path).ok().and_then(|m| m.modified().ok());
-        if let Some(cached) = self.texture_cache.get(path)
+        let modified = fs::metadata(&resolved).ok().and_then(|m| m.modified().ok());
+        if let Some(cached) = self.texture_cache.get(&cache_key)
             && cached.modified == modified
         {
             return Some(cached.texture.clone());
         }
 
-        let img = image::open(path).ok()?.into_rgba8();
+        let img = image::open(&resolved).ok()?.into_rgba8();
         let size = [img.width() as usize, img.height() as usize];
         let color_image = egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw());
 
         let texture = ctx.load_texture(
-            format!("riverdeck_image:{path}"),
+            format!("riverdeck_image:{cache_key}"),
             color_image,
             egui::TextureOptions::LINEAR,
         );
         self.texture_cache.insert(
-            path.to_owned(),
+            cache_key,
             CachedTexture {
                 modified,
                 texture: texture.clone(),
@@ -559,6 +635,14 @@ impl RiverDeckApp {
 
 impl eframe::App for RiverDeckApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // `tray-icon` on Linux uses GTK/AppIndicator under the hood, which relies on GLib to
+        // process DBus registration events. eframe/winit does not run a GTK mainloop, so we
+        // pump pending GLib events once per frame when tray support is enabled.
+        #[cfg(all(target_os = "linux", feature = "tray"))]
+        if self.tray.is_some() {
+            while gtk::glib::MainContext::default().iteration(false) {}
+        }
+
         // If the user tries to close the window, prefer "hide to tray" (when available).
         // A real exit is done via the tray menu (Quit).
         #[cfg(feature = "tray")]
@@ -567,7 +651,7 @@ impl eframe::App for RiverDeckApp {
                 // Allow the close to proceed.
             } else if self.tray.is_some() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                self.hide_to_tray_requested = true;
             }
         }
 
@@ -588,6 +672,14 @@ impl eframe::App for RiverDeckApp {
         #[cfg(feature = "tray")]
         if let Some(tray) = &mut self.tray {
             tray.poll(ctx);
+        }
+
+        // Apply hide-to-tray requests (we do this after polling the tray menu so that a
+        // "Show" click can't be immediately overridden by a stale request).
+        #[cfg(feature = "tray")]
+        if self.hide_to_tray_requested {
+            self.hide_to_tray_requested = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
 
         self.poll_ui_events();
@@ -894,7 +986,7 @@ impl RiverDeckApp {
                         // Hide to tray when available; otherwise close.
                         #[cfg(feature = "tray")]
                         if self.tray.is_some() {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                            self.hide_to_tray_requested = true;
                         } else {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         }

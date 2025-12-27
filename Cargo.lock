@@ -4860,6 +4860,7 @@ version = "2.7.1"
 dependencies = [
  "anyhow",
  "auto-launch",
+ "base64",
  "eframe",
  "egui",
  "env_logger",
