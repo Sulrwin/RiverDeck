@@ -69,6 +69,14 @@ pub(crate) fn overlays_for_instance(
 
     let mut overlays: Vec<(String, TextPlacement)> = Vec::new();
 
+    // If both are enabled (and different), force Top/Bottom. This makes the UI predictable and
+    // avoids overlapping when users toggle both on.
+    if show_title && show_action_name && title != action_name {
+        overlays.push((action_name.to_owned(), TextPlacement::Top));
+        overlays.push((title.to_owned(), TextPlacement::Bottom));
+        return Some(overlays);
+    }
+
     // Keep legacy behavior: the Stream Deck "Title" uses `text_placement`.
     if show_title {
         overlays.push((title.to_owned(), st.text_placement));
@@ -76,14 +84,14 @@ pub(crate) fn overlays_for_instance(
 
     // If the title already equals the action name (common default), don't render both.
     if show_action_name && (!show_title || title != action_name) {
-        let opposite = |p: TextPlacement| match p {
-            TextPlacement::Top => TextPlacement::Bottom,
-            TextPlacement::Bottom => TextPlacement::Top,
-            TextPlacement::Left => TextPlacement::Right,
-            TextPlacement::Right => TextPlacement::Left,
-        };
         let placement = if show_title {
-            opposite(st.text_placement)
+            // When title is already present, keep action name on the opposite side.
+            match st.text_placement {
+                TextPlacement::Top => TextPlacement::Bottom,
+                TextPlacement::Bottom => TextPlacement::Top,
+                TextPlacement::Left => TextPlacement::Right,
+                TextPlacement::Right => TextPlacement::Left,
+            }
         } else {
             // If there's no title, keep the action name in the familiar place.
             TextPlacement::Bottom

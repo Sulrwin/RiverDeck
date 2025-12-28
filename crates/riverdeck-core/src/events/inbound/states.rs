@@ -90,7 +90,11 @@ pub async fn set_title(
                 .unwrap_or_else(|| instance.action.icon.clone());
             let _ = crate::events::outbound::devices::update_image_for_instance(
                 instance,
-                if img.trim().is_empty() { None } else { Some(img) },
+                if img.trim().is_empty() {
+                    None
+                } else {
+                    Some(img)
+                },
             )
             .await;
         }
@@ -179,9 +183,14 @@ pub async fn set_image(
 
             if let Err(error) = crate::events::outbound::devices::update_image_for_instance(
                 instance,
-                if img.trim().is_empty() { None } else { Some(img) },
+                if img.trim().is_empty() {
+                    None
+                } else {
+                    Some(img)
+                },
             )
-            .await {
+            .await
+            {
                 log::warn!("Failed to update device image after setImage: {}", error);
             }
         }
@@ -221,9 +230,14 @@ pub async fn set_state(
                 .unwrap_or_else(|| instance.action.icon.clone());
             if let Err(error) = crate::events::outbound::devices::update_image_for_instance(
                 instance,
-                if img.trim().is_empty() { None } else { Some(img) },
+                if img.trim().is_empty() {
+                    None
+                } else {
+                    Some(img)
+                },
             )
-            .await {
+            .await
+            {
                 log::warn!("Failed to update device image after setState: {}", error);
             }
         }

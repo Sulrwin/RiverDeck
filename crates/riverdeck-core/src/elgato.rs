@@ -2,6 +2,8 @@ use crate::events::outbound::{encoder, keypad};
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use elgato_streamdeck::{
@@ -12,10 +14,220 @@ use elgato_streamdeck::{
 use font8x8::UnicodeFonts;
 use image::{Rgba, RgbaImage};
 use once_cell::sync::Lazy;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
+use tokio::time::sleep;
 
 static ELGATO_DEVICES: Lazy<RwLock<HashMap<String, AsyncStreamDeck>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
+
+#[derive(Clone)]
+enum PlusLayer {
+    None,
+    Static(image::DynamicImage),
+    Animated {
+        frames: Vec<crate::animation::PreparedFrame>,
+        idx: usize,
+        next_at: Instant,
+    },
+}
+
+impl PlusLayer {
+    fn is_animated(&self) -> bool {
+        matches!(self, PlusLayer::Animated { .. })
+    }
+
+    fn current_image(&self) -> image::DynamicImage {
+        match self {
+            PlusLayer::None => image::DynamicImage::ImageRgba8(RgbaImage::new(1, 1)),
+            PlusLayer::Static(img) => img.clone(),
+            PlusLayer::Animated { frames, idx, .. } => frames
+                .get(*idx % frames.len())
+                .map(|f| f.image.clone())
+                .unwrap_or_else(|| image::DynamicImage::ImageRgba8(RgbaImage::new(1, 1))),
+        }
+    }
+}
+
+struct PlusDeviceState {
+    generation: u64,
+    background: PlusLayer, // 800x100
+    dials: Vec<PlusLayer>, // per encoder, each 72x72 (or None)
+    task_running: bool,
+}
+
+static PLUS_STATE: Lazy<RwLock<HashMap<String, Arc<Mutex<PlusDeviceState>>>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+
+async fn plus_state_for_device(device_id: &str, encoders: usize) -> Arc<Mutex<PlusDeviceState>> {
+    if let Some(st) = PLUS_STATE.read().await.get(device_id) {
+        return st.clone();
+    }
+    let mut map = PLUS_STATE.write().await;
+    map.entry(device_id.to_owned())
+        .or_insert_with(|| {
+            Arc::new(Mutex::new(PlusDeviceState {
+                generation: 1,
+                background: PlusLayer::None,
+                dials: vec![PlusLayer::None; encoders],
+                task_running: false,
+            }))
+        })
+        .clone()
+}
+
+fn plus_bump_generation(state: &mut PlusDeviceState) -> u64 {
+    state.generation = state.generation.wrapping_add(1).max(1);
+    // Force re-spawn of the render task for the new generation.
+    state.task_running = false;
+    state.generation
+}
+
+fn plus_composite_frame(
+    bg: &PlusLayer,
+    dials: &[(u8, image::DynamicImage)],
+) -> image::DynamicImage {
+    // Compose into a single RGBA image then rely on elgato-streamdeck conversion.
+    let mut base = match bg {
+        PlusLayer::None => RgbaImage::from_pixel(800, 100, Rgba([0, 0, 0, 255])),
+        _ => bg
+            .current_image()
+            .resize_exact(800, 100, image::imageops::FilterType::Nearest)
+            .to_rgba8(),
+    };
+
+    for (dial, icon) in dials {
+        let icon = icon
+            .resize_exact(72, 72, image::imageops::FilterType::Nearest)
+            .to_rgba8();
+        let ox = (*dial as u32) * 200 + 64;
+        let oy = 14u32;
+        for y in 0..icon.height() {
+            for x in 0..icon.width() {
+                let dst_x = ox + x;
+                let dst_y = oy + y;
+                if dst_x < base.width() && dst_y < base.height() {
+                    let src = *icon.get_pixel(x, y);
+                    if src[3] != 0 {
+                        let dst = base.get_pixel_mut(dst_x, dst_y);
+                        blend_pixel(dst, src);
+                    }
+                }
+            }
+        }
+    }
+
+    image::DynamicImage::ImageRgba8(base)
+}
+
+async fn plus_render_once(device_id: &str, state: Arc<Mutex<PlusDeviceState>>) {
+    let device = {
+        let devices = ELGATO_DEVICES.read().await;
+        devices.get(device_id).cloned()
+    };
+    let Some(device) = device else { return };
+    if device.kind() != Kind::Plus {
+        return;
+    }
+
+    // Snapshot current images without holding the state lock across awaits.
+    let (bg, dial_imgs) = {
+        let st = state.lock().await;
+        let bg = st.background.clone();
+        let mut out: Vec<(u8, image::DynamicImage)> = Vec::new();
+        for (idx, layer) in st.dials.iter().enumerate() {
+            match layer {
+                PlusLayer::None => {}
+                _ => out.push((idx as u8, layer.current_image())),
+            }
+        }
+        (bg, out)
+    };
+
+    let composed = plus_composite_frame(&bg, &dial_imgs);
+    let fmt = device.kind().lcd_image_format().unwrap();
+    if let Ok(buf) = convert_image_with_format_async(fmt, composed) {
+        let _ = device.write_lcd_fill(&buf).await;
+        let _ = device.flush().await;
+    }
+}
+
+async fn plus_ensure_task(device_id: String, state: Arc<Mutex<PlusDeviceState>>, generation: u64) {
+    // Avoid spawning multiple tasks.
+    {
+        let mut st = state.lock().await;
+        if st.task_running && st.generation == generation {
+            return;
+        }
+        st.task_running = true;
+    }
+
+    tokio::spawn(async move {
+        loop {
+            // Snapshot current state and also advance any due animations.
+            let (still_current, any_animated, sleep_for) = {
+                let mut st = state.lock().await;
+                if st.generation != generation {
+                    st.task_running = false;
+                    (false, false, Duration::from_millis(0))
+                } else {
+                    let now = Instant::now();
+                    let mut next: Option<Instant> = None;
+
+                    let mut bump_layer = |layer: &mut PlusLayer| {
+                        let PlusLayer::Animated {
+                            frames,
+                            idx,
+                            next_at,
+                        } = layer
+                        else {
+                            return;
+                        };
+                        if frames.is_empty() {
+                            return;
+                        }
+                        if *next_at <= now {
+                            *idx = idx.wrapping_add(1) % frames.len();
+                            *next_at = now + frames[*idx].delay;
+                        }
+                        next = Some(next.map(|n| n.min(*next_at)).unwrap_or(*next_at));
+                    };
+
+                    bump_layer(&mut st.background);
+                    for dial in st.dials.iter_mut() {
+                        bump_layer(dial);
+                    }
+
+                    let any =
+                        st.background.is_animated() || st.dials.iter().any(|d| d.is_animated());
+                    let sleep_for = if any {
+                        next.and_then(|t| t.checked_duration_since(Instant::now()))
+                            .unwrap_or_else(|| Duration::from_millis(5))
+                            .clamp(Duration::from_millis(1), Duration::from_millis(200))
+                    } else {
+                        Duration::from_millis(0)
+                    };
+                    (true, any, sleep_for)
+                }
+            };
+
+            if !still_current {
+                break;
+            }
+
+            // Render current frame (background + dial overlays).
+            plus_render_once(&device_id, state.clone()).await;
+
+            if !any_animated {
+                // No ongoing animation; shut down.
+                let mut st = state.lock().await;
+                st.task_running = false;
+                break;
+            }
+
+            sleep(sleep_for).await;
+        }
+    });
+}
 
 fn blend_pixel(dst: &mut Rgba<u8>, src: Rgba<u8>) {
     let sa = src[3] as f32 / 255.0;
@@ -40,19 +252,6 @@ fn blend_pixel(dst: &mut Rgba<u8>, src: Rgba<u8>) {
     dst[3] = (out_a * 255.0).round().clamp(0.0, 255.0) as u8;
 }
 
-fn draw_rect(img: &mut RgbaImage, x: u32, y: u32, w: u32, h: u32, color: Rgba<u8>) {
-    let iw = img.width();
-    let ih = img.height();
-    let x1 = (x + w).min(iw);
-    let y1 = (y + h).min(ih);
-    for yy in y..y1 {
-        for xx in x..x1 {
-            let p = img.get_pixel_mut(xx, yy);
-            blend_pixel(p, color);
-        }
-    }
-}
-
 fn draw_text_8x8(img: &mut RgbaImage, x: u32, y: u32, text: &str, scale: u32, color: Rgba<u8>) {
     let scale = scale.max(1);
     let mut cursor_x = x;
@@ -64,7 +263,8 @@ fn draw_text_8x8(img: &mut RgbaImage, x: u32, y: u32, text: &str, scale: u32, co
         for (row, bits) in glyph.iter().enumerate() {
             for col in 0..8 {
                 if (bits >> col) & 1 == 1 {
-                    let px = cursor_x + (7 - col) as u32 * scale;
+                    // `font8x8` stores glyph bits LSB-first (col 0 = left). Do not mirror.
+                    let px = cursor_x + (col as u32) * scale;
                     let py = y + row as u32 * scale;
                     for dy in 0..scale {
                         for dx in 0..scale {
@@ -97,48 +297,172 @@ fn overlay_label(
         return image::DynamicImage::ImageRgba8(img);
     }
 
-    // Choose a scale that stays readable across common Stream Deck sizes.
+    // Auto-scale + wrap so text always fits.
     let min_side = w.min(h).max(1);
-    let scale = (min_side / 72).clamp(1, 3);
+    let max_scale = if min_side >= 96 {
+        3
+    } else if min_side >= 72 {
+        2
+    } else {
+        1
+    };
 
-    // Truncate to fit (horizontal).
-    let max_w = w.saturating_sub(8);
-    let char_w = 8 * scale + scale;
-    let mut text = label.to_owned();
-    if (text.chars().count() as u32) * char_w > max_w && char_w > 0 {
-        let max_chars = (max_w / char_w).saturating_sub(3) as usize;
-        if max_chars > 0 {
-            text = text.chars().take(max_chars).collect::<String>() + "...";
-        } else {
-            text = "...".to_owned();
+    let max_w = w.saturating_sub(8).max(1);
+    let max_h = match placement {
+        // Reserve roughly half the key for the label strip so icons still have room.
+        crate::shared::TextPlacement::Top | crate::shared::TextPlacement::Bottom => {
+            (h / 2).saturating_sub(4).max(8)
+        }
+        crate::shared::TextPlacement::Left | crate::shared::TextPlacement::Right => {
+            h.saturating_sub(8).max(8)
+        }
+    };
+
+    let ellipsize = |s: &str, max_chars: usize| -> String {
+        if max_chars == 0 {
+            return String::new();
+        }
+        let chars: Vec<char> = s.chars().collect();
+        if chars.len() <= max_chars {
+            return s.to_owned();
+        }
+        if max_chars <= 3 {
+            return "...".chars().take(max_chars).collect();
+        }
+        let keep = max_chars.saturating_sub(3);
+        chars.into_iter().take(keep).collect::<String>() + "..."
+    };
+
+    let wrap_words = |text: &str, max_cols: usize, max_lines: usize| -> Vec<String> {
+        if max_cols == 0 || max_lines == 0 {
+            return vec![];
+        }
+        let mut lines: Vec<String> = Vec::new();
+        let mut current = String::new();
+
+        let push_line = |line: String, lines: &mut Vec<String>| {
+            if !line.trim().is_empty() {
+                lines.push(line);
+            }
+        };
+
+        // Split on whitespace, keep words (no punctuation awareness needed for this tiny font).
+        for word in text.split_whitespace() {
+            if lines.len() >= max_lines {
+                break;
+            }
+            // If the current line is empty, try to place the word (or a chunk of it).
+            let sep = if current.is_empty() { "" } else { " " };
+            let candidate = format!("{current}{sep}{word}");
+            if candidate.chars().count() <= max_cols {
+                current = candidate;
+                continue;
+            }
+
+            // Commit current line if it has content.
+            if !current.is_empty() {
+                push_line(std::mem::take(&mut current), &mut lines);
+                if lines.len() >= max_lines {
+                    break;
+                }
+            }
+
+            // Word longer than max_cols: hard-break.
+            let mut remaining = word;
+            while !remaining.is_empty() && lines.len() < max_lines {
+                let chunk: String = remaining.chars().take(max_cols).collect();
+                let taken = chunk.chars().count();
+                push_line(chunk, &mut lines);
+                remaining = &remaining[remaining
+                    .char_indices()
+                    .nth(taken)
+                    .map(|(i, _)| i)
+                    .unwrap_or(remaining.len())..];
+            }
+        }
+
+        if lines.len() < max_lines && !current.is_empty() {
+            push_line(current, &mut lines);
+        }
+
+        lines
+    };
+
+    let mut chosen_scale = 1u32;
+    let mut chosen_lines: Vec<String> = vec![label.to_owned()];
+
+    for scale in (1..=max_scale).rev() {
+        let scale = scale as u32;
+        let char_w = 8 * scale + scale;
+        let line_h = 8 * scale;
+
+        // For left/right placements, we keep a single horizontal line (it will be rotated later).
+        let max_lines = match placement {
+            crate::shared::TextPlacement::Left | crate::shared::TextPlacement::Right => 1usize,
+            _ => {
+                // Prefer up to 2 lines, but fall back to 1 if height is tight.
+                if max_h >= (line_h * 2 + scale) { 2 } else { 1 }
+            }
+        };
+
+        let max_cols = match placement {
+            crate::shared::TextPlacement::Left | crate::shared::TextPlacement::Right => {
+                // After rotation, width becomes height. Constrain by max_h.
+                (max_h / char_w).max(1) as usize
+            }
+            _ => (max_w / char_w).max(1) as usize,
+        };
+
+        let mut lines = wrap_words(label, max_cols, max_lines);
+        if lines.is_empty() {
+            lines = vec![String::new()];
+        }
+
+        // Ellipsize if we had to truncate lines.
+        if lines.len() == max_lines {
+            let last = lines.last().cloned().unwrap_or_default();
+            let last = ellipsize(&last, max_cols);
+            if let Some(last_mut) = lines.last_mut() {
+                *last_mut = last;
+            }
+        }
+
+        let max_line_chars = lines
+            .iter()
+            .map(|l| l.chars().count() as u32)
+            .max()
+            .unwrap_or(0);
+        let text_w = max_line_chars * char_w;
+        let text_h = (lines.len() as u32) * line_h + (lines.len().saturating_sub(1) as u32) * scale;
+
+        if text_w <= max_w && text_h <= max_h {
+            chosen_scale = scale;
+            chosen_lines = lines;
+            break;
         }
     }
 
-    let text_w = (text.chars().count() as u32) * char_w;
-    let text_h = 8 * scale;
+    let scale = chosen_scale;
+    let char_w = 8 * scale + scale;
+    let line_h = 8 * scale;
+    let line_step = 8 * scale + scale;
+    let max_line_chars = chosen_lines
+        .iter()
+        .map(|l| l.chars().count() as u32)
+        .max()
+        .unwrap_or(0);
+    let text_w = (max_line_chars * char_w).max(1);
+    let text_h = ((chosen_lines.len() as u32) * line_h
+        + (chosen_lines.len().saturating_sub(1) as u32) * scale)
+        .max(1);
 
-    let mut text_img = RgbaImage::new(text_w.max(1), text_h.max(1));
-    // Background strip for contrast.
-    let bg_w = text_img.width();
-    let bg_h = text_img.height();
-    draw_rect(&mut text_img, 0, 0, bg_w, bg_h, Rgba([0, 0, 0, 140]));
-    // Shadow + text.
-    draw_text_8x8(
-        &mut text_img,
-        scale,
-        scale,
-        &text,
-        scale,
-        Rgba([0, 0, 0, 220]),
-    );
-    draw_text_8x8(
-        &mut text_img,
-        0,
-        0,
-        &text,
-        scale,
-        Rgba([255, 255, 255, 255]),
-    );
+    let mut text_img = RgbaImage::new(text_w, text_h);
+    for (i, line) in chosen_lines.iter().enumerate() {
+        let y = (i as u32) * line_step;
+        // Shadow + text (no background strip; keep text readable with subtle shadow).
+        draw_text_8x8(&mut text_img, 1, y + 1, line, scale, Rgba([0, 0, 0, 200]));
+        draw_text_8x8(&mut text_img, 0, y, line, scale, Rgba([255, 255, 255, 255]));
+    }
 
     let (overlay, ox, oy) = match placement {
         crate::shared::TextPlacement::Top => {
@@ -221,13 +545,261 @@ async fn load_dynamic_image(image: &str) -> Result<image::DynamicImage, anyhow::
     }
 }
 
+async fn resolve_image_bytes(image: &str) -> Result<Vec<u8>, anyhow::Error> {
+    if image.trim().starts_with("data:") {
+        // Stream Deck SDK commonly uses data URLs.
+        // Support both base64 and "raw" (non-base64) payloads.
+        if image.contains(";base64,") {
+            let (_meta, b64) = image
+                .split_once(";base64,")
+                .ok_or_else(|| anyhow::anyhow!("invalid data url (missing ';base64,')"))?;
+            Ok(base64::engine::general_purpose::STANDARD.decode(b64)?)
+        } else {
+            let (_meta, raw) = image
+                .split_once(',')
+                .ok_or_else(|| anyhow::anyhow!("invalid data url (missing ',')"))?;
+            Ok(raw.as_bytes().to_vec())
+        }
+    } else {
+        // Mirror `load_dynamic_image` path resolution so plugins can animate from the same sources.
+        let mut candidate: Option<std::path::PathBuf> = None;
+        let p = Path::new(image.trim());
+        if p.is_file() {
+            candidate = Some(p.to_path_buf());
+        } else if image.starts_with("riverdeck/") || image.starts_with("opendeck/") {
+            let cfg = crate::shared::config_dir().join(image.trim());
+            if cfg.is_file() {
+                candidate = Some(cfg);
+            } else if let Some(res) = crate::shared::resource_dir() {
+                let rp = res.join(image.trim());
+                if rp.is_file() {
+                    candidate = Some(rp);
+                }
+            }
+        }
+        let path = candidate.ok_or_else(|| anyhow::anyhow!("image path not found: {image}"))?;
+        Ok(tokio::fs::read(path).await?)
+    }
+}
+
+fn is_gif(bytes: &[u8]) -> bool {
+    bytes.len() >= 6 && &bytes[0..3] == b"GIF"
+}
+
+fn gif_cache_key(bytes: &[u8]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    format!("gif:{:016x}", h.finish())
+}
+
 pub async fn update_image(
     context: &crate::shared::Context,
     image: Option<&str>,
     overlays: Option<Vec<(String, crate::shared::TextPlacement)>>,
 ) -> Result<(), anyhow::Error> {
     if let Some(device) = ELGATO_DEVICES.read().await.get(&context.device) {
+        let anim_key = crate::animation::AnimationKey {
+            device: context.device.clone(),
+            controller: context.controller.clone(),
+            position: context.position,
+        };
         if let Some(image) = image {
+            let bytes = resolve_image_bytes(image).await;
+            if let Ok(bytes) = bytes
+                && is_gif(&bytes)
+            {
+                // Animated GIF: stop any existing animation for this slot and start a new one.
+                let generation = crate::animation::next_generation(&anim_key).await;
+                let cache_key = gif_cache_key(&bytes);
+                let decoded = crate::animation::decode_gif_cached(cache_key, bytes).await?;
+
+                // Single-frame GIFs behave like static images.
+                if decoded.len() <= 1 {
+                    crate::animation::stop(&anim_key).await;
+                } else if context.controller == "Encoder" {
+                    // Stream Deck Plus: encoder icons are drawn on the shared 800x100 LCD.
+                    // We must render them via the compositor so animated backgrounds and dial icons
+                    // can coexist.
+                    if device.kind() == Kind::Plus {
+                        // Ensure we don't have any legacy per-context encoder animation task running.
+                        crate::animation::stop(&anim_key).await;
+
+                        let state = plus_state_for_device(
+                            &context.device,
+                            device.kind().encoder_count() as usize,
+                        )
+                        .await;
+                        let generation = {
+                            let mut st = state.lock().await;
+                            if st.dials.len() < device.kind().encoder_count() as usize {
+                                st.dials.resize(
+                                    device.kind().encoder_count() as usize,
+                                    PlusLayer::None,
+                                );
+                            }
+                            if decoded.len() <= 1 {
+                                // Single-frame GIF: treat as static.
+                                let img = decoded
+                                    .first()
+                                    .map(|f| f.image.clone())
+                                    .unwrap_or_else(|| image::DynamicImage::new_rgba8(72, 72));
+                                let img =
+                                    img.resize_exact(72, 72, image::imageops::FilterType::Nearest);
+                                let mut img = img;
+                                if let Some(ov) = overlays.as_deref() {
+                                    for (label, placement) in ov {
+                                        if !label.trim().is_empty() {
+                                            img = overlay_label(img, label, *placement);
+                                        }
+                                    }
+                                }
+                                st.dials[context.position as usize] = PlusLayer::Static(img);
+                            } else {
+                                let prepared = crate::animation::prepare_frames(
+                                    decoded.as_ref(),
+                                    crate::animation::Target {
+                                        width: 72,
+                                        height: 72,
+                                        resize_mode: crate::animation::ResizeMode::Exact,
+                                        filter: image::imageops::FilterType::Nearest,
+                                    },
+                                    overlays.as_deref(),
+                                    Some(overlay_label),
+                                );
+                                let next_at = Instant::now() + prepared[0].delay;
+                                st.dials[context.position as usize] = PlusLayer::Animated {
+                                    frames: prepared,
+                                    idx: 0,
+                                    next_at,
+                                };
+                            }
+                            plus_bump_generation(&mut st)
+                        };
+
+                        plus_render_once(&context.device, state.clone()).await;
+                        let any_animated = {
+                            let st = state.lock().await;
+                            st.background.is_animated() || st.dials.iter().any(|d| d.is_animated())
+                        };
+                        if any_animated {
+                            plus_ensure_task(context.device.clone(), state, generation).await;
+                        }
+                        return Ok(());
+                    }
+
+                    // Non-Plus encoder LCD icons are 72x72.
+                    // Apply overlay *after* resize for crisp 8x8 text.
+                    let prepared = crate::animation::prepare_frames(
+                        decoded.as_ref(),
+                        crate::animation::Target {
+                            width: 72,
+                            height: 72,
+                            resize_mode: crate::animation::ResizeMode::Fit,
+                            filter: image::imageops::FilterType::Nearest,
+                        },
+                        overlays.as_deref(),
+                        Some(overlay_label),
+                    );
+
+                    // Render first frame immediately.
+                    device
+                        .write_lcd(
+                            (context.position as u16 * 200) + 64,
+                            14,
+                            &ImageRect::from_image_async(prepared[0].image.clone())?,
+                        )
+                        .await?;
+                    device.flush().await?;
+
+                    let device_id = context.device.clone();
+                    let controller = context.controller.clone();
+                    let position = context.position;
+                    tokio::spawn(async move {
+                        let mut idx = 1usize;
+                        loop {
+                            if !crate::animation::is_current(&anim_key, generation).await {
+                                break;
+                            }
+                            let device = {
+                                let devices = ELGATO_DEVICES.read().await;
+                                devices.get(&device_id).cloned()
+                            };
+                            let Some(device) = device else { break };
+
+                            let frame = &prepared[idx % prepared.len()];
+                            if controller == "Encoder" {
+                                let rect = match ImageRect::from_image_async(frame.image.clone()) {
+                                    Ok(r) => r,
+                                    Err(_) => {
+                                        sleep(frame.delay).await;
+                                        idx = idx.wrapping_add(1);
+                                        continue;
+                                    }
+                                };
+                                let _ = device
+                                    .write_lcd((position as u16 * 200) + 64, 14, &rect)
+                                    .await;
+                                let _ = device.flush().await;
+                            }
+                            sleep(frame.delay).await;
+                            idx = idx.wrapping_add(1);
+                        }
+                    });
+
+                    return Ok(());
+                } else {
+                    // Keypad GIF: pre-resize frames to the device key resolution, then apply overlays.
+                    // This keeps text sizing consistent across keys regardless of the source GIF dimensions.
+                    let (kw, kh) = device.kind().key_image_format().size;
+                    let prepared = crate::animation::prepare_frames(
+                        decoded.as_ref(),
+                        crate::animation::Target {
+                            width: kw as u32,
+                            height: kh as u32,
+                            resize_mode: crate::animation::ResizeMode::Exact,
+                            filter: image::imageops::FilterType::Nearest,
+                        },
+                        overlays.as_deref(),
+                        Some(overlay_label),
+                    );
+
+                    // Render first frame immediately.
+                    if let Err(e) = device
+                        .set_button_image(context.position, prepared[0].image.clone())
+                        .await
+                    {
+                        log::warn!("Failed to render first GIF frame: {}", e);
+                    }
+                    let _ = device.flush().await;
+
+                    let device_id = context.device.clone();
+                    let position = context.position;
+                    tokio::spawn(async move {
+                        let mut idx = 1usize;
+                        loop {
+                            if !crate::animation::is_current(&anim_key, generation).await {
+                                break;
+                            }
+                            let device = {
+                                let devices = ELGATO_DEVICES.read().await;
+                                devices.get(&device_id).cloned()
+                            };
+                            let Some(device) = device else { break };
+                            let frame = &prepared[idx % prepared.len()];
+                            let _ = device.set_button_image(position, frame.image.clone()).await;
+                            let _ = device.flush().await;
+                            sleep(frame.delay).await;
+                            idx = idx.wrapping_add(1);
+                        }
+                    });
+
+                    return Ok(());
+                }
+            }
+
+            // Not an animated GIF (or failed to load bytes): treat as static.
+            crate::animation::stop(&anim_key).await;
             let dyn_img = load_dynamic_image(image).await?;
 
             if context.controller == "Encoder" {
@@ -240,17 +812,49 @@ pub async fn update_image(
                         }
                     }
                 }
-                device
-                    .write_lcd(
-                        (context.position as u16 * 200) + 64,
-                        14,
-                        &ImageRect::from_image_async(final_img)?,
+                if device.kind() == Kind::Plus {
+                    let state = plus_state_for_device(
+                        &context.device,
+                        device.kind().encoder_count() as usize,
                     )
-                    .await?;
+                    .await;
+                    let generation = {
+                        let mut st = state.lock().await;
+                        if st.dials.len() < device.kind().encoder_count() as usize {
+                            st.dials
+                                .resize(device.kind().encoder_count() as usize, PlusLayer::None);
+                        }
+                        st.dials[context.position as usize] = PlusLayer::Static(final_img);
+                        plus_bump_generation(&mut st)
+                    };
+                    plus_render_once(&context.device, state.clone()).await;
+                    let any_animated = {
+                        let st = state.lock().await;
+                        st.background.is_animated() || st.dials.iter().any(|d| d.is_animated())
+                    };
+                    if any_animated {
+                        plus_ensure_task(context.device.clone(), state, generation).await;
+                    }
+                } else {
+                    device
+                        .write_lcd(
+                            (context.position as u16 * 200) + 64,
+                            14,
+                            &ImageRect::from_image_async(final_img)?,
+                        )
+                        .await?;
+                }
             } else {
-                // Apply text overlays directly to the image. The elgato-streamdeck crate handles
-                // any necessary image format conversion and resizing internally.
-                let mut final_img = dyn_img;
+                // Keypad buttons: if we draw overlays before the elgato-streamdeck conversion,
+                // and the source image isn't already at native key resolution, the subsequent
+                // resize will also shrink our rendered text, making font sizes inconsistent
+                // across keys (and sometimes unreadably small). To avoid this, resize first.
+                let (kw, kh) = device.kind().key_image_format().size;
+                let mut final_img = dyn_img.resize_exact(
+                    kw as u32,
+                    kh as u32,
+                    image::imageops::FilterType::Nearest,
+                );
                 if let Some(overlays) = overlays {
                     for (label, placement) in overlays {
                         if !label.trim().is_empty() {
@@ -261,14 +865,39 @@ pub async fn update_image(
                 device.set_button_image(context.position, final_img).await?;
             }
         } else if context.controller == "Encoder" {
-            device
-                .write_lcd(
-                    context.position as u16 * 200,
-                    0,
-                    &ImageRect::from_image_async(image::DynamicImage::new_rgb8(200, 100))?,
-                )
-                .await?;
+            crate::animation::stop(&anim_key).await;
+            if device.kind() == Kind::Plus {
+                let state =
+                    plus_state_for_device(&context.device, device.kind().encoder_count() as usize)
+                        .await;
+                let generation = {
+                    let mut st = state.lock().await;
+                    if st.dials.len() < device.kind().encoder_count() as usize {
+                        st.dials
+                            .resize(device.kind().encoder_count() as usize, PlusLayer::None);
+                    }
+                    st.dials[context.position as usize] = PlusLayer::None;
+                    plus_bump_generation(&mut st)
+                };
+                plus_render_once(&context.device, state.clone()).await;
+                let any_animated = {
+                    let st = state.lock().await;
+                    st.background.is_animated() || st.dials.iter().any(|d| d.is_animated())
+                };
+                if any_animated {
+                    plus_ensure_task(context.device.clone(), state, generation).await;
+                }
+            } else {
+                device
+                    .write_lcd(
+                        context.position as u16 * 200,
+                        0,
+                        &ImageRect::from_image_async(image::DynamicImage::new_rgb8(200, 100))?,
+                    )
+                    .await?;
+            }
         } else {
+            crate::animation::stop(&anim_key).await;
             device.clear_button_image(context.position).await?;
         }
         device.flush().await?;
@@ -281,21 +910,70 @@ pub async fn set_lcd_background(id: &str, image: Option<&str>) -> Result<(), any
         if device.kind() != Kind::Plus {
             return Ok(());
         }
-        let fmt = device.kind().lcd_image_format().unwrap();
-        let dyn_img = if let Some(image) = image {
-            load_dynamic_image(image).await?.resize_exact(
-                800,
-                100,
-                image::imageops::FilterType::Nearest,
-            )
+        let state = plus_state_for_device(id, device.kind().encoder_count() as usize).await;
+
+        let (generation, any_animated) = if let Some(image) = image {
+            // Prefer decoding from bytes so GIF detection works for both `data:` and file paths.
+            let bytes = resolve_image_bytes(image).await?;
+            if is_gif(&bytes) {
+                let decoded =
+                    crate::animation::decode_gif_cached(gif_cache_key(&bytes), bytes).await?;
+                let mut st = state.lock().await;
+                if decoded.len() <= 1 {
+                    st.background = PlusLayer::Static(
+                        decoded
+                            .first()
+                            .map(|f| f.image.clone())
+                            .unwrap_or_else(|| image::DynamicImage::new_rgb8(800, 100))
+                            .resize_exact(800, 100, image::imageops::FilterType::Nearest),
+                    );
+                } else {
+                    let prepared = crate::animation::prepare_frames(
+                        decoded.as_ref(),
+                        crate::animation::Target {
+                            width: 800,
+                            height: 100,
+                            resize_mode: crate::animation::ResizeMode::Exact,
+                            filter: image::imageops::FilterType::Nearest,
+                        },
+                        None,
+                        None,
+                    );
+                    let next_at = Instant::now() + prepared[0].delay;
+                    st.background = PlusLayer::Animated {
+                        frames: prepared,
+                        idx: 0,
+                        next_at,
+                    };
+                }
+                let generation = plus_bump_generation(&mut st);
+                let any = st.background.is_animated() || st.dials.iter().any(|d| d.is_animated());
+                (generation, any)
+            } else {
+                let dyn_img = image::load_from_memory(&bytes)?.resize_exact(
+                    800,
+                    100,
+                    image::imageops::FilterType::Nearest,
+                );
+                let mut st = state.lock().await;
+                st.background = PlusLayer::Static(dyn_img);
+                let generation = plus_bump_generation(&mut st);
+                let any = st.dials.iter().any(|d| d.is_animated());
+                (generation, any)
+            }
         } else {
-            image::DynamicImage::new_rgb8(800, 100)
+            let mut st = state.lock().await;
+            st.background = PlusLayer::None;
+            let generation = plus_bump_generation(&mut st);
+            let any = st.dials.iter().any(|d| d.is_animated());
+            (generation, any)
         };
 
-        device
-            .write_lcd_fill(&convert_image_with_format_async(fmt, dyn_img)?)
-            .await?;
-        device.flush().await?;
+        // Render immediately; if any layer is animated, ensure the compositor task is running.
+        plus_render_once(id, state.clone()).await;
+        if any_animated {
+            plus_ensure_task(id.to_owned(), state, generation).await;
+        }
     }
     Ok(())
 }
@@ -304,12 +982,16 @@ pub async fn clear_screen(id: &str) -> Result<(), anyhow::Error> {
     if let Some(device) = ELGATO_DEVICES.read().await.get(id) {
         device.clear_all_button_images().await?;
         if device.kind() == Kind::Plus {
-            device
-                .write_lcd_fill(&convert_image_with_format_async(
-                    device.kind().lcd_image_format().unwrap(),
-                    image::DynamicImage::new_rgb8(800, 100),
-                )?)
-                .await?;
+            let state = plus_state_for_device(id, device.kind().encoder_count() as usize).await;
+            {
+                let mut st = state.lock().await;
+                st.background = PlusLayer::None;
+                for dial in st.dials.iter_mut() {
+                    *dial = PlusLayer::None;
+                }
+                let _ = plus_bump_generation(&mut st);
+            }
+            plus_render_once(id, state).await;
         }
         device.flush().await?;
     }
@@ -406,7 +1088,17 @@ async fn init(device: AsyncStreamDeck, device_id: String) {
                 DeviceStateUpdate::EncoderUp(dial) => {
                     encoder::dial_press(&device_id, "dialUp", dial).await
                 }
-                _ => Ok(()),
+                DeviceStateUpdate::TouchScreenPress(x, y) => {
+                    encoder::touch_tap(&device_id, x, y, false).await
+                }
+                DeviceStateUpdate::TouchScreenLongPress(x, y) => {
+                    encoder::touch_tap(&device_id, x, y, true).await
+                }
+                // Touch points are low-level segment state changes on devices like Stream Deck+.
+                // The official Stream Deck SDK surface is the `touchTap` event (with `hold`),
+                // which we emit from the higher-level TouchScreenPress/LongPress updates above.
+                DeviceStateUpdate::TouchPointDown(_) | DeviceStateUpdate::TouchPointUp(_) => Ok(()),
+                DeviceStateUpdate::TouchScreenSwipe(_, _) => Ok(()),
             } {
                 Ok(_) => (),
                 Err(error) => log::warn!("Failed to process device event {update:?}: {error}"),
@@ -415,6 +1107,7 @@ async fn init(device: AsyncStreamDeck, device_id: String) {
     }
 
     ELGATO_DEVICES.write().await.remove(&device_id);
+    PLUS_STATE.write().await.remove(&device_id);
     crate::events::inbound::devices::deregister_device(
         "",
         crate::events::inbound::PayloadEvent { payload: device_id },

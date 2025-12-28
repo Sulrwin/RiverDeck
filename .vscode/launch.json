@@ -5,6 +5,7 @@
 			"type": "lldb",
 			"request": "launch",
 			"name": "Debug (egui)",
+			"stopOnEntry": false,
 			"cargo": {
 				"args": [
 					"run",
@@ -18,7 +19,23 @@
 		{
 			"type": "lldb",
 			"request": "launch",
+			"name": "Show existing (egui)",
+			"stopOnEntry": false,
+			"cargo": {
+				"args": [
+					"run",
+					"-p",
+					"riverdeck-egui",
+					"--",
+					"--show"
+				]
+			}
+		},
+		{
+			"type": "lldb",
+			"request": "launch",
 			"name": "Debug (pi helper)",
+			"stopOnEntry": false,
 			"cargo": {
 				"args": [
 					"run",

@@ -165,8 +165,12 @@ pub async fn set_encoder_screen_background(
             .unwrap_or("png")
             .to_lowercase();
         let ext = match ext.as_str() {
-            "png" | "jpg" | "jpeg" => ext,
-            _ => return Err(anyhow::anyhow!("unsupported image type (use png/jpg/jpeg)")),
+            "png" | "jpg" | "jpeg" | "gif" => ext,
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "unsupported image type (use png/jpg/jpeg/gif)"
+                ));
+            }
         };
 
         let dst_dir = crate::shared::config_dir()

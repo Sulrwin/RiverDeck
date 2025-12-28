@@ -22,6 +22,45 @@ use once_cell::sync::Lazy;
 use tokio::sync::{Mutex, RwLock};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
+#[cfg(unix)]
+fn unix_set_new_process_group(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    unsafe {
+        cmd.pre_exec(|| {
+            // Put the child into its own process group so we can terminate the whole tree
+            // (useful for Wine / node that might spawn helpers).
+            let _ = libc::setpgid(0, 0);
+            Ok(())
+        });
+    }
+}
+
+#[cfg(unix)]
+fn unix_signal_process_group(pid: u32, sig: i32) {
+    if pid == 0 {
+        return;
+    }
+    // Negative PID targets the process group.
+    let _ = unsafe { libc::kill(-(pid as i32), sig) };
+}
+
+fn record_child_process(pid: u32, kind: &str, plugin_uuid: &str) {
+    crate::runtime_processes::record_process(
+        pid,
+        kind,
+        vec![
+            "-pluginUUID".to_owned(),
+            plugin_uuid.to_owned(),
+            // Common arg across native/node/wine plugin runners.
+            "-registerEvent".to_owned(),
+        ],
+    );
+}
+
+fn unrecord_child_process(pid: u32) {
+    crate::runtime_processes::unrecord_process(pid);
+}
+
 fn is_safe_relative_path(p: &str) -> bool {
     let p = std::path::Path::new(p);
     !p.is_absolute()
@@ -345,6 +384,7 @@ pub async fn initialise_plugin(path: &path::Path) -> anyhow::Result<()> {
                 .stderr(Stdio::from(log_file))
                 .creation_flags(0x08000000)
                 .spawn()?;
+            record_child_process(child.id(), "plugin_node", plugin_uuid);
 
             INSTANCES
                 .lock()
@@ -354,16 +394,19 @@ pub async fn initialise_plugin(path: &path::Path) -> anyhow::Result<()> {
 
         #[cfg(not(target_os = "windows"))]
         {
-            let child = Command::new(command)
-                .current_dir(path)
+            let mut cmd = Command::new(command);
+            cmd.current_dir(path)
                 .args(extra_args)
                 .arg(code_path)
                 .args(args)
                 .arg(serde_json::to_string(&info)?)
                 .stdin(Stdio::null())
                 .stdout(Stdio::from(log_file.try_clone()?))
-                .stderr(Stdio::from(log_file))
-                .spawn()?;
+                .stderr(Stdio::from(log_file));
+            #[cfg(unix)]
+            unix_set_new_process_group(&mut cmd);
+            let child = cmd.spawn()?;
+            record_child_process(child.id(), "plugin_node", plugin_uuid);
 
             INSTANCES
                 .lock()
@@ -407,6 +450,8 @@ pub async fn initialise_plugin(path: &path::Path) -> anyhow::Result<()> {
             .stdin(Stdio::null())
             .stdout(Stdio::from(log_file.try_clone()?))
             .stderr(Stdio::from(log_file));
+        #[cfg(unix)]
+        unix_set_new_process_group(&mut command);
         if get_settings()?.value.separatewine {
             command.env(
                 "WINEPREFIX",
@@ -416,6 +461,7 @@ pub async fn initialise_plugin(path: &path::Path) -> anyhow::Result<()> {
             let _ = fs::remove_dir_all(path.join("wineprefix"));
         }
         let child = command.spawn()?;
+        record_child_process(child.id(), "plugin_wine", plugin_uuid);
 
         INSTANCES
             .lock()
@@ -438,6 +484,7 @@ pub async fn initialise_plugin(path: &path::Path) -> anyhow::Result<()> {
                 .stderr(Stdio::from(log_file))
                 .creation_flags(0x08000000)
                 .spawn()?;
+            record_child_process(child.id(), "plugin_native", plugin_uuid);
 
             INSTANCES
                 .lock()
@@ -453,14 +500,17 @@ pub async fn initialise_plugin(path: &path::Path) -> anyhow::Result<()> {
 
         #[cfg(not(target_os = "windows"))]
         {
-            let child = Command::new(path.join(code_path))
-                .current_dir(path)
+            let mut cmd = Command::new(path.join(code_path));
+            cmd.current_dir(path)
                 .args(args)
                 .arg(serde_json::to_string(&info)?)
                 .stdin(Stdio::null())
                 .stdout(Stdio::from(log_file.try_clone()?))
-                .stderr(Stdio::from(log_file))
-                .spawn()?;
+                .stderr(Stdio::from(log_file));
+            #[cfg(unix)]
+            unix_set_new_process_group(&mut cmd);
+            let child = cmd.spawn()?;
+            record_child_process(child.id(), "plugin_native", plugin_uuid);
 
             INSTANCES
                 .lock()
@@ -516,8 +566,36 @@ pub async fn deactivate_plugin(uuid: &str) -> Result<(), anyhow::Error> {
             PluginInstance::Node(mut child)
             | PluginInstance::Wine(mut child)
             | PluginInstance::Native(mut child) => {
-                child.kill()?;
-                child.wait()?;
+                let pid = child.id();
+                // IMPORTANT: this runs on async shutdown paths; don't block the runtime thread
+                // with `std::thread::sleep` or a potentially-hanging `child.wait()`.
+                #[cfg(unix)]
+                unix_signal_process_group(pid, libc::SIGTERM);
+                #[cfg(not(unix))]
+                let _ = child.kill();
+
+                // Give the child a moment to exit cleanly.
+                for _ in 0..20 {
+                    if child.try_wait()?.is_some() {
+                        unrecord_child_process(pid);
+                        return Ok(());
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+
+                #[cfg(unix)]
+                unix_signal_process_group(pid, libc::SIGKILL);
+                let _ = child.kill();
+
+                // Best-effort: poll for a short time, then stop waiting so shutdown can't hang.
+                for _ in 0..20 {
+                    if child.try_wait()?.is_some() {
+                        unrecord_child_process(pid);
+                        return Ok(());
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+                unrecord_child_process(pid);
             }
         }
         Ok(())
@@ -526,8 +604,8 @@ pub async fn deactivate_plugin(uuid: &str) -> Result<(), anyhow::Error> {
     }
 }
 
-#[cfg(windows)]
-pub async fn deactivate_plugins() {
+/// Deactivate all running plugin instances (best-effort).
+pub async fn deactivate_all_plugins() -> Result<(), anyhow::Error> {
     let uuids = {
         let instances = INSTANCES.lock().await;
         instances.keys().cloned().collect::<Vec<_>>()
@@ -536,6 +614,7 @@ pub async fn deactivate_plugins() {
     for uuid in uuids {
         let _ = deactivate_plugin(&uuid).await;
     }
+    Ok(())
 }
 
 /// Initialise plugins from the plugins directory.
