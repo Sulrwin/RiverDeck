@@ -144,9 +144,27 @@ pub async fn set_selected_page(
                 || crate::shared::is_toggle_action_uuid(instance.action.uuid.as_str()))
             {
                 let _ = crate::events::outbound::will_appear::will_appear(instance).await;
-            } else if let Some(children) = instance.children.as_ref() {
-                for child in children {
-                    let _ = crate::events::outbound::will_appear::will_appear(child).await;
+            } else {
+                // Multi/Toggle parent instances are built-in and don't have a real plugin process
+                // behind them, so we avoid queuing `willAppear`. But we *must* still push a visible
+                // icon back to the device after `clear_screen()` (e.g. when paging via swipe).
+                let img = instance
+                    .states
+                    .get(instance.current_state as usize)
+                    .map(|s| s.image.trim())
+                    .filter(|s| !s.is_empty() && *s != "actionDefaultImage")
+                    .map(|s| s.to_owned())
+                    .unwrap_or_else(|| instance.action.icon.clone());
+                let _ = crate::events::outbound::devices::update_image_for_instance(
+                    instance,
+                    Some(img),
+                )
+                .await;
+
+                if let Some(children) = instance.children.as_ref() {
+                    for child in children {
+                        let _ = crate::events::outbound::will_appear::will_appear(child).await;
+                    }
                 }
             }
         }

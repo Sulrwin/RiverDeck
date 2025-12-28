@@ -923,8 +923,8 @@ async fn init(device: AsyncStreamDeck, device_id: String) {
                     let dx = end.0 as i32 - start.0 as i32;
                     let dy = end.1 as i32 - start.1 as i32;
                     if dx.abs() >= dy.abs() {
-                        // Convention: swipe left (end_x < start_x) advances to next page.
-                        let delta = if dx < 0 { 1 } else { -1 };
+                        // Convention (matching the Stream Deck app): swipe left goes to previous page.
+                        let delta = if dx < 0 { -1 } else { 1 };
                         let _ =
                             crate::api::pages::shift_selected_page(device_id.clone(), delta).await;
                     }

@@ -1602,11 +1602,11 @@ impl RiverDeckApp {
                             || shared::is_toggle_action_uuid(instance.action.uuid.as_str());
 
                         if show_right {
-                            // Cap the left column so the Multi Action panel sits next to it,
-                            // instead of feeling pushed far right by unused space.
+                            // True split down the middle (matches the mental model in the UI).
                             let usable = (avail_w - gap).max(0.0);
-                            let left_w = (usable * 0.5).clamp(0.0, 360.0);
-                            let right_w = (usable - left_w).max(0.0);
+                            let col_w = (usable * 0.5).max(0.0);
+                            let left_w = col_w;
+                            let right_w = col_w;
                             ui.horizontal(|ui| {
                                 ui.allocate_ui_with_layout(
                                     egui::vec2(left_w, ui.available_height()),
@@ -1663,7 +1663,7 @@ impl RiverDeckApp {
         ui.add_space(6.0);
         ui.label("Button title (dynamic):");
         ui.add_sized(
-            [ui.available_width().min(320.0), 0.0],
+            [ui.available_width(), 0.0],
             egui::TextEdit::singleline(&mut self.button_label_input)
                 .hint_text("Leave empty for clean"),
         );
@@ -1673,7 +1673,9 @@ impl RiverDeckApp {
             ui.checkbox(&mut self.button_show_title, "Show title");
         });
 
-        ui.horizontal(|ui| {
+        // This row can overflow in the single-column editor (e.g. "Auto (Top/Bottom)"),
+        // which looks like the right side is cut off. Wrap instead of clipping.
+        ui.horizontal_wrapped(|ui| {
             ui.label("Placement:");
             let placement_locked = self.button_show_title && self.button_show_action_name;
             ui.add_enabled_ui(!placement_locked, |ui| {
@@ -1764,7 +1766,9 @@ impl RiverDeckApp {
             .is_some_and(|c| c == &instance.context)
             && self.pi_child.is_some();
 
-        ui.horizontal(|ui| {
+        // Wrap this row so it doesn't collapse the last label into 1-character columns
+        // (which looks like "vertical text") when the editor is narrow.
+        ui.horizontal_wrapped(|ui| {
             if ui.button("✕").on_hover_text("Remove custom icon").clicked() {
                 let ctx_to_clear = instance.context.clone();
                 let state = instance.current_state;
@@ -1896,7 +1900,8 @@ impl RiverDeckApp {
                 );
             } else {
                 for (idx, child) in children.iter().enumerate() {
-                    ui.horizontal(|ui| {
+                    // Wrap if space gets tight so buttons never clip outside the panel.
+                    ui.horizontal_wrapped(|ui| {
                         let icon_size = egui::vec2(20.0, 20.0);
                         let img = child
                             .states
@@ -1914,7 +1919,12 @@ impl RiverDeckApp {
                         ui.add(egui::Label::new(child.action.name.trim()).truncate());
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("Remove").clicked() {
+                            let btn_w = 22.0;
+                            let btn = |text: &'static str| {
+                                egui::Button::new(text).min_size(egui::vec2(btn_w, 0.0))
+                            };
+
+                            if ui.add(btn("✕")).on_hover_text("Remove step").clicked() {
                                 let ctx_to_remove = child.context.clone();
                                 self.runtime.spawn(async move {
                                     let _ = riverdeck_core::api::instances::remove_instance(
@@ -1925,10 +1935,7 @@ impl RiverDeckApp {
                             }
 
                             let parent_ctx = instance.context.clone();
-                            if ui
-                                .add_enabled(idx + 1 < children.len(), egui::Button::new("↓"))
-                                .clicked()
-                            {
+                            if ui.add_enabled(idx + 1 < children.len(), btn("↓")).clicked() {
                                 let from = idx;
                                 let to = idx + 1;
                                 self.runtime.spawn(async move {
@@ -1941,7 +1948,7 @@ impl RiverDeckApp {
                             }
 
                             let parent_ctx = instance.context.clone();
-                            if ui.add_enabled(idx > 0, egui::Button::new("↑")).clicked() {
+                            if ui.add_enabled(idx > 0, btn("↑")).clicked() {
                                 let from = idx;
                                 let to = idx - 1;
                                 self.runtime.spawn(async move {
@@ -1959,10 +1966,13 @@ impl RiverDeckApp {
         }
 
         ui.add_space(4.0);
-        ui.label(
-            egui::RichText::new("Tip: drag actions onto this button to add steps.")
-                .small()
-                .color(ui.visuals().weak_text_color()),
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new("Tip: drag actions onto this button to add steps.")
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+            )
+            .wrap(),
         );
     }
 
@@ -3762,22 +3772,40 @@ impl eframe::App for RiverDeckApp {
             if anim_t > 0.0 {
                 // Size/center against the preview geometry (cached each frame from the preview area).
                 let avail = ctx.available_rect();
+                let screen = ctx.screen_rect();
                 let preview_w = self.preview_width.unwrap_or(avail.width());
-                // Size relative to the available center area so it scales naturally.
-                // No hard max width; the only upper bound is the available space itself.
-                // Slightly narrower overall: keep it readable, but avoid feeling "massive".
-                let w_factor = if selected_is_multi_action { 0.68 } else { 0.62 };
-                let target_w = (preview_w * w_factor).clamp(360.0, preview_w.max(360.0));
-                let target_h = (avail.height() * 0.45).clamp(260.0, 460.0);
+                // Pick width from the editor's content rather than from ad-hoc scaling factors.
+                // This keeps the editor consistent across "button types" and only grows when the
+                // editor actually shows more UI (e.g. Multi Action / Toggle Action).
+                let col_min_w = 360.0;
+                let cols_gap = 6.0;
+                let content_min_w: f32 = if selected_is_multi_action {
+                    (col_min_w * 2.0) + cols_gap
+                } else {
+                    col_min_w
+                };
+                let max_w = preview_w.max(1.0);
+                // Account for the popup frame inner margin so content doesn't get clipped.
+                let frame_margin_i8: i8 = 10;
+                let frame_margin = frame_margin_i8 as f32;
+                let content_min_outer_w = content_min_w + (frame_margin * 2.0);
+                let target_w = content_min_outer_w.min(max_w);
+
+                // Keep height consistent across action types by basing it on the full window,
+                // not on `available_rect()` (which varies as side panels/content change).
+                let target_h = (screen.height() * 0.45).clamp(260.0, 460.0);
                 let current_h = target_h * anim_t;
 
                 // Flush to the bottom edge (no lift).
                 let margin = 0.0;
                 let center_x = self.preview_center_x.unwrap_or_else(|| avail.center().x);
                 let x = center_x - (target_w * 0.5);
-                let y = (avail.bottom() - margin - current_h).max(avail.top());
+                let y = (screen.bottom() - margin - current_h).max(screen.top());
                 let rect =
                     egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(target_w, current_h));
+                // Clip slightly *outside* the overlay rect so the popup frame's stroke/rounding
+                // (and any AA/shadow bleed) doesn't get cut off at the edges.
+                let clip_rect = rect.expand(frame_margin + 24.0);
 
                 egui::Area::new("action_editor_overlay".into())
                     .order(egui::Order::Foreground)
@@ -3787,10 +3815,10 @@ impl eframe::App for RiverDeckApp {
                         // inside an already-positioned Area can lead to unexpected expansion.
                         ui.set_min_size(rect.size());
                         ui.set_max_size(rect.size());
-                        ui.set_clip_rect(rect);
+                        ui.set_clip_rect(clip_rect);
 
                         egui::Frame::popup(ui.style())
-                            .inner_margin(egui::Margin::same(10))
+                            .inner_margin(egui::Margin::same(frame_margin_i8))
                             .corner_radius(egui::CornerRadius::same(12))
                             .show(ui, |ui| {
                                 // Avoid trying to render the full editor while we're still animating
