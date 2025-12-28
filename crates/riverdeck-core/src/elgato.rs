@@ -609,6 +609,71 @@ pub async fn update_image(
                 if decoded.len() <= 1 {
                     crate::animation::stop(&anim_key).await;
                 } else if context.controller == "Encoder" {
+                    // Stream Deck Plus: encoder icons are drawn on the shared 800x100 LCD.
+                    // We must render them via the compositor so animated backgrounds and dial icons
+                    // can coexist.
+                    if device.kind() == Kind::Plus {
+                        // Ensure we don't have any legacy per-context encoder animation task running.
+                        crate::animation::stop(&anim_key).await;
+
+                        let state =
+                            plus_state_for_device(&context.device, device.kind().encoder_count() as usize)
+                                .await;
+                        let generation = {
+                            let mut st = state.lock().await;
+                            if st.dials.len() < device.kind().encoder_count() as usize {
+                                st.dials.resize(device.kind().encoder_count() as usize, PlusLayer::None);
+                            }
+                            if decoded.len() <= 1 {
+                                // Single-frame GIF: treat as static.
+                                let img = decoded
+                                    .first()
+                                    .map(|f| f.image.clone())
+                                    .unwrap_or_else(|| image::DynamicImage::new_rgba8(72, 72));
+                                let img = img.resize_exact(72, 72, image::imageops::FilterType::Nearest);
+                                let mut img = img;
+                                if let Some(ov) = overlays.as_deref() {
+                                    for (label, placement) in ov {
+                                        if !label.trim().is_empty() {
+                                            img = overlay_label(img, label, *placement);
+                                        }
+                                    }
+                                }
+                                st.dials[context.position as usize] = PlusLayer::Static(img);
+                            } else {
+                                let prepared = crate::animation::prepare_frames(
+                                    decoded.as_ref(),
+                                    crate::animation::Target {
+                                        width: 72,
+                                        height: 72,
+                                        resize_mode: crate::animation::ResizeMode::Exact,
+                                        filter: image::imageops::FilterType::Nearest,
+                                    },
+                                    overlays.as_deref(),
+                                    Some(overlay_label),
+                                );
+                                let next_at = Instant::now() + prepared[0].delay;
+                                st.dials[context.position as usize] = PlusLayer::Animated {
+                                    frames: prepared,
+                                    idx: 0,
+                                    next_at,
+                                };
+                            }
+                            plus_bump_generation(&mut st)
+                        };
+
+                        plus_render_once(&context.device, state.clone()).await;
+                        let any_animated = {
+                            let st = state.lock().await;
+                            st.background.is_animated()
+                                || st.dials.iter().any(|d| d.is_animated())
+                        };
+                        if any_animated {
+                            plus_ensure_task(context.device.clone(), state, generation).await;
+                        }
+                        return Ok(());
+                    }
+
                     // Non-Plus encoder LCD icons are 72x72.
                     // Apply overlay *after* resize for crisp 8x8 text.
                     let prepared = crate::animation::prepare_frames(
@@ -734,13 +799,34 @@ pub async fn update_image(
                         }
                     }
                 }
-                device
-                    .write_lcd(
-                        (context.position as u16 * 200) + 64,
-                        14,
-                        &ImageRect::from_image_async(final_img)?,
-                    )
-                    .await?;
+                if device.kind() == Kind::Plus {
+                    let state =
+                        plus_state_for_device(&context.device, device.kind().encoder_count() as usize).await;
+                    let generation = {
+                        let mut st = state.lock().await;
+                        if st.dials.len() < device.kind().encoder_count() as usize {
+                            st.dials.resize(device.kind().encoder_count() as usize, PlusLayer::None);
+                        }
+                        st.dials[context.position as usize] = PlusLayer::Static(final_img);
+                        plus_bump_generation(&mut st)
+                    };
+                    plus_render_once(&context.device, state.clone()).await;
+                    let any_animated = {
+                        let st = state.lock().await;
+                        st.background.is_animated() || st.dials.iter().any(|d| d.is_animated())
+                    };
+                    if any_animated {
+                        plus_ensure_task(context.device.clone(), state, generation).await;
+                    }
+                } else {
+                    device
+                        .write_lcd(
+                            (context.position as u16 * 200) + 64,
+                            14,
+                            &ImageRect::from_image_async(final_img)?,
+                        )
+                        .await?;
+                }
             } else {
                 // Apply text overlays directly to the image. The elgato-streamdeck crate handles
                 // any necessary image format conversion and resizing internally.
@@ -756,13 +842,34 @@ pub async fn update_image(
             }
         } else if context.controller == "Encoder" {
             crate::animation::stop(&anim_key).await;
-            device
-                .write_lcd(
-                    context.position as u16 * 200,
-                    0,
-                    &ImageRect::from_image_async(image::DynamicImage::new_rgb8(200, 100))?,
-                )
-                .await?;
+            if device.kind() == Kind::Plus {
+                let state =
+                    plus_state_for_device(&context.device, device.kind().encoder_count() as usize).await;
+                let generation = {
+                    let mut st = state.lock().await;
+                    if st.dials.len() < device.kind().encoder_count() as usize {
+                        st.dials.resize(device.kind().encoder_count() as usize, PlusLayer::None);
+                    }
+                    st.dials[context.position as usize] = PlusLayer::None;
+                    plus_bump_generation(&mut st)
+                };
+                plus_render_once(&context.device, state.clone()).await;
+                let any_animated = {
+                    let st = state.lock().await;
+                    st.background.is_animated() || st.dials.iter().any(|d| d.is_animated())
+                };
+                if any_animated {
+                    plus_ensure_task(context.device.clone(), state, generation).await;
+                }
+            } else {
+                device
+                    .write_lcd(
+                        context.position as u16 * 200,
+                        0,
+                        &ImageRect::from_image_async(image::DynamicImage::new_rgb8(200, 100))?,
+                    )
+                    .await?;
+            }
         } else {
             crate::animation::stop(&anim_key).await;
             device.clear_button_image(context.position).await?;
@@ -777,21 +884,67 @@ pub async fn set_lcd_background(id: &str, image: Option<&str>) -> Result<(), any
         if device.kind() != Kind::Plus {
             return Ok(());
         }
-        let fmt = device.kind().lcd_image_format().unwrap();
-        let dyn_img = if let Some(image) = image {
-            load_dynamic_image(image).await?.resize_exact(
-                800,
-                100,
-                image::imageops::FilterType::Nearest,
-            )
+        let state = plus_state_for_device(id, device.kind().encoder_count() as usize).await;
+
+        let (generation, any_animated) = if let Some(image) = image {
+            // Prefer decoding from bytes so GIF detection works for both `data:` and file paths.
+            let bytes = resolve_image_bytes(image).await?;
+            if is_gif(&bytes) {
+                let decoded =
+                    crate::animation::decode_gif_cached(gif_cache_key(&bytes), bytes).await?;
+                let mut st = state.lock().await;
+                if decoded.len() <= 1 {
+                    st.background = PlusLayer::Static(
+                        decoded
+                            .first()
+                            .map(|f| f.image.clone())
+                            .unwrap_or_else(|| image::DynamicImage::new_rgb8(800, 100))
+                            .resize_exact(800, 100, image::imageops::FilterType::Nearest),
+                    );
+                } else {
+                    let prepared = crate::animation::prepare_frames(
+                        decoded.as_ref(),
+                        crate::animation::Target {
+                            width: 800,
+                            height: 100,
+                            resize_mode: crate::animation::ResizeMode::Exact,
+                            filter: image::imageops::FilterType::Nearest,
+                        },
+                        None,
+                        None,
+                    );
+                    let next_at = Instant::now() + prepared[0].delay;
+                    st.background = PlusLayer::Animated {
+                        frames: prepared,
+                        idx: 0,
+                        next_at,
+                    };
+                }
+                let generation = plus_bump_generation(&mut st);
+                let any = st.background.is_animated() || st.dials.iter().any(|d| d.is_animated());
+                (generation, any)
+            } else {
+                let dyn_img =
+                    image::load_from_memory(&bytes)?.resize_exact(800, 100, image::imageops::FilterType::Nearest);
+                let mut st = state.lock().await;
+                st.background = PlusLayer::Static(dyn_img);
+                let generation = plus_bump_generation(&mut st);
+                let any = st.dials.iter().any(|d| d.is_animated());
+                (generation, any)
+            }
         } else {
-            image::DynamicImage::new_rgb8(800, 100)
+            let mut st = state.lock().await;
+            st.background = PlusLayer::None;
+            let generation = plus_bump_generation(&mut st);
+            let any = st.dials.iter().any(|d| d.is_animated());
+            (generation, any)
         };
 
-        device
-            .write_lcd_fill(&convert_image_with_format_async(fmt, dyn_img)?)
-            .await?;
-        device.flush().await?;
+        // Render immediately; if any layer is animated, ensure the compositor task is running.
+        plus_render_once(id, state.clone()).await;
+        if any_animated {
+            plus_ensure_task(id.to_owned(), state, generation).await;
+        }
     }
     Ok(())
 }
@@ -800,12 +953,16 @@ pub async fn clear_screen(id: &str) -> Result<(), anyhow::Error> {
     if let Some(device) = ELGATO_DEVICES.read().await.get(id) {
         device.clear_all_button_images().await?;
         if device.kind() == Kind::Plus {
-            device
-                .write_lcd_fill(&convert_image_with_format_async(
-                    device.kind().lcd_image_format().unwrap(),
-                    image::DynamicImage::new_rgb8(800, 100),
-                )?)
-                .await?;
+            let state = plus_state_for_device(id, device.kind().encoder_count() as usize).await;
+            {
+                let mut st = state.lock().await;
+                st.background = PlusLayer::None;
+                for dial in st.dials.iter_mut() {
+                    *dial = PlusLayer::None;
+                }
+                let _ = plus_bump_generation(&mut st);
+            }
+            plus_render_once(id, state).await;
         }
         device.flush().await?;
     }
@@ -911,6 +1068,7 @@ async fn init(device: AsyncStreamDeck, device_id: String) {
     }
 
     ELGATO_DEVICES.write().await.remove(&device_id);
+    PLUS_STATE.write().await.remove(&device_id);
     crate::events::inbound::devices::deregister_device(
         "",
         crate::events::inbound::PayloadEvent { payload: device_id },
