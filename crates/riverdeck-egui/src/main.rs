@@ -10,8 +10,10 @@ use std::{
     path::{Path, PathBuf},
     sync::Mutex,
 };
+use std::time::Duration;
 
 use fs2::FileExt;
+use log::LevelFilter;
 use tokio::runtime::Runtime;
 use tokio::sync::broadcast;
 
@@ -32,15 +34,109 @@ static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 #[cfg(unix)]
 static SHOW_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-fn main() -> anyhow::Result<()> {
-    // Default to info logging unless the user overrides with RUST_LOG.
-    // (When started from a desktop entry, stdout/stderr may not be visible, but
-    // this still helps for terminal/Cursor runs.)
-    {
-        use env_logger::Env;
-        let _ = env_logger::Builder::from_env(Env::default().default_filter_or("info")).try_init();
+struct TeeLogger {
+    stderr: env_logger::Logger,
+    file: Option<std::sync::Mutex<std::fs::File>>,
+}
+
+impl log::Log for TeeLogger {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        self.stderr.enabled(metadata)
     }
 
+    fn log(&self, record: &log::Record<'_>) {
+        self.stderr.log(record);
+        let Some(file) = self.file.as_ref() else {
+            return;
+        };
+        // Best-effort: never let logging failures affect app runtime.
+        let mut file = file.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = writeln!(
+            file,
+            "{:?} {:<5} {} - {}",
+            std::time::SystemTime::now(),
+            record.level(),
+            record.target(),
+            record.args()
+        );
+        let _ = file.flush();
+    }
+
+    fn flush(&self) {
+        self.stderr.flush();
+        if let Some(file) = self.file.as_ref() {
+            let mut file = file.lock().unwrap_or_else(|p| p.into_inner());
+            let _ = file.flush();
+        }
+    }
+}
+
+fn init_logging() {
+    // Configure and install a logger:
+    // - still respects RUST_LOG (useful for debugging)
+    // - always writes a persistent log file for GUI launches where stdout/stderr is invisible
+    //
+    // NOTE: This must run after `shared::init_paths()` so `shared::log_dir()` is available.
+    let mut builder = env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("info"),
+    );
+
+    // If the user didn't specify max log level explicitly, avoid dependency spam by default.
+    // (They can always `RUST_LOG=trace`.)
+    if std::env::var("RUST_LOG").is_err() {
+        builder.filter_level(LevelFilter::Info);
+    }
+
+    let stderr_logger = builder.build();
+
+    let file = (|| {
+        // Primary: XDG data dir logs (e.g. ~/.local/share/.../logs)
+        let dir = shared::log_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("riverdeck-egui.log");
+        if let Ok(f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            return Some(std::sync::Mutex::new(f));
+        }
+
+        // Fallback: config dir (e.g. ~/.config/...) so we always get *some* file even if the
+        // XDG data dir is missing/unwritable.
+        let cfg = shared::config_dir();
+        let _ = std::fs::create_dir_all(&cfg);
+        let cfg_path = cfg.join("riverdeck-egui.log");
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(cfg_path)
+            .ok()?;
+        Some(std::sync::Mutex::new(f))
+    })();
+
+    let _ = log::set_boxed_logger(Box::new(TeeLogger {
+        stderr: stderr_logger,
+        file,
+    }));
+    // Let the inner logger handle filtering; keep max_level permissive.
+    log::set_max_level(LevelFilter::Trace);
+}
+
+fn env_truthy_any(name: &str) -> bool {
+    matches!(
+        std::env::var(name).ok().as_deref(),
+        Some("1")
+            | Some("true")
+            | Some("TRUE")
+            | Some("yes")
+            | Some("YES")
+            | Some("on")
+            | Some("ON")
+    )
+}
+
+fn main() -> anyhow::Result<()> {
     // Development quality-of-life: when running under an IDE/debugger, it's easy to end up with an
     // orphaned `riverdeck` process if the parent launcher is force-killed.
     //
@@ -78,6 +174,16 @@ fn main() -> anyhow::Result<()> {
         }
     }
     shared::init_paths(paths);
+
+    // Initialize logging after paths so we can write to the persistent log directory.
+    init_logging();
+    log::info!(
+        "RiverDeck starting (pid={}, args={:?})",
+        std::process::id(),
+        args
+    );
+    log::info!("config_dir={}", shared::config_dir().display());
+    log::info!("log_dir={}", shared::log_dir().display());
 
     configure_autostart();
 
@@ -181,6 +287,7 @@ fn main() -> anyhow::Result<()> {
 
     // Exit the process when the main window is closed.
     // This prevents "background instances" that keep running after the window is gone.
+    log::info!("Preparing native window options");
     let mut native_options = eframe::NativeOptions {
         run_and_return: false,
         ..Default::default()
@@ -194,13 +301,33 @@ fn main() -> anyhow::Result<()> {
     {
         native_options.viewport = native_options.viewport.with_decorations(false);
     }
-    if let Ok(icon) = load_window_icon() {
+    log::info!("Loading window icon (best-effort)");
+    // SAFETY VALVE: some environments have shown hangs during icon decode in debug builds.
+    // The window icon is non-critical; default to skipping it in debug builds to ensure the UI
+    // always starts. Set `RIVERDECK_ENABLE_WINDOW_ICON=1` to force-enable.
+    let enable_window_icon =
+        env_truthy_any("RIVERDECK_ENABLE_WINDOW_ICON") && !env_truthy_any("RIVERDECK_DISABLE_WINDOW_ICON");
+    let icon = if enable_window_icon {
+        Some(load_window_icon_with_timeout(Duration::from_millis(250)))
+    } else {
+        None
+    }
+    .flatten();
+
+    #[cfg(debug_assertions)]
+    if !enable_window_icon {
+        log::warn!("Window icon disabled (debug build safety); set RIVERDECK_ENABLE_WINDOW_ICON=1 to enable");
+    }
+
+    if let Some(icon) = icon {
         native_options.viewport = native_options.viewport.with_icon(icon);
     }
+    log::info!("Starting UI: entering eframe::run_native()");
     eframe::run_native(
         "RiverDeck",
         native_options,
         Box::new(move |_cc| {
+            log::info!("eframe callback invoked: constructing RiverDeckApp");
             Ok(Box::new(RiverDeckApp::new(
                 runtime,
                 lock_file,
@@ -306,6 +433,27 @@ fn load_window_icon() -> anyhow::Result<egui::IconData> {
         width,
         height,
     })
+}
+
+fn load_window_icon_with_timeout(timeout: Duration) -> Option<egui::IconData> {
+    // Safety valve: some users have observed startup hangs during PNG decode in debug builds.
+    // The window icon is non-critical, so we load it off-thread and proceed if it takes too long.
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(load_window_icon());
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(icon)) => Some(icon),
+        Ok(Err(err)) => {
+            log::warn!("Window icon load failed: {err:#}");
+            None
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            log::warn!("Window icon load timed out after {:?}; continuing without icon", timeout);
+            None
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => None,
+    }
 }
 
 fn load_embedded_logo_rgba() -> anyhow::Result<(Vec<u8>, u32, u32)> {
@@ -613,6 +761,7 @@ impl RiverDeckApp {
         start_hidden: bool,
         update_info: Arc<Mutex<Option<UpdateInfo>>>,
     ) -> Self {
+        log::info!("RiverDeckApp::new(start_hidden={start_hidden})");
         #[cfg(feature = "tray")]
         let tray = match TrayState::new() {
             Ok(t) => Some(t),
@@ -1371,7 +1520,10 @@ impl RiverDeckApp {
         if let Some(mut child) = self.pi_child.take() {
             riverdeck_core::runtime_processes::unrecord_process(child.id());
             let _ = child.kill();
-            let _ = child.wait();
+            // Don't block the UI thread on `wait()` (can hang); reap on a background thread.
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
         }
         self.pi_for_context = None;
     }
@@ -1380,7 +1532,10 @@ impl RiverDeckApp {
         if let Some(mut child) = self.marketplace_child.take() {
             riverdeck_core::runtime_processes::unrecord_process(child.id());
             let _ = child.kill();
-            let _ = child.wait();
+            // Don't block the UI thread on `wait()` (can hang); reap on a background thread.
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
         }
     }
 
@@ -2267,7 +2422,15 @@ impl eframe::App for RiverDeckApp {
         // pump pending GLib events once per frame when tray support is enabled.
         #[cfg(all(target_os = "linux", feature = "tray"))]
         if self.tray.is_some() {
-            while gtk::glib::MainContext::default().iteration(false) {}
+            // IMPORTANT: do not drain indefinitely. Some environments can keep the GLib main
+            // context "always ready", which would stall the egui frame and prevent rendering.
+            // A small cap per frame is enough to keep AppIndicator responsive.
+            let ctx = gtk::glib::MainContext::default();
+            for _ in 0..64 {
+                if !ctx.iteration(false) {
+                    break;
+                }
+            }
         }
 
         // If the user tries to close the window, prefer "hide to tray" (when available).
@@ -2776,9 +2939,8 @@ impl eframe::App for RiverDeckApp {
                 });
             });
 
-        // Bottom action editor: hidden when no slot is selected.
-        // When visible, we always render a centered tab; when open, we render a fixed-width
-        // overlay sheet above the tab (same width as the tab).
+        // Action editor: automatically shown when the selected slot has an action instance.
+        // If no slot is selected (or the slot is empty), the editor is hidden.
         let editor_visible =
             selected_device.is_some() && snapshot.is_some() && self.selected_slot.is_some();
         if !editor_visible {
@@ -2788,87 +2950,40 @@ impl eframe::App for RiverDeckApp {
             snapshot.as_ref(),
             self.selected_slot.clone(),
         ) {
-            let mut tab_rect_for_overlay: Option<egui::Rect> = None;
-            let mut tab_w_for_overlay: f32 = 0.0;
+            let instance_present = match &slot.controller[..] {
+                "Encoder" => snapshot
+                    .sliders
+                    .get(slot.position as usize)
+                    .and_then(|v| v.as_ref())
+                    .is_some(),
+                _ => snapshot
+                    .keys
+                    .get(slot.position as usize)
+                    .and_then(|v| v.as_ref())
+                    .is_some(),
+            };
 
-            egui::TopBottomPanel::bottom("action_editor_tab")
-                .exact_height(44.0)
-                .frame(egui::Frame::NONE.inner_margin(egui::Margin::same(6)))
-                .show(ctx, |ui| {
-                    ui.vertical_centered(|ui| {
-                        let tab_w = ui.available_width().clamp(240.0, 520.0);
-                        let tab_h = 34.0;
-                        let (rect, resp) = ui.allocate_exact_size(
-                            egui::vec2(tab_w.min(ui.available_width()), tab_h),
-                            egui::Sense::click(),
-                        );
-
-                        tab_rect_for_overlay = Some(rect);
-                        tab_w_for_overlay = tab_w.min(ui.available_width());
-
-                        let rounding = egui::CornerRadius::same(12);
-                        let fill = if resp.hovered() {
-                            ui.visuals().widgets.hovered.bg_fill
-                        } else {
-                            ui.visuals().widgets.inactive.bg_fill
-                        };
-                        let stroke = if resp.hovered() {
-                            ui.visuals().widgets.hovered.bg_stroke
-                        } else {
-                            ui.visuals().widgets.inactive.bg_stroke
-                        };
-
-                        ui.painter()
-                            .rect(rect, rounding, fill, stroke, egui::StrokeKind::Inside);
-
-                        let label =
-                            format!("Action Editor — {} {}", slot.controller, slot.position);
-                        ui.painter().text(
-                            rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            label,
-                            egui::FontId::proportional(13.0),
-                            ui.visuals().text_color(),
-                        );
-
-                        if resp.clicked() {
-                            self.action_editor_open = true;
-                        }
-                    });
-                });
+            // Keep the state in sync with selection: open iff the slot contains an action.
+            self.action_editor_open = instance_present;
 
             let anim_t =
                 ctx.animate_bool(egui::Id::new("action_editor_anim"), self.action_editor_open);
             if anim_t > 0.0 {
-                let tab_rect = tab_rect_for_overlay.unwrap_or_else(|| {
-                    let r = ctx.available_rect();
-                    // Fallback: a small rect at the bottom center.
-                    let w = tab_w_for_overlay.max(240.0);
-                    egui::Rect::from_min_size(
-                        egui::pos2(r.center().x - (w * 0.5), r.bottom() - 44.0),
-                        egui::vec2(w, 34.0),
-                    )
-                });
-
-                let tab_w = if tab_w_for_overlay > 0.0 {
-                    tab_w_for_overlay
-                } else {
-                    360.0
-                };
+                let avail = ctx.available_rect();
+                let target_w = avail.width().clamp(240.0, 520.0);
                 let target_h = 260.0;
                 let current_h = target_h * anim_t;
 
-                let margin = 6.0;
-                let avail = ctx.available_rect();
-                let x = tab_rect.center().x - (tab_w * 0.5);
-                let y = (tab_rect.min.y - margin - current_h).max(avail.top());
+                let margin = 10.0;
+                let x = avail.center().x - (target_w * 0.5);
+                let y = (avail.bottom() - margin - current_h).max(avail.top() + margin);
 
                 egui::Area::new("action_editor_overlay".into())
                     .order(egui::Order::Foreground)
                     .fixed_pos(egui::pos2(x, y))
                     .show(ctx, |ui| {
-                        ui.set_min_size(egui::vec2(tab_w, current_h));
-                        ui.set_max_size(egui::vec2(tab_w, current_h));
+                        ui.set_min_size(egui::vec2(target_w, current_h));
+                        ui.set_max_size(egui::vec2(target_w, current_h));
 
                         egui::Frame::popup(ui.style())
                             .inner_margin(egui::Margin::same(10))
@@ -2881,21 +2996,7 @@ impl eframe::App for RiverDeckApp {
                                 }
 
                                 ui.vertical(|ui| {
-                                    ui.horizontal(|ui| {
-                                        ui.heading("Action Editor");
-                                        ui.with_layout(
-                                            egui::Layout::right_to_left(egui::Align::Center),
-                                            |ui| {
-                                                if ui
-                                                    .button("▾")
-                                                    .on_hover_text("Collapse")
-                                                    .clicked()
-                                                {
-                                                    self.action_editor_open = false;
-                                                }
-                                            },
-                                        );
-                                    });
+                                    ui.heading("Action Editor");
                                     ui.add_space(6.0);
 
                                     egui::ScrollArea::vertical().show(ui, |ui| {
@@ -3319,11 +3420,9 @@ impl eframe::App for RiverDeckApp {
                                         selected,
                                         drag_action.as_ref(),
                                     );
-                                    if resp.double_clicked() {
+                                    if resp.clicked() {
                                         self.selected_slot = Some(slot);
-                                        self.action_editor_open = true;
-                                    } else if resp.clicked() {
-                                        self.selected_slot = Some(slot);
+                                        self.action_editor_open = instance.is_some();
                                     }
                                 }
                             });
@@ -3365,11 +3464,9 @@ impl eframe::App for RiverDeckApp {
                                     selected,
                                     drag_action.as_ref(),
                                 );
-                                if resp.double_clicked() {
+                                if resp.clicked() {
                                     self.selected_slot = Some(slot);
-                                    self.action_editor_open = true;
-                                } else if resp.clicked() {
-                                    self.selected_slot = Some(slot);
+                                    self.action_editor_open = instance.is_some();
                                 }
                             }
                         });
@@ -3606,7 +3703,9 @@ impl RiverDeckApp {
                     egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
                     |ui| {
                         // Only this label acts as the drag handle, so clicks on the window buttons work reliably.
-                        ui.spacing_mut().item_spacing.x = 6.0;
+                        // Keep the settings icon visually close to the title.
+                        ui.spacing_mut().item_spacing.x = 2.0;
+                        ui.spacing_mut().button_padding = egui::vec2(2.0, 0.0);
                         let drag = ui.add(
                             egui::Label::new(egui::RichText::new("RiverDeck").strong())
                                 .sense(egui::Sense::click_and_drag()),
@@ -3648,14 +3747,8 @@ impl RiverDeckApp {
                     // Use plain ASCII so it renders reliably even when the active font lacks the ✕ glyph.
                     let close = ui.add(egui::Button::new("X").min_size(btn_size));
                     if close.clicked() {
-                        // Hide to tray when available; otherwise close.
-                        #[cfg(feature = "tray")]
-                        if self.tray.is_some() {
-                            self.hide_to_tray_requested = true;
-                        } else {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
-                        #[cfg(not(feature = "tray"))]
+                        // Always request a real close; the `close_requested` handler above will
+                        // decide whether to hide-to-tray (only when explicitly enabled).
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
 
@@ -3800,6 +3893,8 @@ impl TrayState {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             } else if ev.id == self.quit.id() {
                 QUIT_REQUESTED.store(true, Ordering::SeqCst);
+                // Make sure the close isn't intercepted by hide-to-tray logic.
+                // We rely on the normal shutdown path (signal handlers / Drop) to clean up.
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }

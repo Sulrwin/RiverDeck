@@ -567,20 +567,34 @@ pub async fn deactivate_plugin(uuid: &str) -> Result<(), anyhow::Error> {
             | PluginInstance::Wine(mut child)
             | PluginInstance::Native(mut child) => {
                 let pid = child.id();
+                // IMPORTANT: this runs on async shutdown paths; don't block the runtime thread
+                // with `std::thread::sleep` or a potentially-hanging `child.wait()`.
                 #[cfg(unix)]
-                {
-                    unix_signal_process_group(pid, libc::SIGTERM);
-                    for _ in 0..20 {
-                        if child.try_wait()?.is_some() {
-                            unrecord_child_process(pid);
-                            return Ok(());
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(50));
-                    }
-                    unix_signal_process_group(pid, libc::SIGKILL);
-                }
+                unix_signal_process_group(pid, libc::SIGTERM);
+                #[cfg(not(unix))]
                 let _ = child.kill();
-                let _ = child.wait();
+
+                // Give the child a moment to exit cleanly.
+                for _ in 0..20 {
+                    if child.try_wait()?.is_some() {
+                        unrecord_child_process(pid);
+                        return Ok(());
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+
+                #[cfg(unix)]
+                unix_signal_process_group(pid, libc::SIGKILL);
+                let _ = child.kill();
+
+                // Best-effort: poll for a short time, then stop waiting so shutdown can't hang.
+                for _ in 0..20 {
+                    if child.try_wait()?.is_some() {
+                        unrecord_child_process(pid);
+                        return Ok(());
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
                 unrecord_child_process(pid);
             }
         }
