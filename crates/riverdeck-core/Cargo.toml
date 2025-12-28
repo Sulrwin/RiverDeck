@@ -18,7 +18,7 @@ fs2 = "0.4"
 font8x8 = "0.3"
 futures = "0.3"
 getrandom = "0.2"
-image = { version = "0.25", default-features = false, features = ["bmp", "jpeg", "png"] }
+image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png"] }
 json-patch = "4.1"
 log = "0.4"
 once_cell = "1.21"

@@ -4,6 +4,7 @@
 //! (egui main UI, embedded property inspector webviews, etc.) without a hard dependency on Tauri.
 
 pub mod application_watcher;
+pub mod animation;
 pub mod elgato;
 pub mod events;
 pub mod lifecycle;

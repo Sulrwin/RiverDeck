@@ -13,6 +13,7 @@ use font8x8::UnicodeFonts;
 use image::{Rgba, RgbaImage};
 use once_cell::sync::Lazy;
 use tokio::sync::RwLock;
+use tokio::time::sleep;
 
 static ELGATO_DEVICES: Lazy<RwLock<HashMap<String, AsyncStreamDeck>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
@@ -333,13 +334,192 @@ async fn load_dynamic_image(image: &str) -> Result<image::DynamicImage, anyhow::
     }
 }
 
+async fn resolve_image_bytes(image: &str) -> Result<Vec<u8>, anyhow::Error> {
+    if image.trim().starts_with("data:") {
+        // Stream Deck SDK commonly uses data URLs.
+        // Support both base64 and "raw" (non-base64) payloads.
+        if image.contains(";base64,") {
+            let (_meta, b64) = image
+                .split_once(";base64,")
+                .ok_or_else(|| anyhow::anyhow!("invalid data url (missing ';base64,')"))?;
+            Ok(base64::engine::general_purpose::STANDARD.decode(b64)?)
+        } else {
+            let (_meta, raw) = image
+                .split_once(',')
+                .ok_or_else(|| anyhow::anyhow!("invalid data url (missing ',')"))?;
+            Ok(raw.as_bytes().to_vec())
+        }
+    } else {
+        // Mirror `load_dynamic_image` path resolution so plugins can animate from the same sources.
+        let mut candidate: Option<std::path::PathBuf> = None;
+        let p = Path::new(image.trim());
+        if p.is_file() {
+            candidate = Some(p.to_path_buf());
+        } else if image.starts_with("riverdeck/") || image.starts_with("opendeck/") {
+            let cfg = crate::shared::config_dir().join(image.trim());
+            if cfg.is_file() {
+                candidate = Some(cfg);
+            } else if let Some(res) = crate::shared::resource_dir() {
+                let rp = res.join(image.trim());
+                if rp.is_file() {
+                    candidate = Some(rp);
+                }
+            }
+        }
+        let path = candidate.ok_or_else(|| anyhow::anyhow!("image path not found: {image}"))?;
+        Ok(tokio::fs::read(path).await?)
+    }
+}
+
+fn is_gif(bytes: &[u8]) -> bool {
+    bytes.len() >= 6 && &bytes[0..3] == b"GIF"
+}
+
+fn gif_cache_key(bytes: &[u8]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    format!("gif:{:016x}", h.finish())
+}
+
 pub async fn update_image(
     context: &crate::shared::Context,
     image: Option<&str>,
     overlays: Option<Vec<(String, crate::shared::TextPlacement)>>,
 ) -> Result<(), anyhow::Error> {
     if let Some(device) = ELGATO_DEVICES.read().await.get(&context.device) {
+        let anim_key = crate::animation::AnimationKey {
+            device: context.device.clone(),
+            controller: context.controller.clone(),
+            position: context.position,
+        };
         if let Some(image) = image {
+            let bytes = resolve_image_bytes(image).await;
+            if let Ok(bytes) = bytes
+                && is_gif(&bytes)
+            {
+                // Animated GIF: stop any existing animation for this slot and start a new one.
+                let generation = crate::animation::next_generation(&anim_key).await;
+                let cache_key = gif_cache_key(&bytes);
+                let decoded = crate::animation::decode_gif_cached(cache_key, bytes).await?;
+
+                // Single-frame GIFs behave like static images.
+                if decoded.len() <= 1 {
+                    crate::animation::stop(&anim_key).await;
+                } else if context.controller == "Encoder" {
+                    // Non-Plus encoder LCD icons are 72x72.
+                    // Apply overlay *after* resize for crisp 8x8 text.
+                    let prepared = crate::animation::prepare_frames(
+                        decoded.as_ref(),
+                        crate::animation::Target {
+                            width: 72,
+                            height: 72,
+                            resize_mode: crate::animation::ResizeMode::Fit,
+                            filter: image::imageops::FilterType::Nearest,
+                        },
+                        overlays.as_deref(),
+                        Some(overlay_label),
+                    );
+
+                    // Render first frame immediately.
+                    device
+                        .write_lcd(
+                            (context.position as u16 * 200) + 64,
+                            14,
+                            &ImageRect::from_image_async(prepared[0].image.clone())?,
+                        )
+                        .await?;
+                    device.flush().await?;
+
+                    let device_id = context.device.clone();
+                    let controller = context.controller.clone();
+                    let position = context.position;
+                    tokio::spawn(async move {
+                        let mut idx = 1usize;
+                        loop {
+                            if !crate::animation::is_current(&anim_key, generation).await {
+                                break;
+                            }
+                            let device = {
+                                let devices = ELGATO_DEVICES.read().await;
+                                devices.get(&device_id).cloned()
+                            };
+                            let Some(device) = device else { break };
+
+                            let frame = &prepared[idx % prepared.len()];
+                            if controller == "Encoder" {
+                                let rect = match ImageRect::from_image_async(frame.image.clone()) {
+                                    Ok(r) => r,
+                                    Err(_) => {
+                                        sleep(frame.delay).await;
+                                        idx = idx.wrapping_add(1);
+                                        continue;
+                                    }
+                                };
+                                let _ = device
+                                    .write_lcd((position as u16 * 200) + 64, 14, &rect)
+                                    .await;
+                                let _ = device.flush().await;
+                            }
+                            sleep(frame.delay).await;
+                            idx = idx.wrapping_add(1);
+                        }
+                    });
+
+                    return Ok(());
+                } else {
+                    // Keypad GIF: keep original resolution; overlays apply per-frame.
+                    let prepared: Vec<crate::animation::PreparedFrame> = decoded
+                        .iter()
+                        .map(|f| {
+                            let mut img = f.image.clone();
+                            if let Some(ov) = overlays.as_deref() {
+                                for (label, placement) in ov {
+                                    if !label.trim().is_empty() {
+                                        img = overlay_label(img, label, *placement);
+                                    }
+                                }
+                            }
+                            crate::animation::PreparedFrame {
+                                delay: f.delay,
+                                image: img,
+                            }
+                        })
+                        .collect();
+
+                    // Render first frame immediately.
+                    if let Err(e) = device.set_button_image(context.position, prepared[0].image.clone()).await {
+                        log::warn!("Failed to render first GIF frame: {}", e);
+                    }
+                    let _ = device.flush().await;
+
+                    let device_id = context.device.clone();
+                    let position = context.position;
+                    tokio::spawn(async move {
+                        let mut idx = 1usize;
+                        loop {
+                            if !crate::animation::is_current(&anim_key, generation).await {
+                                break;
+                            }
+                            let device = {
+                                let devices = ELGATO_DEVICES.read().await;
+                                devices.get(&device_id).cloned()
+                            };
+                            let Some(device) = device else { break };
+                            let frame = &prepared[idx % prepared.len()];
+                            let _ = device.set_button_image(position, frame.image.clone()).await;
+                            let _ = device.flush().await;
+                            sleep(frame.delay).await;
+                            idx = idx.wrapping_add(1);
+                        }
+                    });
+
+                    return Ok(());
+                }
+            }
+
+            // Not an animated GIF (or failed to load bytes): treat as static.
+            crate::animation::stop(&anim_key).await;
             let dyn_img = load_dynamic_image(image).await?;
 
             if context.controller == "Encoder" {
@@ -373,6 +553,7 @@ pub async fn update_image(
                 device.set_button_image(context.position, final_img).await?;
             }
         } else if context.controller == "Encoder" {
+            crate::animation::stop(&anim_key).await;
             device
                 .write_lcd(
                     context.position as u16 * 200,
@@ -381,6 +562,7 @@ pub async fn update_image(
                 )
                 .await?;
         } else {
+            crate::animation::stop(&anim_key).await;
             device.clear_button_image(context.position).await?;
         }
         device.flush().await?;
