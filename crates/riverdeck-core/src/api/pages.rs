@@ -155,6 +155,56 @@ pub async fn set_selected_page(
     Ok(())
 }
 
+/// Shift the currently selected page for the device's active profile.
+///
+/// - `delta = 1` selects the next page (wraps at end).
+/// - `delta = -1` selects the previous page (wraps at start).
+pub async fn shift_selected_page(device: String, delta: i32) -> Result<(), anyhow::Error> {
+    if delta == 0 {
+        return Ok(());
+    }
+
+    // Compute the next page id under a single lock, then drop and route through `set_selected_page`
+    // for correct willDisappear/willAppear + device update behavior.
+    let (profile_id, next_page_id) = {
+        let mut locks = acquire_locks_mut().await;
+        if !DEVICES.contains_key(&device) {
+            return Err(anyhow::anyhow!("device {device} not found"));
+        }
+        let profile_id = locks.device_stores.get_selected_profile(&device)?;
+
+        let dev = DEVICES.get(&device).unwrap();
+        let store = locks
+            .profile_stores
+            .get_profile_store_mut(&dev, &profile_id)
+            .await?;
+
+        if store.value.pages.len() <= 1 {
+            return Ok(());
+        }
+
+        let cur_id = store.value.selected_page.clone();
+        let cur_idx = store
+            .value
+            .pages
+            .iter()
+            .position(|p| p.id == cur_id)
+            .unwrap_or(0) as i32;
+        let len = store.value.pages.len() as i32;
+        let next_idx = (cur_idx + delta).rem_euclid(len) as usize;
+        let next_page_id = store
+            .value
+            .pages
+            .get(next_idx)
+            .map(|p| p.id.clone())
+            .unwrap_or_else(|| "1".to_owned());
+
+        (profile_id, next_page_id)
+    };
+
+    set_selected_page(device, profile_id, next_page_id).await
+}
+
 pub async fn create_page_and_select(
     device: String,
     profile_id: String,

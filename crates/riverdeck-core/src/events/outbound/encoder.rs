@@ -201,3 +201,81 @@ pub async fn touch_tap(device: &str, x: u16, y: u16, hold: bool) -> Result<(), a
     )
     .await
 }
+
+#[derive(Serialize)]
+#[allow(non_snake_case)]
+struct TouchSwipePayload {
+    controller: &'static str,
+    settings: serde_json::Value,
+    coordinates: Coordinates,
+    resources: HashMap<String, String>,
+    swipeFrom: [u16; 2],
+    swipeTo: [u16; 2],
+}
+
+#[derive(Serialize)]
+struct TouchSwipeEvent {
+    event: &'static str,
+    action: String,
+    context: ActionContext,
+    device: String,
+    payload: TouchSwipePayload,
+}
+
+pub async fn touch_swipe(
+    device: &str,
+    start: (u16, u16),
+    end: (u16, u16),
+) -> Result<(), anyhow::Error> {
+    let encoders = DEVICES.get(device).map(|d| d.encoders).unwrap_or(0);
+    if encoders == 0 {
+        return Ok(());
+    }
+
+    // Stream Deck+ LCD is 800px wide with 4 segments of 200px each. Route the swipe to the
+    // encoder whose segment contains the start x coordinate.
+    let idx = ((start.0 as u32) / 200).min(encoders.saturating_sub(1) as u32) as u8;
+
+    let mut locks = acquire_locks_mut().await;
+    let selected_profile = locks.device_stores.get_selected_profile(device)?;
+    let page = locks
+        .profile_stores
+        .get_profile_store_mut(&DEVICES.get(device).unwrap(), &selected_profile)
+        .await?
+        .value
+        .selected_page
+        .clone();
+    let context = ActionContext {
+        device: device.to_owned(),
+        profile: selected_profile.to_owned(),
+        page,
+        controller: "Encoder".to_owned(),
+        position: idx,
+        index: 0,
+    };
+    let Some(instance) = get_instance_mut(&context, &mut locks).await? else {
+        return Ok(());
+    };
+
+    send_to_plugin(
+        &instance.action.plugin,
+        &TouchSwipeEvent {
+            event: "touchSwipe",
+            action: instance.action.uuid.clone(),
+            context: instance.context.clone(),
+            device: instance.context.device.clone(),
+            payload: TouchSwipePayload {
+                controller: "Encoder",
+                settings: instance.settings.clone(),
+                coordinates: Coordinates {
+                    row: instance.context.position / 3,
+                    column: instance.context.position % 3,
+                },
+                resources: HashMap::new(),
+                swipeFrom: [start.0, start.1],
+                swipeTo: [end.0, end.1],
+            },
+        },
+    )
+    .await
+}

@@ -4950,6 +4950,7 @@ dependencies = [
  "rfd",
  "riverdeck-core",
  "semver",
+ "serde",
  "serde_json",
  "tokio",
  "tray-icon",

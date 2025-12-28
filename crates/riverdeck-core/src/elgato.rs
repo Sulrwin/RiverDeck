@@ -918,7 +918,18 @@ async fn init(device: AsyncStreamDeck, device_id: String) {
                 // The official Stream Deck SDK surface is the `touchTap` event (with `hold`),
                 // which we emit from the higher-level TouchScreenPress/LongPress updates above.
                 DeviceStateUpdate::TouchPointDown(_) | DeviceStateUpdate::TouchPointUp(_) => Ok(()),
-                DeviceStateUpdate::TouchScreenSwipe(_, _) => Ok(()),
+                DeviceStateUpdate::TouchScreenSwipe(start, end) => {
+                    // Stream Deck+ UX: horizontal swipe switches pages like the official app.
+                    let dx = end.0 as i32 - start.0 as i32;
+                    let dy = end.1 as i32 - start.1 as i32;
+                    if dx.abs() >= dy.abs() {
+                        // Convention: swipe left (end_x < start_x) advances to next page.
+                        let delta = if dx < 0 { 1 } else { -1 };
+                        let _ =
+                            crate::api::pages::shift_selected_page(device_id.clone(), delta).await;
+                    }
+                    encoder::touch_swipe(&device_id, start, end).await
+                }
             } {
                 Ok(_) => (),
                 Err(error) => log::warn!("Failed to process device event {update:?}: {error}"),

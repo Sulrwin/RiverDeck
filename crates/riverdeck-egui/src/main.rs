@@ -3,6 +3,7 @@ use riverdeck_core::{application_watcher, elgato, plugins, shared, ui};
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::mpsc;
 use std::time::Duration;
 use std::{
@@ -14,6 +15,7 @@ use std::{
 
 use fs2::FileExt;
 use log::LevelFilter;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::runtime::Runtime;
 use tokio::sync::broadcast;
 
@@ -33,6 +35,22 @@ static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(unix)]
 static SHOW_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+static IPC_PORT: OnceLock<u16> = OnceLock::new();
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum IpcRequest {
+    Show,
+    DeepLink { url: String },
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum IpcResponse {
+    Ok,
+    Err { error: String },
+}
 
 struct TeeLogger {
     stderr: env_logger::Logger,
@@ -147,6 +165,12 @@ fn main() -> anyhow::Result<()> {
     let start_hidden = args.iter().any(|a| a == "--hide");
     let replace_instance = args.iter().any(|a| a == "--replace");
     let show_existing = args.iter().any(|a| a == "--show");
+    let deep_links: Vec<String> = args
+        .iter()
+        .filter(|a| is_deep_link_arg(a))
+        .cloned()
+        .collect();
+    let has_deep_links = !deep_links.is_empty();
     let spawn_all_devices = args.iter().any(|a| a == "--spawn-all-devices");
     if spawn_all_devices {
         // Dev/testing mode: register mock devices for each supported Stream Deck family so the UI
@@ -216,9 +240,12 @@ fn main() -> anyhow::Result<()> {
         .open(shared::config_dir().join("riverdeck.lock"))?;
     if lock_file.try_lock_exclusive().is_err() {
         // Another instance is running.
+        // In debug builds we often want takeover for fast restarts, but deep-link invocations should
+        // forward to the existing instance instead of killing it.
         let should_replace = replace_instance
-            || cfg!(debug_assertions)
-            || std::env::var("RIVERDECK_REPLACE_INSTANCE").ok().as_deref() == Some("1");
+            || (!has_deep_links
+                && (cfg!(debug_assertions)
+                    || std::env::var("RIVERDECK_REPLACE_INSTANCE").ok().as_deref() == Some("1")));
 
         if should_replace {
             let pid = read_lock_pid(&mut lock_file);
@@ -255,6 +282,13 @@ fn main() -> anyhow::Result<()> {
                 return Ok(());
             }
         } else {
+            if has_deep_links
+                && let Some(port) = read_lock_ipc_port(&mut lock_file)
+                && forward_ipc_deep_links(port, &deep_links).is_ok()
+            {
+                return Ok(());
+            }
+
             // Best-effort UX: ask the running instance to show its window, so the user doesn't
             // end up with an invisible background process (e.g. hidden-to-tray with no tray).
             let pid = read_lock_pid(&mut lock_file);
@@ -279,9 +313,6 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Record our PID into the lock file (best-effort).
-    let _ = write_lock_pid(&mut lock_file);
-
     // If a previous instance was force-killed, it may have left plugin/PI subprocesses behind.
     // Reap those before we start new servers or spawn new plugins.
     riverdeck_core::lifecycle::startup_cleanup();
@@ -295,6 +326,16 @@ fn main() -> anyhow::Result<()> {
             .thread_name("riverdeck-core")
             .build()?,
     );
+
+    // Start a small local IPC server so secondary invocations (e.g. deep links) can forward
+    // requests to this running instance.
+    let ipc_port = runtime.block_on(start_ipc_server()).ok();
+    if let Some(port) = ipc_port {
+        let _ = IPC_PORT.set(port);
+    }
+    // Record our PID (+ IPC port when available) into the lock file (best-effort).
+    let _ = write_lock_info(&mut lock_file, ipc_port);
+
     start_signal_handlers(runtime.clone());
     start_core_background(runtime.clone());
 
@@ -499,14 +540,6 @@ fn set_parent_death_signal() {
     }
 }
 
-fn write_lock_pid(lock_file: &mut std::fs::File) -> std::io::Result<()> {
-    lock_file.set_len(0)?;
-    lock_file.seek(SeekFrom::Start(0))?;
-    writeln!(lock_file, "{}", std::process::id())?;
-    lock_file.sync_all()?;
-    Ok(())
-}
-
 fn read_lock_pid(lock_file: &mut std::fs::File) -> Option<u32> {
     let mut buf = String::new();
     let _ = lock_file.seek(SeekFrom::Start(0));
@@ -515,6 +548,135 @@ fn read_lock_pid(lock_file: &mut std::fs::File) -> Option<u32> {
         return None;
     }
     buf.lines().next()?.trim().parse::<u32>().ok()
+}
+
+fn write_lock_info(lock_file: &mut std::fs::File, ipc_port: Option<u16>) -> std::io::Result<()> {
+    lock_file.set_len(0)?;
+    lock_file.seek(SeekFrom::Start(0))?;
+    writeln!(lock_file, "{}", std::process::id())?;
+    if let Some(port) = ipc_port {
+        writeln!(lock_file, "{port}")?;
+    }
+    lock_file.sync_all()?;
+    Ok(())
+}
+
+fn read_lock_ipc_port(lock_file: &mut std::fs::File) -> Option<u16> {
+    let mut buf = String::new();
+    let _ = lock_file.seek(SeekFrom::Start(0));
+    let mut take = lock_file.take(64);
+    if take.read_to_string(&mut buf).is_err() {
+        return None;
+    }
+    buf.lines().nth(1)?.trim().parse::<u16>().ok()
+}
+
+fn is_deep_link_arg(arg: &str) -> bool {
+    arg.starts_with("openaction://")
+        || arg.starts_with("streamdeck://")
+        || arg.starts_with("riverdeck://")
+}
+
+async fn start_ipc_server() -> anyhow::Result<u16> {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+    let port = listener.local_addr()?.port();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _addr) = match listener.accept().await {
+                Ok(x) => x,
+                Err(_) => break,
+            };
+            tokio::spawn(async move {
+                let (read_half, mut write_half) = stream.into_split();
+                let mut reader = tokio::io::BufReader::new(read_half);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match reader.read_line(&mut line).await {
+                        Ok(0) => break,
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    let req = match serde_json::from_str::<IpcRequest>(trimmed) {
+                        Ok(r) => r,
+                        Err(err) => {
+                            let _ = write_half_json(
+                                &mut write_half,
+                                IpcResponse::Err {
+                                    error: format!("invalid request: {err:#}"),
+                                },
+                            )
+                            .await;
+                            continue;
+                        }
+                    };
+
+                    let res: anyhow::Result<()> = match req {
+                        IpcRequest::Show => {
+                            #[cfg(unix)]
+                            {
+                                SHOW_REQUESTED.store(true, Ordering::SeqCst);
+                            }
+                            Ok(())
+                        }
+                        IpcRequest::DeepLink { url } => handle_deep_link_arg(&url).await,
+                    };
+
+                    let _ = match res {
+                        Ok(()) => write_half_json(&mut write_half, IpcResponse::Ok).await,
+                        Err(err) => {
+                            write_half_json(
+                                &mut write_half,
+                                IpcResponse::Err {
+                                    error: format!("{err:#}"),
+                                },
+                            )
+                            .await
+                        }
+                    };
+                }
+            });
+        }
+    });
+
+    Ok(port)
+}
+
+async fn write_half_json(
+    w: &mut tokio::net::tcp::OwnedWriteHalf,
+    resp: IpcResponse,
+) -> std::io::Result<()> {
+    let mut s = serde_json::to_string(&resp)
+        .unwrap_or_else(|_| "{\"type\":\"err\",\"error\":\"serialize\"}".to_owned());
+    s.push('\n');
+    w.write_all(s.as_bytes()).await?;
+    Ok(())
+}
+
+fn forward_ipc_deep_links(port: u16, deep_links: &[String]) -> anyhow::Result<()> {
+    use std::net::{SocketAddr, TcpStream};
+
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse()?;
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(300))?;
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(300)));
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(300)));
+
+    fn send(stream: &mut TcpStream, req: &IpcRequest) -> std::io::Result<()> {
+        let mut s = serde_json::to_string(req).unwrap_or_else(|_| "{\"type\":\"show\"}".to_owned());
+        s.push('\n');
+        stream.write_all(s.as_bytes())
+    }
+
+    // Best-effort: show the existing window for UX.
+    let _ = send(&mut stream, &IpcRequest::Show);
+    for url in deep_links {
+        let _ = send(&mut stream, &IpcRequest::DeepLink { url: url.clone() });
+    }
+    Ok(())
 }
 
 #[cfg(all(unix, target_os = "linux"))]
@@ -526,6 +688,9 @@ fn linux_pid_looks_like_riverdeck(pid: u32) -> bool {
     let Some(name) = exe.file_name().and_then(|n| n.to_str()) else {
         return false;
     };
+    // When running from `cargo run` and recompiling, Linux can show the process exe as
+    // `riverdeck (deleted)` (the inode is unlinked). Treat that as a RiverDeck process too.
+    let name = name.strip_suffix(" (deleted)").unwrap_or(name);
     name == "riverdeck" || name == "riverdeck-egui" || name == "riverdeck.exe"
 }
 
@@ -1034,6 +1199,11 @@ struct RiverDeckApp {
     icon_library_icons_cache: Vec<riverdeck_core::api::icon_packs::IconInfo>,
     icon_library_cache_key: Option<(String, String)>, // (pack_id, query)
     icon_library_error: Option<String>,
+
+    // Cached center of the main preview area so overlays can align with it (not with side panels).
+    preview_center_x: Option<f32>,
+    // Cached width of the main preview area so overlays scale like it (not like side panels).
+    preview_width: Option<f32>,
 }
 
 #[derive(Debug, Clone)]
@@ -1311,6 +1481,8 @@ impl RiverDeckApp {
             icon_library_icons_cache: vec![],
             icon_library_cache_key: None,
             icon_library_error: None,
+            preview_center_x: None,
+            preview_width: None,
         }
     }
 
@@ -1399,6 +1571,9 @@ impl RiverDeckApp {
                     });
 
                     if let Some(instance) = instance {
+                        let is_multi_action =
+                            shared::is_multi_action_uuid(instance.action.uuid.as_str());
+
                         // Keep editor state stable while switching slots.
                         let needs_reset = match self.button_label_context.as_ref() {
                             None => true,
@@ -1418,327 +1593,57 @@ impl RiverDeckApp {
                                 st.map(|s| s.show_action_name).unwrap_or(true);
                         }
 
-                        ui.add_space(6.0);
-                        ui.label("Button title (dynamic):");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.button_label_input)
-                                .hint_text("Leave empty for clean"),
-                        );
+                        // Layout:
+                        // - Normal actions: single full-width column
+                        // - Multi/Toggle actions: two columns
+                        let gap = 6.0;
+                        let avail_w = ui.available_width().max(0.0);
+                        let show_right = is_multi_action
+                            || shared::is_toggle_action_uuid(instance.action.uuid.as_str());
 
-                        ui.horizontal(|ui| {
-                            ui.checkbox(&mut self.button_show_action_name, "Show action name");
-                            ui.checkbox(&mut self.button_show_title, "Show title");
-                        });
-
-                        ui.horizontal(|ui| {
-                            ui.label("Placement:");
-                            let placement_locked =
-                                self.button_show_title && self.button_show_action_name;
-                            ui.add_enabled_ui(!placement_locked, |ui| {
-                                egui::ComboBox::from_id_salt("button_label_placement")
-                                    .selected_text(match self.button_label_placement {
-                                        shared::TextPlacement::Top => "Top",
-                                        shared::TextPlacement::Bottom => "Bottom",
-                                        shared::TextPlacement::Left => "Left",
-                                        shared::TextPlacement::Right => "Right",
-                                    })
-                                    .show_ui(ui, |ui| {
-                                        ui.selectable_value(
-                                            &mut self.button_label_placement,
-                                            shared::TextPlacement::Top,
-                                            "Top",
-                                        );
-                                        ui.selectable_value(
-                                            &mut self.button_label_placement,
-                                            shared::TextPlacement::Bottom,
-                                            "Bottom",
-                                        );
-                                        ui.selectable_value(
-                                            &mut self.button_label_placement,
-                                            shared::TextPlacement::Left,
-                                            "Left",
-                                        );
-                                        ui.selectable_value(
-                                            &mut self.button_label_placement,
-                                            shared::TextPlacement::Right,
-                                            "Right",
-                                        );
-                                    });
-                            });
-                            if placement_locked {
-                                ui.label(
-                                    egui::RichText::new("Auto (Top/Bottom)")
-                                        .small()
-                                        .color(ui.visuals().weak_text_color()),
+                        if show_right {
+                            // Cap the left column so the Multi Action panel sits next to it,
+                            // instead of feeling pushed far right by unused space.
+                            let usable = (avail_w - gap).max(0.0);
+                            let left_w = (usable * 0.5).clamp(0.0, 360.0);
+                            let right_w = (usable - left_w).max(0.0);
+                            ui.horizontal(|ui| {
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(left_w, ui.available_height()),
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| {
+                                        self.draw_action_editor_left_column(
+                                            ui, ctx, device, instance,
+                                        )
+                                    },
                                 );
-                            }
-                            // Placement changes are staged; saved via the explicit Save button below.
-                        });
-
-                        ui.add_space(6.0);
-                        ui.horizontal(|ui| {
-                            if ui.button("Save").clicked()
-                                && let Some(ctx_to_set) = self.button_label_context.clone()
-                            {
-                                let text = self.button_label_input.clone();
-                                let placement = self.button_label_placement;
-                                let show_title = self.button_show_title;
-                                let show_action_name = self.button_show_action_name;
-                                self.runtime.spawn(async move {
-                                    let _ = riverdeck_core::api::instances::set_button_label(
-                                        ctx_to_set.clone(),
-                                        text,
-                                    )
-                                    .await;
-                                    let _ = riverdeck_core::api::instances::set_button_label_placement(
-                                        ctx_to_set.clone(),
-                                        placement,
-                                    )
-                                    .await;
-                                    let _ = riverdeck_core::api::instances::set_button_show_title(
-                                        ctx_to_set.clone(),
-                                        show_title,
-                                    )
-                                    .await;
-                                    let _ = riverdeck_core::api::instances::set_button_show_action_name(
-                                        ctx_to_set,
-                                        show_action_name,
-                                    )
-                                    .await;
-                                });
-                            }
-                            ui.label(
-                                egui::RichText::new("Tip: empty label hides text")
-                                    .small()
-                                    .color(ui.visuals().weak_text_color()),
-                            );
-                        });
-
-                        ui.separator();
-
-                        // Multi Action editor (native, built-in).
-                        if shared::is_multi_action_uuid(instance.action.uuid.as_str()) {
-                            ui.vertical(|ui| {
-                                ui.label(egui::RichText::new("Multi Action").strong());
-
-                                // Run on: key press vs key release.
-                                let run_on = instance
-                                    .settings
-                                    .get("runOn")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("keyDown");
-                                let mut run_on_key_up = run_on == "keyUp";
-                                ui.horizontal(|ui| {
-                                    ui.label("Run on:");
-                                    egui::ComboBox::from_id_salt("multi_action_run_on")
-                                        .selected_text(if run_on_key_up {
-                                            "Key Release"
+                                ui.add_space(gap);
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(right_w, ui.available_height()),
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| {
+                                        if is_multi_action {
+                                            self.draw_action_editor_multi_action_right_column(
+                                                ui, ctx, instance,
+                                            );
                                         } else {
-                                            "Key Press"
-                                        })
-                                        .show_ui(ui, |ui| {
-                                            ui.selectable_value(
-                                                &mut run_on_key_up,
-                                                false,
-                                                "Key Press",
+                                            // Toggle Action doesn't have a custom right panel (yet).
+                                            ui.label(
+                                                egui::RichText::new("Toggle Action")
+                                                    .small()
+                                                    .color(ui.visuals().weak_text_color()),
                                             );
-                                            ui.selectable_value(
-                                                &mut run_on_key_up,
-                                                true,
-                                                "Key Release",
-                                            );
-                                        });
-                                });
-                                if (run_on == "keyUp") != run_on_key_up {
-                                    let ctx_to_set = instance.context.clone();
-                                    let run_on = if run_on_key_up {
-                                        riverdeck_core::api::instances::MultiActionRunOn::KeyUp
-                                    } else {
-                                        riverdeck_core::api::instances::MultiActionRunOn::KeyDown
-                                    };
-                                    self.runtime.spawn(async move {
-                                        let _ =
-                                            riverdeck_core::api::instances::set_multi_action_run_on(
-                                                ctx_to_set, run_on,
-                                            )
-                                            .await;
-                                    });
-                                }
-
-                                ui.add_space(6.0);
-                                ui.label(egui::RichText::new("Steps").strong());
-
-                                if let Some(children) = instance.children.as_ref() {
-                                    if children.is_empty() {
-                                        ui.label(
-                                            egui::RichText::new("No steps yet. Drag actions onto this button to add steps.")
-                                                .small()
-                                                .color(ui.visuals().weak_text_color()),
-                                        );
-                                    } else {
-                                        for (idx, child) in children.iter().enumerate() {
-                                            ui.horizontal(|ui| {
-                                                let icon_size = egui::vec2(20.0, 20.0);
-                                                let img = child
-                                                    .states
-                                                    .get(child.current_state as usize)
-                                                    .map(|s| s.image.trim())
-                                                    .filter(|s| !s.is_empty() && *s != "actionDefaultImage")
-                                                    .map(|s| s.to_owned())
-                                                    .unwrap_or_else(|| child.action.icon.clone());
-                                                if let Some(tex) = self.texture_for_path(ctx, &img) {
-                                                    ui.image((tex.id(), icon_size));
-                                                } else {
-                                                    ui.allocate_exact_size(icon_size, egui::Sense::hover());
-                                                }
-
-                                                ui.label(child.action.name.trim());
-                                                ui.with_layout(
-                                                    egui::Layout::right_to_left(egui::Align::Center),
-                                                    |ui| {
-                                                        if ui.button("Remove").clicked() {
-                                                            let ctx_to_remove = child.context.clone();
-                                                            self.runtime.spawn(async move {
-                                                                let _ = riverdeck_core::api::instances::remove_instance(ctx_to_remove).await;
-                                                            });
-                                                        }
-
-                                                        let parent_ctx = instance.context.clone();
-                                                        if ui
-                                                            .add_enabled(idx + 1 < children.len(), egui::Button::new("↓"))
-                                                            .clicked()
-                                                        {
-                                                            let from = idx;
-                                                            let to = idx + 1;
-                                                            self.runtime.spawn(async move {
-                                                                let _ = riverdeck_core::api::instances::reorder_multi_action_child(
-                                                                    parent_ctx, from, to,
-                                                                )
-                                                                .await;
-                                                            });
-                                                        }
-                                                        let parent_ctx = instance.context.clone();
-                                                        if ui
-                                                            .add_enabled(idx > 0, egui::Button::new("↑"))
-                                                            .clicked()
-                                                        {
-                                                            let from = idx;
-                                                            let to = idx - 1;
-                                                            self.runtime.spawn(async move {
-                                                                let _ = riverdeck_core::api::instances::reorder_multi_action_child(
-                                                                    parent_ctx, from, to,
-                                                                )
-                                                                .await;
-                                                            });
-                                                        }
-                                                    },
-                                                );
-                                            });
                                         }
-                                    }
-                                }
-
-                                ui.add_space(4.0);
-                                ui.label(
-                                    egui::RichText::new("Tip: drag actions onto this button to add steps.")
-                                        .small()
-                                        .color(ui.visuals().weak_text_color()),
+                                    },
                                 );
                             });
-
-                            ui.separator();
+                        } else {
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(avail_w, ui.available_height()),
+                                egui::Layout::top_down(egui::Align::Min),
+                                |ui| self.draw_action_editor_left_column(ui, ctx, device, instance),
+                            );
                         }
-
-                        let has_pi = !instance.action.property_inspector.trim().is_empty();
-                        let open_for_this = self
-                            .pi_for_context
-                            .as_ref()
-                            .is_some_and(|c| c == &instance.context)
-                            && self.pi_child.is_some();
-
-                        ui.horizontal(|ui| {
-                            // Reuse existing PI controls from the original panel.
-                            if ui.button("✕").on_hover_text("Remove custom icon").clicked() {
-                                let ctx_to_clear = instance.context.clone();
-                                let state = instance.current_state;
-                                self.runtime.spawn(async move {
-                                    let _ = riverdeck_core::api::instances::clear_custom_icon(
-                                        ctx_to_clear,
-                                        Some(state),
-                                    )
-                                    .await;
-                                });
-                            }
-                            if ui
-                                .button("Upload")
-                                .on_hover_text("Set custom icon")
-                                .clicked()
-                                && self.pending_icon_pick.is_none()
-                            {
-                                let (tx, rx) = mpsc::channel();
-                                std::thread::spawn(move || {
-                                    let picked = rfd::FileDialog::new()
-                                        .add_filter("Image", &["png", "jpg", "jpeg"])
-                                        .pick_file();
-                                    let _ = tx.send(picked);
-                                });
-                                self.pending_icon_pick =
-                                    Some((rx, instance.context.clone(), instance.current_state));
-                            }
-                            if ui
-                                .button("Icon Library…")
-                                .on_hover_text("Choose an icon from installed icon packs")
-                                .clicked()
-                            {
-                                self.icon_library_open =
-                                    Some((instance.context.clone(), instance.current_state));
-                                self.icon_library_packs_cache =
-                                    riverdeck_core::api::icon_packs::list_icon_packs();
-                                self.icon_library_selected_pack = self
-                                    .icon_library_packs_cache
-                                    .first()
-                                    .map(|p| p.id.clone());
-                                self.icon_library_query.clear();
-                                self.icon_library_icons_cache.clear();
-                                self.icon_library_cache_key = None;
-                                self.icon_library_error = None;
-                            }
-                            if ui
-                                .button("Get more icons")
-                                .on_hover_text("Browse icon packs on the Elgato Marketplace")
-                                .clicked()
-                                && let Err(err) = self.open_marketplace_url(
-                                    ctx,
-                                    "https://marketplace.elgato.com/stream-deck/icons",
-                                )
-                            {
-                                self.marketplace_last_error = Some(err.to_string());
-                            }
-
-                            if ui
-                                .add_enabled(has_pi && !open_for_this, egui::Button::new("Open PI"))
-                                .clicked()
-                            {
-                                let dock = Self::compute_pi_dock_geometry(ctx, 420);
-                                if let Err(err) =
-                                    self.open_property_inspector_for_instance(device, instance, dock)
-                                {
-                                    self.pi_last_error = Some(err.to_string());
-                                }
-                            }
-                            if ui
-                                .add_enabled(open_for_this, egui::Button::new("Close PI"))
-                                .clicked()
-                            {
-                                self.close_pi();
-                            }
-
-                            if !has_pi {
-                                ui.label("This action has no Property Inspector.");
-                            } else if open_for_this {
-                                ui.label("PI open.");
-                            }
-                        });
                     }
                 });
             });
@@ -1746,6 +1651,319 @@ impl RiverDeckApp {
         if let Some(err) = self.pi_last_error.as_ref() {
             ui.colored_label(ui.visuals().error_fg_color, err);
         }
+    }
+
+    fn draw_action_editor_left_column(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        device: &shared::DeviceInfo,
+        instance: &shared::ActionInstance,
+    ) {
+        ui.add_space(6.0);
+        ui.label("Button title (dynamic):");
+        ui.add_sized(
+            [ui.available_width().min(320.0), 0.0],
+            egui::TextEdit::singleline(&mut self.button_label_input)
+                .hint_text("Leave empty for clean"),
+        );
+
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.button_show_action_name, "Show action name");
+            ui.checkbox(&mut self.button_show_title, "Show title");
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Placement:");
+            let placement_locked = self.button_show_title && self.button_show_action_name;
+            ui.add_enabled_ui(!placement_locked, |ui| {
+                let combo_w = ui.available_width().min(200.0);
+                egui::ComboBox::from_id_salt("button_label_placement")
+                    .width(combo_w)
+                    .selected_text(match self.button_label_placement {
+                        shared::TextPlacement::Top => "Top",
+                        shared::TextPlacement::Bottom => "Bottom",
+                        shared::TextPlacement::Left => "Left",
+                        shared::TextPlacement::Right => "Right",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.button_label_placement,
+                            shared::TextPlacement::Top,
+                            "Top",
+                        );
+                        ui.selectable_value(
+                            &mut self.button_label_placement,
+                            shared::TextPlacement::Bottom,
+                            "Bottom",
+                        );
+                        ui.selectable_value(
+                            &mut self.button_label_placement,
+                            shared::TextPlacement::Left,
+                            "Left",
+                        );
+                        ui.selectable_value(
+                            &mut self.button_label_placement,
+                            shared::TextPlacement::Right,
+                            "Right",
+                        );
+                    });
+            });
+            if placement_locked {
+                ui.label(
+                    egui::RichText::new("Auto (Top/Bottom)")
+                        .small()
+                        .color(ui.visuals().weak_text_color()),
+                );
+            }
+        });
+
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if ui.button("Save").clicked()
+                && let Some(ctx_to_set) = self.button_label_context.clone()
+            {
+                let text = self.button_label_input.clone();
+                let placement = self.button_label_placement;
+                let show_title = self.button_show_title;
+                let show_action_name = self.button_show_action_name;
+                self.runtime.spawn(async move {
+                    let _ =
+                        riverdeck_core::api::instances::set_button_label(ctx_to_set.clone(), text)
+                            .await;
+                    let _ = riverdeck_core::api::instances::set_button_label_placement(
+                        ctx_to_set.clone(),
+                        placement,
+                    )
+                    .await;
+                    let _ = riverdeck_core::api::instances::set_button_show_title(
+                        ctx_to_set.clone(),
+                        show_title,
+                    )
+                    .await;
+                    let _ = riverdeck_core::api::instances::set_button_show_action_name(
+                        ctx_to_set,
+                        show_action_name,
+                    )
+                    .await;
+                });
+            }
+            ui.label(
+                egui::RichText::new("Tip: empty label hides text")
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+            );
+        });
+
+        ui.separator();
+
+        let has_pi = !instance.action.property_inspector.trim().is_empty();
+        let open_for_this = self
+            .pi_for_context
+            .as_ref()
+            .is_some_and(|c| c == &instance.context)
+            && self.pi_child.is_some();
+
+        ui.horizontal(|ui| {
+            if ui.button("✕").on_hover_text("Remove custom icon").clicked() {
+                let ctx_to_clear = instance.context.clone();
+                let state = instance.current_state;
+                self.runtime.spawn(async move {
+                    let _ = riverdeck_core::api::instances::clear_custom_icon(
+                        ctx_to_clear,
+                        Some(state),
+                    )
+                    .await;
+                });
+            }
+            if ui
+                .button("Upload")
+                .on_hover_text("Set custom icon")
+                .clicked()
+                && self.pending_icon_pick.is_none()
+            {
+                let (tx, rx) = mpsc::channel();
+                std::thread::spawn(move || {
+                    let picked = rfd::FileDialog::new()
+                        .add_filter("Image", &["png", "jpg", "jpeg"])
+                        .pick_file();
+                    let _ = tx.send(picked);
+                });
+                self.pending_icon_pick =
+                    Some((rx, instance.context.clone(), instance.current_state));
+            }
+            if ui
+                .button("Icon Library…")
+                .on_hover_text("Choose an icon from installed icon packs")
+                .clicked()
+            {
+                self.icon_library_open = Some((instance.context.clone(), instance.current_state));
+                self.icon_library_packs_cache = riverdeck_core::api::icon_packs::list_icon_packs();
+                self.icon_library_selected_pack =
+                    self.icon_library_packs_cache.first().map(|p| p.id.clone());
+                self.icon_library_query.clear();
+                self.icon_library_icons_cache.clear();
+                self.icon_library_cache_key = None;
+                self.icon_library_error = None;
+            }
+            if ui
+                .button("Get more icons")
+                .on_hover_text("Browse icon packs on the Elgato Marketplace")
+                .clicked()
+                && let Err(err) = self
+                    .open_marketplace_url(ctx, "https://marketplace.elgato.com/stream-deck/icons")
+            {
+                self.marketplace_last_error = Some(err.to_string());
+            }
+
+            if ui
+                .add_enabled(has_pi && !open_for_this, egui::Button::new("Open PI"))
+                .clicked()
+            {
+                let dock = Self::compute_pi_dock_geometry(ctx, 420);
+                if let Err(err) = self.open_property_inspector_for_instance(device, instance, dock)
+                {
+                    self.pi_last_error = Some(err.to_string());
+                }
+            }
+            if ui
+                .add_enabled(open_for_this, egui::Button::new("Close PI"))
+                .clicked()
+            {
+                self.close_pi();
+            }
+
+            if !has_pi {
+                ui.add(egui::Label::new("This action has no Property Inspector.").wrap());
+            } else if open_for_this {
+                ui.label("PI open.");
+            }
+        });
+    }
+
+    fn draw_action_editor_multi_action_right_column(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        instance: &shared::ActionInstance,
+    ) {
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new("Multi Action").strong());
+
+        let run_on = instance
+            .settings
+            .get("runOn")
+            .and_then(|v| v.as_str())
+            .unwrap_or("keyDown");
+        let mut run_on_key_up = run_on == "keyUp";
+        ui.horizontal(|ui| {
+            ui.label("Run on:");
+            egui::ComboBox::from_id_salt("multi_action_run_on")
+                .width(ui.available_width().min(200.0))
+                .selected_text(if run_on_key_up {
+                    "Key Release"
+                } else {
+                    "Key Press"
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut run_on_key_up, false, "Key Press");
+                    ui.selectable_value(&mut run_on_key_up, true, "Key Release");
+                });
+        });
+        if (run_on == "keyUp") != run_on_key_up {
+            let ctx_to_set = instance.context.clone();
+            let run_on = if run_on_key_up {
+                riverdeck_core::api::instances::MultiActionRunOn::KeyUp
+            } else {
+                riverdeck_core::api::instances::MultiActionRunOn::KeyDown
+            };
+            self.runtime.spawn(async move {
+                let _ = riverdeck_core::api::instances::set_multi_action_run_on(ctx_to_set, run_on)
+                    .await;
+            });
+        }
+
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new("Steps").strong());
+        if let Some(children) = instance.children.as_ref() {
+            if children.is_empty() {
+                ui.label(
+                    egui::RichText::new(
+                        "No steps yet. Drag actions onto this button to add steps.",
+                    )
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+                );
+            } else {
+                for (idx, child) in children.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        let icon_size = egui::vec2(20.0, 20.0);
+                        let img = child
+                            .states
+                            .get(child.current_state as usize)
+                            .map(|s| s.image.trim())
+                            .filter(|s| !s.is_empty() && *s != "actionDefaultImage")
+                            .map(|s| s.to_owned())
+                            .unwrap_or_else(|| child.action.icon.clone());
+                        if let Some(tex) = self.texture_for_path(ctx, &img) {
+                            ui.image((tex.id(), icon_size));
+                        } else {
+                            ui.allocate_exact_size(icon_size, egui::Sense::hover());
+                        }
+
+                        ui.add(egui::Label::new(child.action.name.trim()).truncate());
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Remove").clicked() {
+                                let ctx_to_remove = child.context.clone();
+                                self.runtime.spawn(async move {
+                                    let _ = riverdeck_core::api::instances::remove_instance(
+                                        ctx_to_remove,
+                                    )
+                                    .await;
+                                });
+                            }
+
+                            let parent_ctx = instance.context.clone();
+                            if ui
+                                .add_enabled(idx + 1 < children.len(), egui::Button::new("↓"))
+                                .clicked()
+                            {
+                                let from = idx;
+                                let to = idx + 1;
+                                self.runtime.spawn(async move {
+                                    let _ =
+                                        riverdeck_core::api::instances::reorder_multi_action_child(
+                                            parent_ctx, from, to,
+                                        )
+                                        .await;
+                                });
+                            }
+
+                            let parent_ctx = instance.context.clone();
+                            if ui.add_enabled(idx > 0, egui::Button::new("↑")).clicked() {
+                                let from = idx;
+                                let to = idx - 1;
+                                self.runtime.spawn(async move {
+                                    let _ =
+                                        riverdeck_core::api::instances::reorder_multi_action_child(
+                                            parent_ctx, from, to,
+                                        )
+                                        .await;
+                                });
+                            }
+                        });
+                    });
+                }
+            }
+        }
+
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new("Tip: drag actions onto this button to add steps.")
+                .small()
+                .color(ui.visuals().weak_text_color()),
+        );
     }
 
     fn action_icon_path(action: &shared::Action) -> Option<&str> {
@@ -3508,6 +3726,21 @@ impl eframe::App for RiverDeckApp {
             snapshot.as_ref(),
             self.selected_slot.clone(),
         ) {
+            let selected_instance = match &slot.controller[..] {
+                "Encoder" => snapshot
+                    .sliders
+                    .get(slot.position as usize)
+                    .and_then(|v| v.as_ref()),
+                _ => snapshot
+                    .keys
+                    .get(slot.position as usize)
+                    .and_then(|v| v.as_ref()),
+            };
+            let selected_is_multi_action = selected_instance.is_some_and(|i| {
+                shared::is_multi_action_uuid(i.action.uuid.as_str())
+                    || shared::is_toggle_action_uuid(i.action.uuid.as_str())
+            });
+
             let instance_present = match &slot.controller[..] {
                 "Encoder" => snapshot
                     .sliders
@@ -3527,21 +3760,34 @@ impl eframe::App for RiverDeckApp {
             let anim_t =
                 ctx.animate_bool(egui::Id::new("action_editor_anim"), self.action_editor_open);
             if anim_t > 0.0 {
+                // Size/center against the preview geometry (cached each frame from the preview area).
                 let avail = ctx.available_rect();
-                let target_w = avail.width().clamp(240.0, 520.0);
-                let target_h = 260.0;
+                let preview_w = self.preview_width.unwrap_or(avail.width());
+                // Size relative to the available center area so it scales naturally.
+                // No hard max width; the only upper bound is the available space itself.
+                // Slightly narrower overall: keep it readable, but avoid feeling "massive".
+                let w_factor = if selected_is_multi_action { 0.68 } else { 0.62 };
+                let target_w = (preview_w * w_factor).clamp(360.0, preview_w.max(360.0));
+                let target_h = (avail.height() * 0.45).clamp(260.0, 460.0);
                 let current_h = target_h * anim_t;
 
-                let margin = 10.0;
-                let x = avail.center().x - (target_w * 0.5);
-                let y = (avail.bottom() - margin - current_h).max(avail.top() + margin);
+                // Flush to the bottom edge (no lift).
+                let margin = 0.0;
+                let center_x = self.preview_center_x.unwrap_or_else(|| avail.center().x);
+                let x = center_x - (target_w * 0.5);
+                let y = (avail.bottom() - margin - current_h).max(avail.top());
+                let rect =
+                    egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(target_w, current_h));
 
                 egui::Area::new("action_editor_overlay".into())
                     .order(egui::Order::Foreground)
                     .fixed_pos(egui::pos2(x, y))
                     .show(ctx, |ui| {
-                        ui.set_min_size(egui::vec2(target_w, current_h));
-                        ui.set_max_size(egui::vec2(target_w, current_h));
+                        // Size and clip the Area's UI directly. Using an absolute `max_rect(rect)`
+                        // inside an already-positioned Area can lead to unexpected expansion.
+                        ui.set_min_size(rect.size());
+                        ui.set_max_size(rect.size());
+                        ui.set_clip_rect(rect);
 
                         egui::Frame::popup(ui.style())
                             .inner_margin(egui::Margin::same(10))
@@ -4189,6 +4435,9 @@ impl eframe::App for RiverDeckApp {
             // (We intentionally keep this scoped to the preview area, not the whole center panel.)
             let (preview_rect, preview_resp) =
                 ui.allocate_exact_size(ui.available_size(), egui::Sense::click());
+            // Cache preview center so overlays can align with the preview, not with side panels.
+            self.preview_center_x = Some(preview_rect.center().x);
+            self.preview_width = Some(preview_rect.width());
             if preview_resp.clicked()
                 && self.selected_slot.is_some()
                 && self.drag_payload.is_none()
@@ -4897,6 +5146,7 @@ fn spawn_pi_process(
     dock: Option<(i32, i32, i32, i32)>,
 ) -> anyhow::Result<std::process::Child> {
     let mut cmd = std::process::Command::new(resolve_pi_exe()?);
+    configure_pi_webview_env(&mut cmd);
     cmd.arg("--label")
         .arg(label)
         .arg("--pi-src")
@@ -4945,7 +5195,11 @@ fn spawn_web_process(
     dock: Option<(i32, i32, i32, i32)>,
 ) -> anyhow::Result<std::process::Child> {
     let mut cmd = std::process::Command::new(resolve_pi_exe()?);
+    configure_pi_webview_env(&mut cmd);
     cmd.arg("--label").arg(label).arg("--url").arg(url);
+    if let Some(port) = IPC_PORT.get() {
+        cmd.arg("--ipc-port").arg(port.to_string());
+    }
 
     if let Some((x, y, w, h)) = dock {
         cmd.arg("--x")
@@ -4969,6 +5223,34 @@ fn spawn_web_process(
     Ok(child)
 }
 
+fn configure_pi_webview_env(cmd: &mut std::process::Command) {
+    // On some Wayland setups, wry/webkit can fail at runtime with:
+    // "Error: the window handle kind is not supported".
+    // Work around by forcing the webview helper onto X11 (XWayland) for now.
+    #[cfg(target_os = "linux")]
+    {
+        let session = std::env::var("XDG_SESSION_TYPE")
+            .unwrap_or_default()
+            .to_lowercase();
+        if session == "wayland" && std::env::var("DISPLAY").ok().is_some() {
+            cmd.env("GDK_BACKEND", "x11");
+            cmd.env("WINIT_UNIX_BACKEND", "x11");
+
+            // Further hardening: WebKitGTK can show a white window under XWayland when it tries
+            // to allocate GBM/DMABuf-backed buffers (common on some drivers/setups). For our use
+            // case (simple marketplace / property inspector UIs), prefer reliability over GPU
+            // acceleration.
+            cmd.env("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
+            cmd.env("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+            cmd.env("LIBGL_ALWAYS_SOFTWARE", "1");
+
+            // NVIDIA (and some compositor setups) can glitch with explicit sync enabled.
+            // Best-effort: disable it for the helper process only.
+            cmd.env("__NV_DISABLE_EXPLICIT_SYNC", "1");
+        }
+    }
+}
+
 fn pi_exe_basename() -> &'static str {
     if cfg!(windows) {
         "riverdeck-pi.exe"
@@ -4988,8 +5270,30 @@ fn resolve_pi_exe() -> anyhow::Result<std::ffi::OsString> {
         }
     }
 
-    // 2) Fall back to PATH. This helps in dev when `riverdeck-pi` is built but not
-    // located next to the `riverdeck-egui` binary.
+    // 2) Dev convenience: prefer the workspace `target/<profile>/riverdeck-pi` when running from
+    // a checkout. `cargo run -p riverdeck-egui` does not necessarily build `riverdeck-pi`, so we
+    // optionally build it on-demand (best-effort) to keep the in-app marketplace working.
+    #[cfg(debug_assertions)]
+    {
+        let cwd = std::env::current_dir().ok();
+        if let Some(cwd) = cwd {
+            let debug_candidate = cwd.join("target").join("debug").join(pi_exe_basename());
+            if debug_candidate.exists() {
+                return Ok(debug_candidate.into_os_string());
+            }
+            // If this looks like the repo root, try to build `riverdeck-pi` once.
+            if cwd.join("Cargo.toml").is_file() {
+                let status = std::process::Command::new("cargo")
+                    .args(["build", "-p", "riverdeck-pi"])
+                    .status();
+                if status.map(|s| s.success()).unwrap_or(false) && debug_candidate.exists() {
+                    return Ok(debug_candidate.into_os_string());
+                }
+            }
+        }
+    }
+
+    // 3) Fall back to PATH.
     Ok(std::ffi::OsString::from(pi_exe_basename()))
 }
 

@@ -59,9 +59,9 @@ fn main() -> anyhow::Result<()> {
     let webview = match &args {
         Args::Pi(a) => {
             let html = pi_host_html(a);
-            build_pi_webview(&window, html, proxy)?
+            build_pi_webview(&window, html, proxy, a.ipc_port)?
         }
-        Args::Url(a) => build_url_webview(&window, &a.url)?,
+        Args::Url(a) => build_url_webview(&window, &a.url, a.ipc_port)?,
     };
 
     event_loop.run(move |event, _target, control_flow| {
@@ -86,18 +86,23 @@ fn build_pi_webview(
     window: &tao::window::Window,
     html: String,
     proxy: EventLoopProxy<PiEvent>,
+    ipc_port: Option<u16>,
 ) -> anyhow::Result<WebView> {
     let proxy_for_ipc = proxy.clone();
     let builder = WebViewBuilder::new()
         .with_html(html)
-        .with_navigation_handler(|url: String| {
+        .with_navigation_handler(move |url: String| {
             // Allow regular browsing, but hand off deep-links to the OS.
             // This is important for things like Elgato Marketplace "Open in Stream Deck" links.
             if url.starts_with("openaction://")
                 || url.starts_with("streamdeck://")
                 || url.starts_with("riverdeck://")
             {
-                let _ = open::that_detached(url);
+                if let Some(port) = ipc_port {
+                    let _ = send_deep_link_ipc(port, &url);
+                } else {
+                    let _ = open::that_detached(url);
+                }
                 return false;
             }
             true
@@ -107,20 +112,50 @@ fn build_pi_webview(
     Ok(builder.build(window)?)
 }
 
-fn build_url_webview(window: &tao::window::Window, url: &str) -> anyhow::Result<WebView> {
-    let builder = WebViewBuilder::new()
-        .with_url(url)
-        .with_navigation_handler(|url: String| {
-            if url.starts_with("openaction://")
-                || url.starts_with("streamdeck://")
-                || url.starts_with("riverdeck://")
-            {
-                let _ = open::that_detached(url);
-                return false;
-            }
-            true
-        });
+fn build_url_webview(
+    window: &tao::window::Window,
+    url: &str,
+    ipc_port: Option<u16>,
+) -> anyhow::Result<WebView> {
+    let builder =
+        WebViewBuilder::new()
+            .with_url(url)
+            .with_navigation_handler(move |url: String| {
+                if url.starts_with("openaction://")
+                    || url.starts_with("streamdeck://")
+                    || url.starts_with("riverdeck://")
+                {
+                    if let Some(port) = ipc_port {
+                        let _ = send_deep_link_ipc(port, &url);
+                    } else {
+                        let _ = open::that_detached(url);
+                    }
+                    return false;
+                }
+                true
+            });
     Ok(builder.build(window)?)
+}
+
+fn send_deep_link_ipc(port: u16, url: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::net::{SocketAddr, TcpStream};
+    use std::time::Duration;
+
+    let addr: SocketAddr = format!("127.0.0.1:{port}")
+        .parse()
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid ipc port"))?;
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(250))?;
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(250)));
+
+    // Ask the existing window to show for UX, then forward the deep link.
+    let _ = writeln!(stream, "{{\"type\":\"show\"}}");
+    writeln!(
+        stream,
+        "{}",
+        serde_json::json!({ "type": "deep_link", "url": url })
+    )?;
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -138,6 +173,7 @@ struct PiArgs {
     context: String,
     info_json: String,
     connect_json: String,
+    ipc_port: Option<u16>,
     x: Option<i32>,
     y: Option<i32>,
     w: Option<i32>,
@@ -175,6 +211,7 @@ impl Args {
         let y = take_opt(&mut argv, "--y").and_then(|v| v.parse::<i32>().ok());
         let w = take_opt(&mut argv, "--w").and_then(|v| v.parse::<i32>().ok());
         let h = take_opt(&mut argv, "--h").and_then(|v| v.parse::<i32>().ok());
+        let ipc_port = take_opt(&mut argv, "--ipc-port").and_then(|v| v.parse::<u16>().ok());
         let decorations = take_opt(&mut argv, "--decorations").and_then(|v| match v.as_str() {
             "1" | "true" | "True" | "TRUE" => Some(true),
             "0" | "false" | "False" | "FALSE" => Some(false),
@@ -193,6 +230,7 @@ impl Args {
             return Ok(Args::Url(UrlArgs {
                 label,
                 url,
+                ipc_port,
                 x,
                 y,
                 w,
@@ -219,6 +257,7 @@ impl Args {
             context,
             info_json,
             connect_json,
+            ipc_port,
             x,
             y,
             w,
@@ -233,6 +272,7 @@ impl Args {
 struct UrlArgs {
     label: String,
     url: String,
+    ipc_port: Option<u16>,
     x: Option<i32>,
     y: Option<i32>,
     w: Option<i32>,
