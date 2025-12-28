@@ -40,19 +40,18 @@ impl PlusLayer {
         match self {
             PlusLayer::None => image::DynamicImage::ImageRgba8(RgbaImage::new(1, 1)),
             PlusLayer::Static(img) => img.clone(),
-            PlusLayer::Animated { frames, idx, .. } => {
-                frames.get(*idx % frames.len()).map(|f| f.image.clone()).unwrap_or_else(|| {
-                    image::DynamicImage::ImageRgba8(RgbaImage::new(1, 1))
-                })
-            }
+            PlusLayer::Animated { frames, idx, .. } => frames
+                .get(*idx % frames.len())
+                .map(|f| f.image.clone())
+                .unwrap_or_else(|| image::DynamicImage::ImageRgba8(RgbaImage::new(1, 1))),
         }
     }
 }
 
 struct PlusDeviceState {
     generation: u64,
-    background: PlusLayer,      // 800x100
-    dials: Vec<PlusLayer>,      // per encoder, each 72x72 (or None)
+    background: PlusLayer, // 800x100
+    dials: Vec<PlusLayer>, // per encoder, each 72x72 (or None)
     task_running: bool,
 }
 
@@ -64,15 +63,16 @@ async fn plus_state_for_device(device_id: &str, encoders: usize) -> Arc<Mutex<Pl
         return st.clone();
     }
     let mut map = PLUS_STATE.write().await;
-    map.entry(device_id.to_owned()).or_insert_with(|| {
-        Arc::new(Mutex::new(PlusDeviceState {
-            generation: 1,
-            background: PlusLayer::None,
-            dials: vec![PlusLayer::None; encoders],
-            task_running: false,
-        }))
-    })
-    .clone()
+    map.entry(device_id.to_owned())
+        .or_insert_with(|| {
+            Arc::new(Mutex::new(PlusDeviceState {
+                generation: 1,
+                background: PlusLayer::None,
+                dials: vec![PlusLayer::None; encoders],
+                task_running: false,
+            }))
+        })
+        .clone()
 }
 
 fn plus_bump_generation(state: &mut PlusDeviceState) -> u64 {
@@ -89,7 +89,10 @@ fn plus_composite_frame(
     // Compose into a single RGBA image then rely on elgato-streamdeck conversion.
     let mut base = match bg {
         PlusLayer::None => RgbaImage::from_pixel(800, 100, Rgba([0, 0, 0, 255])),
-        _ => bg.current_image().resize_exact(800, 100, image::imageops::FilterType::Nearest).to_rgba8(),
+        _ => bg
+            .current_image()
+            .resize_exact(800, 100, image::imageops::FilterType::Nearest)
+            .to_rgba8(),
     };
 
     for (dial, icon) in dials {
@@ -171,7 +174,12 @@ async fn plus_ensure_task(device_id: String, state: Arc<Mutex<PlusDeviceState>>,
                     let mut next: Option<Instant> = None;
 
                     let mut bump_layer = |layer: &mut PlusLayer| {
-                        let PlusLayer::Animated { frames, idx, next_at } = layer else {
+                        let PlusLayer::Animated {
+                            frames,
+                            idx,
+                            next_at,
+                        } = layer
+                        else {
                             return;
                         };
                         if frames.is_empty() {
@@ -189,7 +197,8 @@ async fn plus_ensure_task(device_id: String, state: Arc<Mutex<PlusDeviceState>>,
                         bump_layer(dial);
                     }
 
-                    let any = st.background.is_animated() || st.dials.iter().any(|d| d.is_animated());
+                    let any =
+                        st.background.is_animated() || st.dials.iter().any(|d| d.is_animated());
                     let sleep_for = if any {
                         next.and_then(|t| t.checked_duration_since(Instant::now()))
                             .unwrap_or_else(|| Duration::from_millis(5))
@@ -616,13 +625,18 @@ pub async fn update_image(
                         // Ensure we don't have any legacy per-context encoder animation task running.
                         crate::animation::stop(&anim_key).await;
 
-                        let state =
-                            plus_state_for_device(&context.device, device.kind().encoder_count() as usize)
-                                .await;
+                        let state = plus_state_for_device(
+                            &context.device,
+                            device.kind().encoder_count() as usize,
+                        )
+                        .await;
                         let generation = {
                             let mut st = state.lock().await;
                             if st.dials.len() < device.kind().encoder_count() as usize {
-                                st.dials.resize(device.kind().encoder_count() as usize, PlusLayer::None);
+                                st.dials.resize(
+                                    device.kind().encoder_count() as usize,
+                                    PlusLayer::None,
+                                );
                             }
                             if decoded.len() <= 1 {
                                 // Single-frame GIF: treat as static.
@@ -630,7 +644,8 @@ pub async fn update_image(
                                     .first()
                                     .map(|f| f.image.clone())
                                     .unwrap_or_else(|| image::DynamicImage::new_rgba8(72, 72));
-                                let img = img.resize_exact(72, 72, image::imageops::FilterType::Nearest);
+                                let img =
+                                    img.resize_exact(72, 72, image::imageops::FilterType::Nearest);
                                 let mut img = img;
                                 if let Some(ov) = overlays.as_deref() {
                                     for (label, placement) in ov {
@@ -665,8 +680,7 @@ pub async fn update_image(
                         plus_render_once(&context.device, state.clone()).await;
                         let any_animated = {
                             let st = state.lock().await;
-                            st.background.is_animated()
-                                || st.dials.iter().any(|d| d.is_animated())
+                            st.background.is_animated() || st.dials.iter().any(|d| d.is_animated())
                         };
                         if any_animated {
                             plus_ensure_task(context.device.clone(), state, generation).await;
@@ -735,27 +749,26 @@ pub async fn update_image(
 
                     return Ok(());
                 } else {
-                    // Keypad GIF: keep original resolution; overlays apply per-frame.
-                    let prepared: Vec<crate::animation::PreparedFrame> = decoded
-                        .iter()
-                        .map(|f| {
-                            let mut img = f.image.clone();
-                            if let Some(ov) = overlays.as_deref() {
-                                for (label, placement) in ov {
-                                    if !label.trim().is_empty() {
-                                        img = overlay_label(img, label, *placement);
-                                    }
-                                }
-                            }
-                            crate::animation::PreparedFrame {
-                                delay: f.delay,
-                                image: img,
-                            }
-                        })
-                        .collect();
+                    // Keypad GIF: pre-resize frames to the device key resolution, then apply overlays.
+                    // This keeps text sizing consistent across keys regardless of the source GIF dimensions.
+                    let (kw, kh) = device.kind().key_image_format().size;
+                    let prepared = crate::animation::prepare_frames(
+                        decoded.as_ref(),
+                        crate::animation::Target {
+                            width: kw as u32,
+                            height: kh as u32,
+                            resize_mode: crate::animation::ResizeMode::Exact,
+                            filter: image::imageops::FilterType::Nearest,
+                        },
+                        overlays.as_deref(),
+                        Some(overlay_label),
+                    );
 
                     // Render first frame immediately.
-                    if let Err(e) = device.set_button_image(context.position, prepared[0].image.clone()).await {
+                    if let Err(e) = device
+                        .set_button_image(context.position, prepared[0].image.clone())
+                        .await
+                    {
                         log::warn!("Failed to render first GIF frame: {}", e);
                     }
                     let _ = device.flush().await;
@@ -800,12 +813,16 @@ pub async fn update_image(
                     }
                 }
                 if device.kind() == Kind::Plus {
-                    let state =
-                        plus_state_for_device(&context.device, device.kind().encoder_count() as usize).await;
+                    let state = plus_state_for_device(
+                        &context.device,
+                        device.kind().encoder_count() as usize,
+                    )
+                    .await;
                     let generation = {
                         let mut st = state.lock().await;
                         if st.dials.len() < device.kind().encoder_count() as usize {
-                            st.dials.resize(device.kind().encoder_count() as usize, PlusLayer::None);
+                            st.dials
+                                .resize(device.kind().encoder_count() as usize, PlusLayer::None);
                         }
                         st.dials[context.position as usize] = PlusLayer::Static(final_img);
                         plus_bump_generation(&mut st)
@@ -828,9 +845,16 @@ pub async fn update_image(
                         .await?;
                 }
             } else {
-                // Apply text overlays directly to the image. The elgato-streamdeck crate handles
-                // any necessary image format conversion and resizing internally.
-                let mut final_img = dyn_img;
+                // Keypad buttons: if we draw overlays before the elgato-streamdeck conversion,
+                // and the source image isn't already at native key resolution, the subsequent
+                // resize will also shrink our rendered text, making font sizes inconsistent
+                // across keys (and sometimes unreadably small). To avoid this, resize first.
+                let (kw, kh) = device.kind().key_image_format().size;
+                let mut final_img = dyn_img.resize_exact(
+                    kw as u32,
+                    kh as u32,
+                    image::imageops::FilterType::Nearest,
+                );
                 if let Some(overlays) = overlays {
                     for (label, placement) in overlays {
                         if !label.trim().is_empty() {
@@ -844,11 +868,13 @@ pub async fn update_image(
             crate::animation::stop(&anim_key).await;
             if device.kind() == Kind::Plus {
                 let state =
-                    plus_state_for_device(&context.device, device.kind().encoder_count() as usize).await;
+                    plus_state_for_device(&context.device, device.kind().encoder_count() as usize)
+                        .await;
                 let generation = {
                     let mut st = state.lock().await;
                     if st.dials.len() < device.kind().encoder_count() as usize {
-                        st.dials.resize(device.kind().encoder_count() as usize, PlusLayer::None);
+                        st.dials
+                            .resize(device.kind().encoder_count() as usize, PlusLayer::None);
                     }
                     st.dials[context.position as usize] = PlusLayer::None;
                     plus_bump_generation(&mut st)
@@ -924,8 +950,11 @@ pub async fn set_lcd_background(id: &str, image: Option<&str>) -> Result<(), any
                 let any = st.background.is_animated() || st.dials.iter().any(|d| d.is_animated());
                 (generation, any)
             } else {
-                let dyn_img =
-                    image::load_from_memory(&bytes)?.resize_exact(800, 100, image::imageops::FilterType::Nearest);
+                let dyn_img = image::load_from_memory(&bytes)?.resize_exact(
+                    800,
+                    100,
+                    image::imageops::FilterType::Nearest,
+                );
                 let mut st = state.lock().await;
                 st.background = PlusLayer::Static(dyn_img);
                 let generation = plus_bump_generation(&mut st);

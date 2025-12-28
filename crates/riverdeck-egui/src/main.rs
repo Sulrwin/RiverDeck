@@ -16,7 +16,10 @@ use tokio::runtime::Runtime;
 use tokio::sync::broadcast;
 
 #[cfg(feature = "tray")]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
+
+#[cfg(any(unix, feature = "tray"))]
+use std::sync::atomic::Ordering;
 
 #[cfg(feature = "tray")]
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
@@ -25,6 +28,9 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 #[cfg(feature = "tray")]
 static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(unix)]
+static SHOW_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn main() -> anyhow::Result<()> {
     // Default to info logging unless the user overrides with RUST_LOG.
@@ -45,6 +51,7 @@ fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let start_hidden = args.iter().any(|a| a == "--hide");
     let replace_instance = args.iter().any(|a| a == "--replace");
+    let show_existing = args.iter().any(|a| a == "--show");
 
     let mut paths = shared::discover_paths()?;
     // Best-effort resource dir discovery:
@@ -125,7 +132,26 @@ fn main() -> anyhow::Result<()> {
                 return Ok(());
             }
         } else {
-            log::warn!("RiverDeck already running (lockfile held). Pass `--replace` to take over.");
+            // Best-effort UX: ask the running instance to show its window, so the user doesn't
+            // end up with an invisible background process (e.g. hidden-to-tray with no tray).
+            let pid = read_lock_pid(&mut lock_file);
+            #[cfg(unix)]
+            if let Some(pid) = pid {
+                #[cfg(target_os = "linux")]
+                if linux_pid_looks_like_riverdeck(pid) {
+                    request_show_existing_instance(pid);
+                }
+                #[cfg(not(target_os = "linux"))]
+                request_show_existing_instance(pid);
+            }
+
+            if show_existing {
+                log::info!("Requested existing RiverDeck instance to show its window");
+            } else {
+                log::warn!(
+                    "RiverDeck already running (lockfile held). Pass `--replace` to take over, or `--show` to request the existing window."
+                );
+            }
             return Ok(());
         }
     }
@@ -200,20 +226,78 @@ fn start_signal_handlers(runtime: Arc<Runtime>) {
             Ok(s) => s,
             Err(_) => return,
         };
+        let mut sigusr1 = match signal(SignalKind::user_defined1()) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
 
-        tokio::select! {
-            _ = sigterm.recv() => {},
-            _ = sigint.recv() => {},
+        loop {
+            tokio::select! {
+                _ = sigusr1.recv() => {
+                    SHOW_REQUESTED.store(true, Ordering::SeqCst);
+                },
+                _ = sigterm.recv() => {
+                    log::warn!("Received termination signal; shutting down RiverDeck");
+                    riverdeck_core::lifecycle::shutdown_all().await;
+                    std::process::exit(0);
+                },
+                _ = sigint.recv() => {
+                    log::warn!("Received interrupt signal; shutting down RiverDeck");
+                    riverdeck_core::lifecycle::shutdown_all().await;
+                    std::process::exit(0);
+                },
+            }
         }
-
-        log::warn!("Received termination signal; shutting down RiverDeck");
-        riverdeck_core::lifecycle::shutdown_all().await;
-        std::process::exit(0);
     });
 }
 
 #[cfg(not(unix))]
 fn start_signal_handlers(_runtime: Arc<Runtime>) {}
+
+#[cfg(feature = "tray")]
+fn env_truthy(name: &str) -> bool {
+    matches!(
+        std::env::var(name).ok().as_deref(),
+        Some("1")
+            | Some("true")
+            | Some("TRUE")
+            | Some("yes")
+            | Some("YES")
+            | Some("on")
+            | Some("ON")
+    )
+}
+
+/// Best-effort heuristic for whether "hide to tray" is a safe UX.
+///
+/// Motivation: on some desktops (notably GNOME without an AppIndicator extension), the tray icon
+/// may not appear even if `tray-icon` succeeds in creating it. In that case, hiding the window
+/// creates an invisible background process with no obvious way to restore it.
+#[cfg(feature = "tray")]
+fn tray_hide_is_safe_by_default() -> bool {
+    if env_truthy("RIVERDECK_DISABLE_TRAY") {
+        return false;
+    }
+    if env_truthy("RIVERDECK_FORCE_TRAY") {
+        return true;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let desktop = std::env::var("XDG_CURRENT_DESKTOP")
+            .or_else(|_| std::env::var("XDG_SESSION_DESKTOP"))
+            .unwrap_or_default()
+            .to_lowercase();
+
+        // GNOME generally does not display StatusNotifier/AppIndicator icons by default.
+        // Users can opt-in via `RIVERDECK_FORCE_TRAY=1`.
+        if desktop.contains("gnome") {
+            return false;
+        }
+    }
+
+    true
+}
 
 fn load_window_icon() -> anyhow::Result<egui::IconData> {
     let (rgba, width, height) = load_embedded_logo_rgba()?;
@@ -310,6 +394,11 @@ fn signal_pid(pid: u32, sig: i32) -> std::io::Result<()> {
         return Ok(());
     }
     Err(err)
+}
+
+#[cfg(unix)]
+fn request_show_existing_instance(pid: u32) {
+    let _ = signal_pid(pid, libc::SIGUSR1);
 }
 
 fn looks_like_bundled_resources(dir: &Path) -> bool {
@@ -426,6 +515,8 @@ struct RiverDeckApp {
     #[cfg(feature = "tray")]
     tray: Option<TrayState>,
     #[cfg(feature = "tray")]
+    tray_hide_ok: bool,
+    #[cfg(feature = "tray")]
     hide_to_tray_requested: bool,
     selected_device: Option<String>,
 
@@ -536,6 +627,15 @@ impl RiverDeckApp {
         if tray.is_some() {
             log_tray_status_to_file("tray init ok");
         }
+        #[cfg(feature = "tray")]
+        let tray_hide_ok = tray.is_some() && tray_hide_is_safe_by_default();
+        #[cfg(feature = "tray")]
+        if tray.is_some() && !tray_hide_ok {
+            log::warn!(
+                "Tray icon initialized but hide-to-tray is disabled for this desktop (set RIVERDECK_FORCE_TRAY=1 to override)"
+            );
+            log_tray_status_to_file("tray init ok, but hide-to-tray disabled by desktop heuristic");
+        }
 
         Self {
             runtime,
@@ -545,6 +645,8 @@ impl RiverDeckApp {
             update_info,
             #[cfg(feature = "tray")]
             tray,
+            #[cfg(feature = "tray")]
+            tray_hide_ok,
             #[cfg(feature = "tray")]
             hide_to_tray_requested: false,
             selected_device: None,
@@ -590,6 +692,11 @@ impl RiverDeckApp {
             pending_icon_pick: None,
             pending_screen_bg_pick: None,
         }
+    }
+
+    #[cfg(feature = "tray")]
+    fn hide_to_tray_available(&self) -> bool {
+        self.tray.is_some() && self.tray_hide_ok
     }
 
     #[allow(dead_code)]
@@ -2169,7 +2276,9 @@ impl eframe::App for RiverDeckApp {
         if ctx.input(|i| i.viewport().close_requested()) {
             if QUIT_REQUESTED.load(Ordering::SeqCst) {
                 // Allow the close to proceed.
-            } else if self.tray.is_some() {
+            } else if self.hide_to_tray_available()
+                && (cfg!(not(target_os = "linux")) || env_truthy("RIVERDECK_CLOSE_TO_TRAY"))
+            {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.hide_to_tray_requested = true;
             }
@@ -2180,7 +2289,7 @@ impl eframe::App for RiverDeckApp {
             // If tray is available, start hidden-to-tray (no taskbar entry).
             // Otherwise, fall back to minimizing so the user can still find the app.
             #[cfg(feature = "tray")]
-            if self.tray.is_some() {
+            if self.hide_to_tray_available() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             } else {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
@@ -2194,12 +2303,24 @@ impl eframe::App for RiverDeckApp {
             tray.poll(ctx);
         }
 
+        // Allow external show requests (e.g. second instance wants to bring the window back).
+        #[cfg(unix)]
+        if SHOW_REQUESTED.swap(false, Ordering::SeqCst) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        }
+
         // Apply hide-to-tray requests (we do this after polling the tray menu so that a
         // "Show" click can't be immediately overridden by a stale request).
         #[cfg(feature = "tray")]
         if self.hide_to_tray_requested {
             self.hide_to_tray_requested = false;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            if self.hide_to_tray_available() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            } else {
+                // Safer fallback: keep a taskbar entry so the user can restore the app.
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            }
         }
 
         self.poll_ui_events();
@@ -2655,8 +2776,9 @@ impl eframe::App for RiverDeckApp {
                 });
             });
 
-        // Bottom action editor: hidden when no slot is selected, otherwise a centered tab that
-        // expands into a full-width bottom sheet (collapsed by default).
+        // Bottom action editor: hidden when no slot is selected.
+        // When visible, we always render a centered tab; when open, we render a fixed-width
+        // overlay sheet above the tab (same width as the tab).
         let editor_visible =
             selected_device.is_some() && snapshot.is_some() && self.selected_slot.is_some();
         if !editor_visible {
@@ -2666,84 +2788,128 @@ impl eframe::App for RiverDeckApp {
             snapshot.as_ref(),
             self.selected_slot.clone(),
         ) {
-            if !self.action_editor_open {
-                egui::TopBottomPanel::bottom("action_editor_tab")
-                    .exact_height(44.0)
-                    .frame(egui::Frame::NONE.inner_margin(egui::Margin::same(6)))
-                    .show(ctx, |ui| {
-                        ui.vertical_centered(|ui| {
-                            let tab_w = ui.available_width().clamp(240.0, 520.0);
-                            let tab_h = 34.0;
-                            let (rect, resp) = ui.allocate_exact_size(
-                                egui::vec2(tab_w.min(ui.available_width()), tab_h),
-                                egui::Sense::click(),
-                            );
+            let mut tab_rect_for_overlay: Option<egui::Rect> = None;
+            let mut tab_w_for_overlay: f32 = 0.0;
 
-                            let rounding = egui::CornerRadius::same(12);
-                            let fill = if resp.hovered() {
-                                ui.visuals().widgets.hovered.bg_fill
-                            } else {
-                                ui.visuals().widgets.inactive.bg_fill
-                            };
-                            let stroke = if resp.hovered() {
-                                ui.visuals().widgets.hovered.bg_stroke
-                            } else {
-                                ui.visuals().widgets.inactive.bg_stroke
-                            };
+            egui::TopBottomPanel::bottom("action_editor_tab")
+                .exact_height(44.0)
+                .frame(egui::Frame::NONE.inner_margin(egui::Margin::same(6)))
+                .show(ctx, |ui| {
+                    ui.vertical_centered(|ui| {
+                        let tab_w = ui.available_width().clamp(240.0, 520.0);
+                        let tab_h = 34.0;
+                        let (rect, resp) = ui.allocate_exact_size(
+                            egui::vec2(tab_w.min(ui.available_width()), tab_h),
+                            egui::Sense::click(),
+                        );
 
-                            ui.painter().rect(
-                                rect,
-                                rounding,
-                                fill,
-                                stroke,
-                                egui::StrokeKind::Inside,
-                            );
+                        tab_rect_for_overlay = Some(rect);
+                        tab_w_for_overlay = tab_w.min(ui.available_width());
 
-                            let label =
-                                format!("Action Editor — {} {}", slot.controller, slot.position);
-                            ui.painter().text(
-                                rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                label,
-                                egui::FontId::proportional(13.0),
-                                ui.visuals().text_color(),
-                            );
+                        let rounding = egui::CornerRadius::same(12);
+                        let fill = if resp.hovered() {
+                            ui.visuals().widgets.hovered.bg_fill
+                        } else {
+                            ui.visuals().widgets.inactive.bg_fill
+                        };
+                        let stroke = if resp.hovered() {
+                            ui.visuals().widgets.hovered.bg_stroke
+                        } else {
+                            ui.visuals().widgets.inactive.bg_stroke
+                        };
 
-                            if resp.clicked() {
-                                self.action_editor_open = true;
-                            }
-                        });
+                        ui.painter()
+                            .rect(rect, rounding, fill, stroke, egui::StrokeKind::Inside);
+
+                        let label =
+                            format!("Action Editor — {} {}", slot.controller, slot.position);
+                        ui.painter().text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            label,
+                            egui::FontId::proportional(13.0),
+                            ui.visuals().text_color(),
+                        );
+
+                        if resp.clicked() {
+                            self.action_editor_open = true;
+                        }
                     });
-            } else {
-                egui::TopBottomPanel::bottom("action_editor_sheet")
-                    .default_height(260.0)
-                    .resizable(true)
-                    .show(ctx, |ui| {
-                        ui.vertical(|ui| {
-                            ui.horizontal(|ui| {
-                                ui.heading("Action Editor");
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        if ui.button("▾").on_hover_text("Collapse").clicked() {
-                                            self.action_editor_open = false;
-                                        }
-                                    },
-                                );
-                            });
-                            ui.add_space(6.0);
+                });
 
-                            egui::ScrollArea::vertical().show(ui, |ui| {
-                                self.draw_action_editor_contents(
-                                    ui,
-                                    ctx,
-                                    device,
-                                    snapshot,
-                                    &selected_profile,
-                                    &slot,
-                                );
+            let anim_t =
+                ctx.animate_bool(egui::Id::new("action_editor_anim"), self.action_editor_open);
+            if anim_t > 0.0 {
+                let tab_rect = tab_rect_for_overlay.unwrap_or_else(|| {
+                    let r = ctx.available_rect();
+                    // Fallback: a small rect at the bottom center.
+                    let w = tab_w_for_overlay.max(240.0);
+                    egui::Rect::from_min_size(
+                        egui::pos2(r.center().x - (w * 0.5), r.bottom() - 44.0),
+                        egui::vec2(w, 34.0),
+                    )
+                });
+
+                let tab_w = if tab_w_for_overlay > 0.0 {
+                    tab_w_for_overlay
+                } else {
+                    360.0
+                };
+                let target_h = 260.0;
+                let current_h = target_h * anim_t;
+
+                let margin = 6.0;
+                let avail = ctx.available_rect();
+                let x = tab_rect.center().x - (tab_w * 0.5);
+                let y = (tab_rect.min.y - margin - current_h).max(avail.top());
+
+                egui::Area::new("action_editor_overlay".into())
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(egui::pos2(x, y))
+                    .show(ctx, |ui| {
+                        ui.set_min_size(egui::vec2(tab_w, current_h));
+                        ui.set_max_size(egui::vec2(tab_w, current_h));
+
+                        egui::Frame::popup(ui.style())
+                            .inner_margin(egui::Margin::same(10))
+                            .corner_radius(egui::CornerRadius::same(12))
+                            .show(ui, |ui| {
+                                // Avoid trying to render the full editor while we're still animating
+                                // from ~0px tall (it would just clip awkwardly).
+                                if current_h < 48.0 {
+                                    return;
+                                }
+
+                                ui.vertical(|ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.heading("Action Editor");
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                if ui
+                                                    .button("▾")
+                                                    .on_hover_text("Collapse")
+                                                    .clicked()
+                                                {
+                                                    self.action_editor_open = false;
+                                                }
+                                            },
+                                        );
+                                    });
+                                    ui.add_space(6.0);
+
+                                    egui::ScrollArea::vertical().show(ui, |ui| {
+                                        self.draw_action_editor_contents(
+                                            ui,
+                                            ctx,
+                                            device,
+                                            snapshot,
+                                            &selected_profile,
+                                            &slot,
+                                        );
+                                    });
+                                });
                             });
-                        });
                     });
             }
         }
@@ -3153,10 +3319,11 @@ impl eframe::App for RiverDeckApp {
                                         selected,
                                         drag_action.as_ref(),
                                     );
-                                    if resp.clicked() {
+                                    if resp.double_clicked() {
                                         self.selected_slot = Some(slot);
-                                        // Collapsed by default on selection.
-                                        self.action_editor_open = false;
+                                        self.action_editor_open = true;
+                                    } else if resp.clicked() {
+                                        self.selected_slot = Some(slot);
                                     }
                                 }
                             });
@@ -3198,10 +3365,11 @@ impl eframe::App for RiverDeckApp {
                                     selected,
                                     drag_action.as_ref(),
                                 );
-                                if resp.clicked() {
+                                if resp.double_clicked() {
                                     self.selected_slot = Some(slot);
-                                    // Collapsed by default on selection.
-                                    self.action_editor_open = false;
+                                    self.action_editor_open = true;
+                                } else if resp.clicked() {
+                                    self.selected_slot = Some(slot);
                                 }
                             }
                         });

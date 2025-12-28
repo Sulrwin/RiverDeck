@@ -3,8 +3,8 @@
 //! This crate is extracted from the former Tauri backend to allow multiple frontends
 //! (egui main UI, embedded property inspector webviews, etc.) without a hard dependency on Tauri.
 
-pub mod application_watcher;
 pub mod animation;
+pub mod application_watcher;
 pub mod elgato;
 pub mod events;
 pub mod lifecycle;

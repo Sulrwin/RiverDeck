@@ -18,6 +18,20 @@
 		{
 			"type": "lldb",
 			"request": "launch",
+			"name": "Show existing (egui)",
+			"cargo": {
+				"args": [
+					"run",
+					"-p",
+					"riverdeck-egui",
+					"--",
+					"--show"
+				]
+			}
+		},
+		{
+			"type": "lldb",
+			"request": "launch",
 			"name": "Debug (pi helper)",
 			"cargo": {
 				"args": [

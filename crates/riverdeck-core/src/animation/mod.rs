@@ -55,7 +55,8 @@ struct AnimationRegistry {
     generation: HashMap<AnimationKey, u64>,
 }
 
-static REGISTRY: Lazy<Mutex<AnimationRegistry>> = Lazy::new(|| Mutex::new(AnimationRegistry::default()));
+static REGISTRY: Lazy<Mutex<AnimationRegistry>> =
+    Lazy::new(|| Mutex::new(AnimationRegistry::default()));
 
 static GIF_CACHE: Lazy<Mutex<HashMap<String, Arc<Vec<PreparedFrame>>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
@@ -130,10 +131,10 @@ pub async fn decode_gif_cached(
     let decoded = Arc::new(decode_gif(&bytes)?);
     let mut cache = GIF_CACHE.lock().await;
     // Simple bounded cache eviction: if over capacity, drop an arbitrary (oldest-unknown) entry.
-    if cache.len() >= MAX_CACHE_ENTRIES {
-        if let Some(k) = cache.keys().next().cloned() {
-            cache.remove(&k);
-        }
+    if cache.len() >= MAX_CACHE_ENTRIES
+        && let Some(k) = cache.keys().next().cloned()
+    {
+        cache.remove(&k);
     }
     cache.insert(cache_key, decoded.clone());
     Ok(decoded)
@@ -144,13 +145,17 @@ pub fn prepare_frames(
     frames: &[PreparedFrame],
     target: Target,
     overlays: Option<&[(String, crate::shared::TextPlacement)]>,
-    overlay_fn: Option<fn(image::DynamicImage, &str, crate::shared::TextPlacement) -> image::DynamicImage>,
+    overlay_fn: Option<
+        fn(image::DynamicImage, &str, crate::shared::TextPlacement) -> image::DynamicImage,
+    >,
 ) -> Vec<PreparedFrame> {
     let mut out: Vec<PreparedFrame> = Vec::with_capacity(frames.len());
     for f in frames {
         let mut f = f.clone();
         let mut img = match target.resize_mode {
-            ResizeMode::Exact => f.image.resize_exact(target.width, target.height, target.filter),
+            ResizeMode::Exact => f
+                .image
+                .resize_exact(target.width, target.height, target.filter),
             ResizeMode::Fit => f.image.resize(target.width, target.height, target.filter),
         };
 
@@ -167,5 +172,3 @@ pub fn prepare_frames(
     }
     out
 }
-
-
