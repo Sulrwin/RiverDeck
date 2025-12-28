@@ -2,6 +2,8 @@ use crate::events::outbound::{encoder, keypad};
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use elgato_streamdeck::{
@@ -12,11 +14,211 @@ use elgato_streamdeck::{
 use font8x8::UnicodeFonts;
 use image::{Rgba, RgbaImage};
 use once_cell::sync::Lazy;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio::time::sleep;
 
 static ELGATO_DEVICES: Lazy<RwLock<HashMap<String, AsyncStreamDeck>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
+
+#[derive(Clone)]
+enum PlusLayer {
+    None,
+    Static(image::DynamicImage),
+    Animated {
+        frames: Vec<crate::animation::PreparedFrame>,
+        idx: usize,
+        next_at: Instant,
+    },
+}
+
+impl PlusLayer {
+    fn is_animated(&self) -> bool {
+        matches!(self, PlusLayer::Animated { .. })
+    }
+
+    fn current_image(&self) -> image::DynamicImage {
+        match self {
+            PlusLayer::None => image::DynamicImage::ImageRgba8(RgbaImage::new(1, 1)),
+            PlusLayer::Static(img) => img.clone(),
+            PlusLayer::Animated { frames, idx, .. } => {
+                frames.get(*idx % frames.len()).map(|f| f.image.clone()).unwrap_or_else(|| {
+                    image::DynamicImage::ImageRgba8(RgbaImage::new(1, 1))
+                })
+            }
+        }
+    }
+}
+
+struct PlusDeviceState {
+    generation: u64,
+    background: PlusLayer,      // 800x100
+    dials: Vec<PlusLayer>,      // per encoder, each 72x72 (or None)
+    task_running: bool,
+}
+
+static PLUS_STATE: Lazy<RwLock<HashMap<String, Arc<Mutex<PlusDeviceState>>>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+
+async fn plus_state_for_device(device_id: &str, encoders: usize) -> Arc<Mutex<PlusDeviceState>> {
+    if let Some(st) = PLUS_STATE.read().await.get(device_id) {
+        return st.clone();
+    }
+    let mut map = PLUS_STATE.write().await;
+    map.entry(device_id.to_owned()).or_insert_with(|| {
+        Arc::new(Mutex::new(PlusDeviceState {
+            generation: 1,
+            background: PlusLayer::None,
+            dials: vec![PlusLayer::None; encoders],
+            task_running: false,
+        }))
+    })
+    .clone()
+}
+
+fn plus_bump_generation(state: &mut PlusDeviceState) -> u64 {
+    state.generation = state.generation.wrapping_add(1).max(1);
+    // Force re-spawn of the render task for the new generation.
+    state.task_running = false;
+    state.generation
+}
+
+fn plus_composite_frame(
+    bg: &PlusLayer,
+    dials: &[(u8, image::DynamicImage)],
+) -> image::DynamicImage {
+    // Compose into a single RGBA image then rely on elgato-streamdeck conversion.
+    let mut base = match bg {
+        PlusLayer::None => RgbaImage::from_pixel(800, 100, Rgba([0, 0, 0, 255])),
+        _ => bg.current_image().resize_exact(800, 100, image::imageops::FilterType::Nearest).to_rgba8(),
+    };
+
+    for (dial, icon) in dials {
+        let icon = icon
+            .resize_exact(72, 72, image::imageops::FilterType::Nearest)
+            .to_rgba8();
+        let ox = (*dial as u32) * 200 + 64;
+        let oy = 14u32;
+        for y in 0..icon.height() {
+            for x in 0..icon.width() {
+                let dst_x = ox + x;
+                let dst_y = oy + y;
+                if dst_x < base.width() && dst_y < base.height() {
+                    let src = *icon.get_pixel(x, y);
+                    if src[3] != 0 {
+                        let dst = base.get_pixel_mut(dst_x, dst_y);
+                        blend_pixel(dst, src);
+                    }
+                }
+            }
+        }
+    }
+
+    image::DynamicImage::ImageRgba8(base)
+}
+
+async fn plus_render_once(device_id: &str, state: Arc<Mutex<PlusDeviceState>>) {
+    let device = {
+        let devices = ELGATO_DEVICES.read().await;
+        devices.get(device_id).cloned()
+    };
+    let Some(device) = device else { return };
+    if device.kind() != Kind::Plus {
+        return;
+    }
+
+    // Snapshot current images without holding the state lock across awaits.
+    let (bg, dial_imgs) = {
+        let st = state.lock().await;
+        let bg = st.background.clone();
+        let mut out: Vec<(u8, image::DynamicImage)> = Vec::new();
+        for (idx, layer) in st.dials.iter().enumerate() {
+            match layer {
+                PlusLayer::None => {}
+                _ => out.push((idx as u8, layer.current_image())),
+            }
+        }
+        (bg, out)
+    };
+
+    let composed = plus_composite_frame(&bg, &dial_imgs);
+    let fmt = device.kind().lcd_image_format().unwrap();
+    if let Ok(buf) = convert_image_with_format_async(fmt, composed) {
+        let _ = device.write_lcd_fill(&buf).await;
+        let _ = device.flush().await;
+    }
+}
+
+async fn plus_ensure_task(device_id: String, state: Arc<Mutex<PlusDeviceState>>, generation: u64) {
+    // Avoid spawning multiple tasks.
+    {
+        let mut st = state.lock().await;
+        if st.task_running && st.generation == generation {
+            return;
+        }
+        st.task_running = true;
+    }
+
+    tokio::spawn(async move {
+        loop {
+            // Snapshot current state and also advance any due animations.
+            let (still_current, any_animated, sleep_for) = {
+                let mut st = state.lock().await;
+                if st.generation != generation {
+                    st.task_running = false;
+                    (false, false, Duration::from_millis(0))
+                } else {
+                    let now = Instant::now();
+                    let mut next: Option<Instant> = None;
+
+                    let mut bump_layer = |layer: &mut PlusLayer| {
+                        let PlusLayer::Animated { frames, idx, next_at } = layer else {
+                            return;
+                        };
+                        if frames.is_empty() {
+                            return;
+                        }
+                        if *next_at <= now {
+                            *idx = idx.wrapping_add(1) % frames.len();
+                            *next_at = now + frames[*idx].delay;
+                        }
+                        next = Some(next.map(|n| n.min(*next_at)).unwrap_or(*next_at));
+                    };
+
+                    bump_layer(&mut st.background);
+                    for dial in st.dials.iter_mut() {
+                        bump_layer(dial);
+                    }
+
+                    let any = st.background.is_animated() || st.dials.iter().any(|d| d.is_animated());
+                    let sleep_for = if any {
+                        next.and_then(|t| t.checked_duration_since(Instant::now()))
+                            .unwrap_or_else(|| Duration::from_millis(5))
+                            .clamp(Duration::from_millis(1), Duration::from_millis(200))
+                    } else {
+                        Duration::from_millis(0)
+                    };
+                    (true, any, sleep_for)
+                }
+            };
+
+            if !still_current {
+                break;
+            }
+
+            // Render current frame (background + dial overlays).
+            plus_render_once(&device_id, state.clone()).await;
+
+            if !any_animated {
+                // No ongoing animation; shut down.
+                let mut st = state.lock().await;
+                st.task_running = false;
+                break;
+            }
+
+            sleep(sleep_for).await;
+        }
+    });
+}
 
 fn blend_pixel(dst: &mut Rgba<u8>, src: Rgba<u8>) {
     let sa = src[3] as f32 / 255.0;
