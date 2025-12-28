@@ -1059,7 +1059,17 @@ async fn init(device: AsyncStreamDeck, device_id: String) {
                 DeviceStateUpdate::EncoderUp(dial) => {
                     encoder::dial_press(&device_id, "dialUp", dial).await
                 }
-                _ => Ok(()),
+                DeviceStateUpdate::TouchScreenPress(x, y) => {
+                    encoder::touch_tap(&device_id, x, y, false).await
+                }
+                DeviceStateUpdate::TouchScreenLongPress(x, y) => {
+                    encoder::touch_tap(&device_id, x, y, true).await
+                }
+                // Touch points are low-level segment state changes on devices like Stream Deck+.
+                // The official Stream Deck SDK surface is the `touchTap` event (with `hold`),
+                // which we emit from the higher-level TouchScreenPress/LongPress updates above.
+                DeviceStateUpdate::TouchPointDown(_) | DeviceStateUpdate::TouchPointUp(_) => Ok(()),
+                DeviceStateUpdate::TouchScreenSwipe(_, _) => Ok(()),
             } {
                 Ok(_) => (),
                 Err(error) => log::warn!("Failed to process device event {update:?}: {error}"),

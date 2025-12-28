@@ -1022,7 +1022,11 @@ impl RiverDeckApp {
         }
 
         for cand in candidates {
-            if !(cand.ends_with(".png") || cand.ends_with(".jpg") || cand.ends_with(".jpeg")) {
+            if !(cand.ends_with(".png")
+                || cand.ends_with(".jpg")
+                || cand.ends_with(".jpeg")
+                || cand.ends_with(".gif"))
+            {
                 continue;
             }
 
@@ -1158,7 +1162,7 @@ impl RiverDeckApp {
                         let (tx, rx) = mpsc::channel();
                         std::thread::spawn(move || {
                             let picked = rfd::FileDialog::new()
-                                .add_filter("Image", &["png", "jpg", "jpeg"])
+                                .add_filter("Image", &["png", "jpg", "jpeg", "gif"])
                                 .pick_file();
                             let _ = tx.send(picked);
                         });
