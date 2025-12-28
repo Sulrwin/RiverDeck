@@ -18,11 +18,13 @@ RiverDeck is a desktop application for using stream controller devices like the 
 
 Only Elgato hardware is officially supported, but plugins are available for support for other hardware vendors.
 
-RiverDeck is made by Ethan Wright (`sulrwin`) and is forked from OpenDeck. Thanks to OpenDeck and its contributors for the original work.
+RiverDeck is made by Ethan Wright (`sulrwin`) and is forked from OpenDeck. A lot of fundimental components and systems have been changed from OpenDeck, all that would have been impossible without OpenDeck. Thanks to OpenDeck and its contributors for the original work.
 
 Special thanks go to the developers of the [elgato-streamdeck](https://github.com/OpenActionAPI/rust-elgato-streamdeck) Rust library, [Wine](https://www.winehq.org/), and [Phosphor Icons](https://phosphoricons.com/).
 
 ### Why use RiverDeck?
+
+- **OpenDeck?**: RiverDeck brings a more modern and sleek interface while implementing a lot of features not found in OpenDeck but can be found in the official software. Along with a few unique features not found in the official software with plans for even more!
 
 - **Stream Deck plugins**: RiverDeck supports the majority of the Stream Deck plugins that users of the Elgato ecosystem are already familiar with, unlike other third-party softwares which are much more limited (e.g. streamdeck-ui, StreamController, Boatswain etc).
 - **Cross-platform**: RiverDeck supports Linux alongside Windows and macOS. macOS users also benefit from switching from the first-party Elgato software as RiverDeck can run plugins only built for Windows on Linux and macOS thanks to Wine. Additionally, profile files are easily moveable between platforms with no changes to them necessary.
@@ -123,4 +125,3 @@ RiverDeck is licensed under the GNU General Public License version 3.0 or later.
 ## Showcase
 
 ![Main menu](.github/readme/mainmenu-plugins-profiles.png)
-![Multi action](.github/readme/multiaction.png)

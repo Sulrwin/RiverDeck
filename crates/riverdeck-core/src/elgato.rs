@@ -40,19 +40,6 @@ fn blend_pixel(dst: &mut Rgba<u8>, src: Rgba<u8>) {
     dst[3] = (out_a * 255.0).round().clamp(0.0, 255.0) as u8;
 }
 
-fn draw_rect(img: &mut RgbaImage, x: u32, y: u32, w: u32, h: u32, color: Rgba<u8>) {
-    let iw = img.width();
-    let ih = img.height();
-    let x1 = (x + w).min(iw);
-    let y1 = (y + h).min(ih);
-    for yy in y..y1 {
-        for xx in x..x1 {
-            let p = img.get_pixel_mut(xx, yy);
-            blend_pixel(p, color);
-        }
-    }
-}
-
 fn draw_text_8x8(img: &mut RgbaImage, x: u32, y: u32, text: &str, scale: u32, color: Rgba<u8>) {
     let scale = scale.max(1);
     let mut cursor_x = x;
@@ -64,7 +51,8 @@ fn draw_text_8x8(img: &mut RgbaImage, x: u32, y: u32, text: &str, scale: u32, co
         for (row, bits) in glyph.iter().enumerate() {
             for col in 0..8 {
                 if (bits >> col) & 1 == 1 {
-                    let px = cursor_x + (7 - col) as u32 * scale;
+                    // `font8x8` stores glyph bits LSB-first (col 0 = left). Do not mirror.
+                    let px = cursor_x + (col as u32) * scale;
                     let py = y + row as u32 * scale;
                     for dy in 0..scale {
                         for dx in 0..scale {
@@ -97,48 +85,172 @@ fn overlay_label(
         return image::DynamicImage::ImageRgba8(img);
     }
 
-    // Choose a scale that stays readable across common Stream Deck sizes.
+    // Auto-scale + wrap so text always fits.
     let min_side = w.min(h).max(1);
-    let scale = (min_side / 72).clamp(1, 3);
+    let max_scale = if min_side >= 96 {
+        3
+    } else if min_side >= 72 {
+        2
+    } else {
+        1
+    };
 
-    // Truncate to fit (horizontal).
-    let max_w = w.saturating_sub(8);
-    let char_w = 8 * scale + scale;
-    let mut text = label.to_owned();
-    if (text.chars().count() as u32) * char_w > max_w && char_w > 0 {
-        let max_chars = (max_w / char_w).saturating_sub(3) as usize;
-        if max_chars > 0 {
-            text = text.chars().take(max_chars).collect::<String>() + "...";
-        } else {
-            text = "...".to_owned();
+    let max_w = w.saturating_sub(8).max(1);
+    let max_h = match placement {
+        // Reserve roughly half the key for the label strip so icons still have room.
+        crate::shared::TextPlacement::Top | crate::shared::TextPlacement::Bottom => {
+            (h / 2).saturating_sub(4).max(8)
+        }
+        crate::shared::TextPlacement::Left | crate::shared::TextPlacement::Right => {
+            h.saturating_sub(8).max(8)
+        }
+    };
+
+    let ellipsize = |s: &str, max_chars: usize| -> String {
+        if max_chars == 0 {
+            return String::new();
+        }
+        let chars: Vec<char> = s.chars().collect();
+        if chars.len() <= max_chars {
+            return s.to_owned();
+        }
+        if max_chars <= 3 {
+            return "...".chars().take(max_chars).collect();
+        }
+        let keep = max_chars.saturating_sub(3);
+        chars.into_iter().take(keep).collect::<String>() + "..."
+    };
+
+    let wrap_words = |text: &str, max_cols: usize, max_lines: usize| -> Vec<String> {
+        if max_cols == 0 || max_lines == 0 {
+            return vec![];
+        }
+        let mut lines: Vec<String> = Vec::new();
+        let mut current = String::new();
+
+        let push_line = |line: String, lines: &mut Vec<String>| {
+            if !line.trim().is_empty() {
+                lines.push(line);
+            }
+        };
+
+        // Split on whitespace, keep words (no punctuation awareness needed for this tiny font).
+        for word in text.split_whitespace() {
+            if lines.len() >= max_lines {
+                break;
+            }
+            // If the current line is empty, try to place the word (or a chunk of it).
+            let sep = if current.is_empty() { "" } else { " " };
+            let candidate = format!("{current}{sep}{word}");
+            if candidate.chars().count() <= max_cols {
+                current = candidate;
+                continue;
+            }
+
+            // Commit current line if it has content.
+            if !current.is_empty() {
+                push_line(std::mem::take(&mut current), &mut lines);
+                if lines.len() >= max_lines {
+                    break;
+                }
+            }
+
+            // Word longer than max_cols: hard-break.
+            let mut remaining = word;
+            while !remaining.is_empty() && lines.len() < max_lines {
+                let chunk: String = remaining.chars().take(max_cols).collect();
+                let taken = chunk.chars().count();
+                push_line(chunk, &mut lines);
+                remaining = &remaining[remaining
+                    .char_indices()
+                    .nth(taken)
+                    .map(|(i, _)| i)
+                    .unwrap_or(remaining.len())..];
+            }
+        }
+
+        if lines.len() < max_lines && !current.is_empty() {
+            push_line(current, &mut lines);
+        }
+
+        lines
+    };
+
+    let mut chosen_scale = 1u32;
+    let mut chosen_lines: Vec<String> = vec![label.to_owned()];
+
+    for scale in (1..=max_scale).rev() {
+        let scale = scale as u32;
+        let char_w = 8 * scale + scale;
+        let line_h = 8 * scale;
+
+        // For left/right placements, we keep a single horizontal line (it will be rotated later).
+        let max_lines = match placement {
+            crate::shared::TextPlacement::Left | crate::shared::TextPlacement::Right => 1usize,
+            _ => {
+                // Prefer up to 2 lines, but fall back to 1 if height is tight.
+                if max_h >= (line_h * 2 + scale) { 2 } else { 1 }
+            }
+        };
+
+        let max_cols = match placement {
+            crate::shared::TextPlacement::Left | crate::shared::TextPlacement::Right => {
+                // After rotation, width becomes height. Constrain by max_h.
+                (max_h / char_w).max(1) as usize
+            }
+            _ => (max_w / char_w).max(1) as usize,
+        };
+
+        let mut lines = wrap_words(label, max_cols, max_lines);
+        if lines.is_empty() {
+            lines = vec![String::new()];
+        }
+
+        // Ellipsize if we had to truncate lines.
+        if lines.len() == max_lines {
+            let last = lines.last().cloned().unwrap_or_default();
+            let last = ellipsize(&last, max_cols);
+            if let Some(last_mut) = lines.last_mut() {
+                *last_mut = last;
+            }
+        }
+
+        let max_line_chars = lines
+            .iter()
+            .map(|l| l.chars().count() as u32)
+            .max()
+            .unwrap_or(0);
+        let text_w = max_line_chars * char_w;
+        let text_h = (lines.len() as u32) * line_h + (lines.len().saturating_sub(1) as u32) * scale;
+
+        if text_w <= max_w && text_h <= max_h {
+            chosen_scale = scale;
+            chosen_lines = lines;
+            break;
         }
     }
 
-    let text_w = (text.chars().count() as u32) * char_w;
-    let text_h = 8 * scale;
+    let scale = chosen_scale;
+    let char_w = 8 * scale + scale;
+    let line_h = 8 * scale;
+    let line_step = 8 * scale + scale;
+    let max_line_chars = chosen_lines
+        .iter()
+        .map(|l| l.chars().count() as u32)
+        .max()
+        .unwrap_or(0);
+    let text_w = (max_line_chars * char_w).max(1);
+    let text_h = ((chosen_lines.len() as u32) * line_h
+        + (chosen_lines.len().saturating_sub(1) as u32) * scale)
+        .max(1);
 
-    let mut text_img = RgbaImage::new(text_w.max(1), text_h.max(1));
-    // Background strip for contrast.
-    let bg_w = text_img.width();
-    let bg_h = text_img.height();
-    draw_rect(&mut text_img, 0, 0, bg_w, bg_h, Rgba([0, 0, 0, 140]));
-    // Shadow + text.
-    draw_text_8x8(
-        &mut text_img,
-        scale,
-        scale,
-        &text,
-        scale,
-        Rgba([0, 0, 0, 220]),
-    );
-    draw_text_8x8(
-        &mut text_img,
-        0,
-        0,
-        &text,
-        scale,
-        Rgba([255, 255, 255, 255]),
-    );
+    let mut text_img = RgbaImage::new(text_w, text_h);
+    for (i, line) in chosen_lines.iter().enumerate() {
+        let y = (i as u32) * line_step;
+        // Shadow + text (no background strip; keep text readable with subtle shadow).
+        draw_text_8x8(&mut text_img, 1, y + 1, line, scale, Rgba([0, 0, 0, 200]));
+        draw_text_8x8(&mut text_img, 0, y, line, scale, Rgba([255, 255, 255, 255]));
+    }
 
     let (overlay, ox, oy) = match placement {
         crate::shared::TextPlacement::Top => {

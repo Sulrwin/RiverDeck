@@ -6,7 +6,9 @@
 pub mod application_watcher;
 pub mod elgato;
 pub mod events;
+pub mod lifecycle;
 pub mod plugins;
+pub mod runtime_processes;
 pub mod shared;
 pub mod store;
 pub mod zip_extract;

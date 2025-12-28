@@ -4891,6 +4891,7 @@ dependencies = [
  "getrandom 0.2.16",
  "image",
  "json-patch",
+ "libc",
  "log",
  "once_cell",
  "open",

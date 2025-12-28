@@ -133,6 +133,10 @@ fn main() -> anyhow::Result<()> {
     // Record our PID into the lock file (best-effort).
     let _ = write_lock_pid(&mut lock_file);
 
+    // If a previous instance was force-killed, it may have left plugin/PI subprocesses behind.
+    // Reap those before we start new servers or spawn new plugins.
+    riverdeck_core::lifecycle::startup_cleanup();
+
     let (ui_tx, _ui_rx) = broadcast::channel(256);
     ui::init(ui_tx);
 
@@ -142,6 +146,7 @@ fn main() -> anyhow::Result<()> {
             .thread_name("riverdeck-core")
             .build()?,
     );
+    start_signal_handlers(runtime.clone());
     start_core_background(runtime.clone());
 
     let update_info: Arc<Mutex<Option<UpdateInfo>>> = Arc::new(Mutex::new(None));
@@ -181,6 +186,34 @@ fn main() -> anyhow::Result<()> {
     .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     Ok(())
 }
+
+#[cfg(unix)]
+fn start_signal_handlers(runtime: Arc<Runtime>) {
+    runtime.spawn(async move {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let mut sigint = match signal(SignalKind::interrupt()) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+
+        tokio::select! {
+            _ = sigterm.recv() => {},
+            _ = sigint.recv() => {},
+        }
+
+        log::warn!("Received termination signal; shutting down RiverDeck");
+        riverdeck_core::lifecycle::shutdown_all().await;
+        std::process::exit(0);
+    });
+}
+
+#[cfg(not(unix))]
+fn start_signal_handlers(_runtime: Arc<Runtime>) {}
 
 fn load_window_icon() -> anyhow::Result<egui::IconData> {
     let (rgba, width, height) = load_embedded_logo_rgba()?;
@@ -406,10 +439,27 @@ struct RiverDeckApp {
     action_search: String,
     texture_cache: HashMap<String, CachedTexture>,
 
+    // Cached async data to avoid blocking the UI thread during paint.
+    categories_cache: Option<Vec<(String, shared::Category)>>,
+    categories_inflight: bool,
+    categories_rx: Option<mpsc::Receiver<std::collections::HashMap<String, shared::Category>>>,
+
+    plugins_cache: Option<Vec<riverdeck_core::api::plugins::PluginInfo>>,
+    plugins_inflight: bool,
+    plugins_rx: Option<mpsc::Receiver<Vec<riverdeck_core::api::plugins::PluginInfo>>>,
+
+    pages_cache: HashMap<(String, String), Vec<String>>, // (device_id, profile_id) -> pages
+    pages_inflight: Option<(String, String)>,
+    pages_rx: Option<PagesRx>,
+
     action_controller_filter: String,
     drag_payload: Option<shared::Action>,
     drag_hover_slot: Option<SelectedSlot>,
     drag_hover_valid: bool,
+
+    // Bottom action editor panel UX (collapsed tab + expandable sheet).
+    #[allow(dead_code)]
+    action_editor_open: bool,
 
     show_update_details: bool,
     show_settings: bool,
@@ -441,6 +491,10 @@ struct RiverDeckApp {
     pending_icon_pick: Option<(mpsc::Receiver<Option<PathBuf>>, shared::ActionContext, u16)>,
     pending_screen_bg_pick: Option<(mpsc::Receiver<Option<PathBuf>>, String, String)>, // (rx, device_id, profile_id)
 }
+
+type PagesKey = (String, String);
+type PagesRxPayload = (PagesKey, Vec<String>);
+type PagesRx = mpsc::Receiver<PagesRxPayload>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SelectedSlot {
@@ -502,10 +556,20 @@ impl RiverDeckApp {
             button_show_action_name: true,
             action_search: String::new(),
             texture_cache: HashMap::new(),
+            categories_cache: None,
+            categories_inflight: false,
+            categories_rx: None,
+            plugins_cache: None,
+            plugins_inflight: false,
+            plugins_rx: None,
+            pages_cache: HashMap::new(),
+            pages_inflight: None,
+            pages_rx: None,
             action_controller_filter: "Keypad".to_owned(),
             drag_payload: None,
             drag_hover_slot: None,
             drag_hover_valid: false,
+            action_editor_open: false,
             show_update_details: false,
             show_settings: false,
             settings_autostart: false,
@@ -525,6 +589,273 @@ impl RiverDeckApp {
             pending_plugin_install_result: None,
             pending_icon_pick: None,
             pending_screen_bg_pick: None,
+        }
+    }
+
+    #[allow(dead_code)]
+    fn draw_action_editor_contents(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        device: &shared::DeviceInfo,
+        snapshot: &ProfileSnapshot,
+        selected_profile: &str,
+        slot: &SelectedSlot,
+    ) {
+        let instance = match &slot.controller[..] {
+            "Encoder" => snapshot
+                .sliders
+                .get(slot.position as usize)
+                .and_then(|v| v.as_ref()),
+            _ => snapshot
+                .keys
+                .get(slot.position as usize)
+                .and_then(|v| v.as_ref()),
+        };
+
+        egui::Frame::group(ui.style())
+            .corner_radius(egui::CornerRadius::same(12))
+            .show(ui, |ui| {
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 8.0;
+
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!("{} {}", slot.controller, slot.position))
+                                .size(14.0)
+                                .strong(),
+                        );
+                        ui.add_space(6.0);
+                        if ui
+                            .add_enabled(instance.is_some(), egui::Button::new("Clear"))
+                            .on_hover_text("Remove the assigned action from this slot")
+                            .clicked()
+                        {
+                            let ctx_to_clear = shared::Context {
+                                device: device.id.clone(),
+                                profile: selected_profile.to_owned(),
+                                page: snapshot.page_id.clone(),
+                                controller: slot.controller.clone(),
+                                position: slot.position,
+                            };
+                            let _ = self.runtime.block_on(async {
+                                riverdeck_core::api::instances::remove_instance(
+                                    shared::ActionContext::from_context(ctx_to_clear, 0),
+                                )
+                                .await
+                            });
+                        }
+                    });
+
+                    ui.horizontal(|ui| {
+                        if let Some(instance) = instance {
+                            let icon_size = egui::vec2(28.0, 28.0);
+                            let img = instance
+                                .states
+                                .get(instance.current_state as usize)
+                                .map(|s| s.image.trim())
+                                .filter(|s| !s.is_empty() && *s != "actionDefaultImage")
+                                .map(|s| s.to_owned())
+                                .unwrap_or_else(|| instance.action.icon.clone());
+                            if let Some(tex) = self.texture_for_path(ctx, &img) {
+                                ui.image((tex.id(), icon_size));
+                            } else {
+                                ui.allocate_exact_size(icon_size, egui::Sense::hover());
+                            }
+                            ui.label(instance.action.name.trim());
+                        } else {
+                            ui.label(
+                                egui::RichText::new("No action assigned")
+                                    .color(ui.visuals().weak_text_color()),
+                            );
+                        }
+                    });
+
+                    if let Some(instance) = instance {
+                        // Keep editor state stable while switching slots.
+                        let needs_reset = match self.button_label_context.as_ref() {
+                            None => true,
+                            Some(c) => c != &instance.context,
+                        };
+                        if needs_reset {
+                            self.button_label_context = Some(instance.context.clone());
+                            let st = instance.states.get(instance.current_state as usize);
+                            self.button_label_input = st
+                                .map(|s| s.text.clone())
+                                .unwrap_or_else(|| instance.action.name.clone());
+                            self.button_label_placement = st
+                                .map(|s| s.text_placement)
+                                .unwrap_or(shared::TextPlacement::Bottom);
+                            self.button_show_title = st.map(|s| s.show).unwrap_or(true);
+                            self.button_show_action_name =
+                                st.map(|s| s.show_action_name).unwrap_or(true);
+                        }
+
+                        ui.add_space(6.0);
+                        ui.label("Button title (dynamic):");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.button_label_input)
+                                .hint_text("Leave empty for clean"),
+                        );
+
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut self.button_show_action_name, "Show action name");
+                            ui.checkbox(&mut self.button_show_title, "Show title");
+                        });
+
+                        ui.horizontal(|ui| {
+                            ui.label("Placement:");
+                            let placement_locked =
+                                self.button_show_title && self.button_show_action_name;
+                            ui.add_enabled_ui(!placement_locked, |ui| {
+                                egui::ComboBox::from_id_salt("button_label_placement")
+                                    .selected_text(match self.button_label_placement {
+                                        shared::TextPlacement::Top => "Top",
+                                        shared::TextPlacement::Bottom => "Bottom",
+                                        shared::TextPlacement::Left => "Left",
+                                        shared::TextPlacement::Right => "Right",
+                                    })
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(
+                                            &mut self.button_label_placement,
+                                            shared::TextPlacement::Top,
+                                            "Top",
+                                        );
+                                        ui.selectable_value(
+                                            &mut self.button_label_placement,
+                                            shared::TextPlacement::Bottom,
+                                            "Bottom",
+                                        );
+                                        ui.selectable_value(
+                                            &mut self.button_label_placement,
+                                            shared::TextPlacement::Left,
+                                            "Left",
+                                        );
+                                        ui.selectable_value(
+                                            &mut self.button_label_placement,
+                                            shared::TextPlacement::Right,
+                                            "Right",
+                                        );
+                                    });
+                            });
+                            if placement_locked {
+                                ui.label(
+                                    egui::RichText::new("Auto (Top/Bottom)")
+                                        .small()
+                                        .color(ui.visuals().weak_text_color()),
+                                );
+                            }
+                            // Placement changes are staged; saved via the explicit Save button below.
+                        });
+
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Save").clicked()
+                                && let Some(ctx_to_set) = self.button_label_context.clone()
+                            {
+                                let text = self.button_label_input.clone();
+                                let placement = self.button_label_placement;
+                                let show_title = self.button_show_title;
+                                let show_action_name = self.button_show_action_name;
+                                self.runtime.spawn(async move {
+                                    let _ = riverdeck_core::api::instances::set_button_label(
+                                        ctx_to_set.clone(),
+                                        text,
+                                    )
+                                    .await;
+                                    let _ = riverdeck_core::api::instances::set_button_label_placement(
+                                        ctx_to_set.clone(),
+                                        placement,
+                                    )
+                                    .await;
+                                    let _ = riverdeck_core::api::instances::set_button_show_title(
+                                        ctx_to_set.clone(),
+                                        show_title,
+                                    )
+                                    .await;
+                                    let _ = riverdeck_core::api::instances::set_button_show_action_name(
+                                        ctx_to_set,
+                                        show_action_name,
+                                    )
+                                    .await;
+                                });
+                            }
+                            ui.label(
+                                egui::RichText::new("Tip: empty label hides text")
+                                    .small()
+                                    .color(ui.visuals().weak_text_color()),
+                            );
+                        });
+
+                        ui.separator();
+
+                        let has_pi = !instance.action.property_inspector.trim().is_empty();
+                        let open_for_this = self
+                            .pi_for_context
+                            .as_ref()
+                            .is_some_and(|c| c == &instance.context)
+                            && self.pi_child.is_some();
+
+                        ui.horizontal(|ui| {
+                            // Reuse existing PI controls from the original panel.
+                            if ui.button("✕").on_hover_text("Remove custom icon").clicked() {
+                                let ctx_to_clear = instance.context.clone();
+                                let state = instance.current_state;
+                                self.runtime.spawn(async move {
+                                    let _ = riverdeck_core::api::instances::clear_custom_icon(
+                                        ctx_to_clear,
+                                        Some(state),
+                                    )
+                                    .await;
+                                });
+                            }
+                            if ui
+                                .button("Upload")
+                                .on_hover_text("Set custom icon")
+                                .clicked()
+                                && self.pending_icon_pick.is_none()
+                            {
+                                let (tx, rx) = mpsc::channel();
+                                std::thread::spawn(move || {
+                                    let picked = rfd::FileDialog::new()
+                                        .add_filter("Image", &["png", "jpg", "jpeg"])
+                                        .pick_file();
+                                    let _ = tx.send(picked);
+                                });
+                                self.pending_icon_pick =
+                                    Some((rx, instance.context.clone(), instance.current_state));
+                            }
+
+                            if ui
+                                .add_enabled(has_pi && !open_for_this, egui::Button::new("Open PI"))
+                                .clicked()
+                            {
+                                let dock = Self::compute_pi_dock_geometry(ctx, 420);
+                                if let Err(err) =
+                                    self.open_property_inspector_for_instance(device, instance, dock)
+                                {
+                                    self.pi_last_error = Some(err.to_string());
+                                }
+                            }
+                            if ui
+                                .add_enabled(open_for_this, egui::Button::new("Close PI"))
+                                .clicked()
+                            {
+                                self.close_pi();
+                            }
+
+                            if !has_pi {
+                                ui.label("This action has no Property Inspector.");
+                            } else if open_for_this {
+                                ui.label("PI open.");
+                            }
+                        });
+                    }
+                });
+            });
+
+        if let Some(err) = self.pi_last_error.as_ref() {
+            ui.colored_label(ui.visuals().error_fg_color, err);
         }
     }
 
@@ -560,6 +891,73 @@ impl RiverDeckApp {
         }
 
         None
+    }
+
+    fn ellipsize_preview(s: &str, max_chars: usize) -> String {
+        if max_chars == 0 {
+            return String::new();
+        }
+        let chars: Vec<char> = s.chars().collect();
+        if chars.len() <= max_chars {
+            return s.to_owned();
+        }
+        if max_chars <= 3 {
+            return "...".chars().take(max_chars).collect();
+        }
+        let keep = max_chars.saturating_sub(3);
+        chars.into_iter().take(keep).collect::<String>() + "..."
+    }
+
+    fn wrap_words_preview(text: &str, max_cols: usize, max_lines: usize) -> Vec<String> {
+        if max_cols == 0 || max_lines == 0 {
+            return vec![];
+        }
+        let mut lines: Vec<String> = Vec::new();
+        let mut current = String::new();
+
+        let push_line = |line: String, lines: &mut Vec<String>| {
+            if !line.trim().is_empty() {
+                lines.push(line);
+            }
+        };
+
+        for word in text.split_whitespace() {
+            if lines.len() >= max_lines {
+                break;
+            }
+            let sep = if current.is_empty() { "" } else { " " };
+            let candidate = format!("{current}{sep}{word}");
+            if candidate.chars().count() <= max_cols {
+                current = candidate;
+                continue;
+            }
+
+            if !current.is_empty() {
+                push_line(std::mem::take(&mut current), &mut lines);
+                if lines.len() >= max_lines {
+                    break;
+                }
+            }
+
+            // Hard-break long words.
+            let mut remaining = word;
+            while !remaining.is_empty() && lines.len() < max_lines {
+                let chunk: String = remaining.chars().take(max_cols).collect();
+                let taken = chunk.chars().count();
+                push_line(chunk, &mut lines);
+                remaining = &remaining[remaining
+                    .char_indices()
+                    .nth(taken)
+                    .map(|(i, _)| i)
+                    .unwrap_or(remaining.len())..];
+            }
+        }
+
+        if lines.len() < max_lines && !current.is_empty() {
+            push_line(current, &mut lines);
+        }
+
+        lines
     }
 
     fn texture_for_path(&mut self, ctx: &egui::Context, path: &str) -> Option<egui::TextureHandle> {
@@ -860,6 +1258,7 @@ impl RiverDeckApp {
 
     fn close_pi(&mut self) {
         if let Some(mut child) = self.pi_child.take() {
+            riverdeck_core::runtime_processes::unrecord_process(child.id());
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -868,6 +1267,7 @@ impl RiverDeckApp {
 
     fn close_marketplace(&mut self) {
         if let Some(mut child) = self.marketplace_child.take() {
+            riverdeck_core::runtime_processes::unrecord_process(child.id());
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -1177,9 +1577,7 @@ impl RiverDeckApp {
                 let show_title = st.show && !title.is_empty();
                 let show_action_name = st.show_action_name && !action_name.is_empty();
 
-                let font = egui::FontId::proportional(11.0);
-                let bg = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 150);
-                let fg = ui.visuals().text_color();
+                let fg = egui::Color32::WHITE;
 
                 // Helper macro to render text at a placement
                 macro_rules! render_text_at_placement {
@@ -1188,83 +1586,175 @@ impl RiverDeckApp {
                             shared::TextPlacement::Top => {
                                 let r = egui::Rect::from_min_max(
                                     rect.min + egui::vec2(4.0, 4.0),
-                                    egui::pos2(rect.max.x - 4.0, rect.min.y + 18.0),
+                                    egui::pos2(rect.max.x - 4.0, rect.min.y + 32.0),
                                 );
-                                painter.rect_filled(r, 4.0, bg);
-                                painter.text(r.center(), egui::Align2::CENTER_CENTER, $text, font.clone(), fg);
+                                let sizes = [11.0, 10.0, 9.0, 8.0, 7.0];
+                                for sz in sizes {
+                                    let font = egui::FontId::monospace(sz);
+                                    let char_w = (sz * 0.60).max(1.0);
+                                    let line_h = (sz + 2.0).max(1.0);
+                                    let max_cols =
+                                        ((r.width() - 6.0) / char_w).floor().max(1.0) as usize;
+                                    let max_lines =
+                                        ((r.height() - 6.0) / line_h).floor().max(1.0) as usize;
+                                    let max_lines = max_lines.min(2);
+                                    let mut lines = RiverDeckApp::wrap_words_preview(
+                                        $text, max_cols, max_lines,
+                                    );
+                                    if lines.len() == max_lines && max_lines > 0 {
+                                        if let Some(last) = lines.last_mut() {
+                                            *last = RiverDeckApp::ellipsize_preview(last, max_cols);
+                                        }
+                                    }
+                                    let t = lines.join("\n");
+                                    let center = r.center();
+                                    painter.text(
+                                        center + egui::vec2(1.0, 1.0),
+                                        egui::Align2::CENTER_CENTER,
+                                        t.clone(),
+                                        font.clone(),
+                                        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 200),
+                                    );
+                                    painter.text(center, egui::Align2::CENTER_CENTER, t, font, fg);
+                                    break;
+                                }
                             }
                             shared::TextPlacement::Bottom => {
                                 let r = egui::Rect::from_min_max(
-                                    egui::pos2(rect.min.x + 4.0, rect.max.y - 18.0),
+                                    egui::pos2(rect.min.x + 4.0, rect.max.y - 32.0),
                                     rect.max - egui::vec2(4.0, 4.0),
                                 );
-                                painter.rect_filled(r, 4.0, bg);
-                                painter.text(r.center(), egui::Align2::CENTER_CENTER, $text, font.clone(), fg);
+                                let sizes = [11.0, 10.0, 9.0, 8.0, 7.0];
+                                for sz in sizes {
+                                    let font = egui::FontId::monospace(sz);
+                                    let char_w = (sz * 0.60).max(1.0);
+                                    let line_h = (sz + 2.0).max(1.0);
+                                    let max_cols =
+                                        ((r.width() - 6.0) / char_w).floor().max(1.0) as usize;
+                                    let max_lines =
+                                        ((r.height() - 6.0) / line_h).floor().max(1.0) as usize;
+                                    let max_lines = max_lines.min(2);
+                                    let mut lines = RiverDeckApp::wrap_words_preview(
+                                        $text, max_cols, max_lines,
+                                    );
+                                    if lines.len() == max_lines && max_lines > 0 {
+                                        if let Some(last) = lines.last_mut() {
+                                            *last = RiverDeckApp::ellipsize_preview(last, max_cols);
+                                        }
+                                    }
+                                    let t = lines.join("\n");
+                                    let center = r.center();
+                                    painter.text(
+                                        center + egui::vec2(1.0, 1.0),
+                                        egui::Align2::CENTER_CENTER,
+                                        t.clone(),
+                                        font.clone(),
+                                        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 200),
+                                    );
+                                    painter.text(center, egui::Align2::CENTER_CENTER, t, font, fg);
+                                    break;
+                                }
                             }
                             shared::TextPlacement::Left => {
-                                let vertical = $text
-                                    .chars()
-                                    .take(10)
-                                    .map(|c| c.to_string())
-                                    .collect::<Vec<_>>()
-                                    .join("\n");
                                 let r = egui::Rect::from_min_max(
                                     rect.min + egui::vec2(4.0, 4.0),
                                     egui::pos2(rect.min.x + 18.0, rect.max.y - 4.0),
                                 );
-                                painter.rect_filled(r, 4.0, bg);
-                                painter.text(
-                                    r.center(),
-                                    egui::Align2::CENTER_CENTER,
-                                    vertical,
-                                    font.clone(),
-                                    fg,
-                                );
+                                let sizes = [10.0, 9.0, 8.0, 7.0];
+                                for sz in sizes {
+                                    let font = egui::FontId::monospace(sz);
+                                    let line_h = (sz + 1.0).max(1.0);
+                                    let max_chars =
+                                        ((r.height() - 6.0) / line_h).floor().max(1.0) as usize;
+                                    let vertical = $text
+                                        .chars()
+                                        .take(max_chars)
+                                        .map(|c| c.to_string())
+                                        .collect::<Vec<_>>()
+                                        .join("\n");
+                                    let center = r.center();
+                                    painter.text(
+                                        center + egui::vec2(1.0, 1.0),
+                                        egui::Align2::CENTER_CENTER,
+                                        vertical.clone(),
+                                        font.clone(),
+                                        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 200),
+                                    );
+                                    painter.text(
+                                        center,
+                                        egui::Align2::CENTER_CENTER,
+                                        vertical,
+                                        font,
+                                        fg,
+                                    );
+                                    break;
+                                }
                             }
                             shared::TextPlacement::Right => {
-                                let vertical = $text
-                                    .chars()
-                                    .take(10)
-                                    .map(|c| c.to_string())
-                                    .collect::<Vec<_>>()
-                                    .join("\n");
                                 let r = egui::Rect::from_min_max(
                                     egui::pos2(rect.max.x - 18.0, rect.min.y + 4.0),
                                     rect.max - egui::vec2(4.0, 4.0),
                                 );
-                                painter.rect_filled(r, 4.0, bg);
-                                painter.text(
-                                    r.center(),
-                                    egui::Align2::CENTER_CENTER,
-                                    vertical,
-                                    font.clone(),
-                                    fg,
-                                );
+                                let sizes = [10.0, 9.0, 8.0, 7.0];
+                                for sz in sizes {
+                                    let font = egui::FontId::monospace(sz);
+                                    let line_h = (sz + 1.0).max(1.0);
+                                    let max_chars =
+                                        ((r.height() - 6.0) / line_h).floor().max(1.0) as usize;
+                                    let vertical = $text
+                                        .chars()
+                                        .take(max_chars)
+                                        .map(|c| c.to_string())
+                                        .collect::<Vec<_>>()
+                                        .join("\n");
+                                    let center = r.center();
+                                    painter.text(
+                                        center + egui::vec2(1.0, 1.0),
+                                        egui::Align2::CENTER_CENTER,
+                                        vertical.clone(),
+                                        font.clone(),
+                                        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 200),
+                                    );
+                                    painter.text(
+                                        center,
+                                        egui::Align2::CENTER_CENTER,
+                                        vertical,
+                                        font,
+                                        fg,
+                                    );
+                                    break;
+                                }
                             }
                         }
                     };
                 }
 
-                // Keep legacy behavior: the Stream Deck "Title" uses `text_placement`.
-                if show_title {
-                    render_text_at_placement!(title, st.text_placement);
-                }
+                // If both are enabled (and different), force Top/Bottom.
+                if show_title && show_action_name && title != action_name {
+                    render_text_at_placement!(action_name, shared::TextPlacement::Top);
+                    render_text_at_placement!(title, shared::TextPlacement::Bottom);
+                } else {
+                    // Keep legacy behavior: the Stream Deck "Title" uses `text_placement`.
+                    if show_title {
+                        render_text_at_placement!(title, st.text_placement);
+                    }
 
-                // If the title already equals the action name (common default), don't render both.
-                if show_action_name && (!show_title || title != action_name) {
-                    let opposite = |p: shared::TextPlacement| match p {
-                        shared::TextPlacement::Top => shared::TextPlacement::Bottom,
-                        shared::TextPlacement::Bottom => shared::TextPlacement::Top,
-                        shared::TextPlacement::Left => shared::TextPlacement::Right,
-                        shared::TextPlacement::Right => shared::TextPlacement::Left,
-                    };
-                    let placement = if show_title {
-                        opposite(st.text_placement)
-                    } else {
-                        // If there's no title, keep the action name in the familiar place.
-                        shared::TextPlacement::Bottom
-                    };
-                    render_text_at_placement!(action_name, placement);
+                    // If the title already equals the action name (common default), don't render both.
+                    if show_action_name && (!show_title || title != action_name) {
+                        let opposite = |p: shared::TextPlacement| match p {
+                            shared::TextPlacement::Top => shared::TextPlacement::Bottom,
+                            shared::TextPlacement::Bottom => shared::TextPlacement::Top,
+                            shared::TextPlacement::Left => shared::TextPlacement::Right,
+                            shared::TextPlacement::Right => shared::TextPlacement::Left,
+                        };
+                        let placement = if show_title {
+                            opposite(st.text_placement)
+                        } else {
+                            // If there's no title, keep the action name in the familiar place.
+                            shared::TextPlacement::Bottom
+                        };
+                        render_text_at_placement!(action_name, placement);
+                    }
                 }
             }
         } else {
@@ -1358,9 +1848,7 @@ impl RiverDeckApp {
                 let show_title = st.show && !title.is_empty();
                 let show_action_name = st.show_action_name && !action_name.is_empty();
 
-                let font = egui::FontId::proportional(10.0);
-                let bg = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 150);
-                let fg = visuals.text_color();
+                let fg = egui::Color32::WHITE;
 
                 // Helper macro to render text at a placement
                 macro_rules! render_text_at_placement {
@@ -1369,83 +1857,175 @@ impl RiverDeckApp {
                             shared::TextPlacement::Top => {
                                 let r = egui::Rect::from_center_size(
                                     egui::pos2(rect.center().x, rect.min.y + 10.0),
-                                    egui::vec2(rect.width() - 8.0, 16.0),
+                                    egui::vec2(rect.width() - 8.0, 26.0),
                                 );
-                                painter.rect_filled(r, 8.0, bg);
-                                painter.text(r.center(), egui::Align2::CENTER_CENTER, $text, font.clone(), fg);
+                                let sizes = [10.0, 9.0, 8.0, 7.0];
+                                for sz in sizes {
+                                    let font = egui::FontId::monospace(sz);
+                                    let char_w = (sz * 0.60).max(1.0);
+                                    let line_h = (sz + 2.0).max(1.0);
+                                    let max_cols =
+                                        ((r.width() - 6.0) / char_w).floor().max(1.0) as usize;
+                                    let max_lines =
+                                        ((r.height() - 6.0) / line_h).floor().max(1.0) as usize;
+                                    let max_lines = max_lines.min(2);
+                                    let mut lines = RiverDeckApp::wrap_words_preview(
+                                        $text, max_cols, max_lines,
+                                    );
+                                    if lines.len() == max_lines && max_lines > 0 {
+                                        if let Some(last) = lines.last_mut() {
+                                            *last = RiverDeckApp::ellipsize_preview(last, max_cols);
+                                        }
+                                    }
+                                    let t = lines.join("\n");
+                                    let center = r.center();
+                                    painter.text(
+                                        center + egui::vec2(1.0, 1.0),
+                                        egui::Align2::CENTER_CENTER,
+                                        t.clone(),
+                                        font.clone(),
+                                        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 200),
+                                    );
+                                    painter.text(center, egui::Align2::CENTER_CENTER, t, font, fg);
+                                    break;
+                                }
                             }
                             shared::TextPlacement::Bottom => {
                                 let r = egui::Rect::from_center_size(
                                     egui::pos2(rect.center().x, rect.max.y - 10.0),
-                                    egui::vec2(rect.width() - 8.0, 16.0),
+                                    egui::vec2(rect.width() - 8.0, 26.0),
                                 );
-                                painter.rect_filled(r, 8.0, bg);
-                                painter.text(r.center(), egui::Align2::CENTER_CENTER, $text, font.clone(), fg);
+                                let sizes = [10.0, 9.0, 8.0, 7.0];
+                                for sz in sizes {
+                                    let font = egui::FontId::monospace(sz);
+                                    let char_w = (sz * 0.60).max(1.0);
+                                    let line_h = (sz + 2.0).max(1.0);
+                                    let max_cols =
+                                        ((r.width() - 6.0) / char_w).floor().max(1.0) as usize;
+                                    let max_lines =
+                                        ((r.height() - 6.0) / line_h).floor().max(1.0) as usize;
+                                    let max_lines = max_lines.min(2);
+                                    let mut lines = RiverDeckApp::wrap_words_preview(
+                                        $text, max_cols, max_lines,
+                                    );
+                                    if lines.len() == max_lines && max_lines > 0 {
+                                        if let Some(last) = lines.last_mut() {
+                                            *last = RiverDeckApp::ellipsize_preview(last, max_cols);
+                                        }
+                                    }
+                                    let t = lines.join("\n");
+                                    let center = r.center();
+                                    painter.text(
+                                        center + egui::vec2(1.0, 1.0),
+                                        egui::Align2::CENTER_CENTER,
+                                        t.clone(),
+                                        font.clone(),
+                                        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 200),
+                                    );
+                                    painter.text(center, egui::Align2::CENTER_CENTER, t, font, fg);
+                                    break;
+                                }
                             }
                             shared::TextPlacement::Left => {
-                                let vertical = $text
-                                    .chars()
-                                    .take(8)
-                                    .map(|c| c.to_string())
-                                    .collect::<Vec<_>>()
-                                    .join("\n");
                                 let r = egui::Rect::from_center_size(
                                     egui::pos2(rect.min.x + 10.0, rect.center().y),
                                     egui::vec2(16.0, rect.height() - 8.0),
                                 );
-                                painter.rect_filled(r, 8.0, bg);
-                                painter.text(
-                                    r.center(),
-                                    egui::Align2::CENTER_CENTER,
-                                    vertical,
-                                    font.clone(),
-                                    fg,
-                                );
+                                let sizes = [9.0, 8.0, 7.0];
+                                for sz in sizes {
+                                    let font = egui::FontId::monospace(sz);
+                                    let line_h = (sz + 1.0).max(1.0);
+                                    let max_chars =
+                                        ((r.height() - 6.0) / line_h).floor().max(1.0) as usize;
+                                    let vertical = $text
+                                        .chars()
+                                        .take(max_chars)
+                                        .map(|c| c.to_string())
+                                        .collect::<Vec<_>>()
+                                        .join("\n");
+                                    let center = r.center();
+                                    painter.text(
+                                        center + egui::vec2(1.0, 1.0),
+                                        egui::Align2::CENTER_CENTER,
+                                        vertical.clone(),
+                                        font.clone(),
+                                        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 200),
+                                    );
+                                    painter.text(
+                                        center,
+                                        egui::Align2::CENTER_CENTER,
+                                        vertical,
+                                        font,
+                                        fg,
+                                    );
+                                    break;
+                                }
                             }
                             shared::TextPlacement::Right => {
-                                let vertical = $text
-                                    .chars()
-                                    .take(8)
-                                    .map(|c| c.to_string())
-                                    .collect::<Vec<_>>()
-                                    .join("\n");
                                 let r = egui::Rect::from_center_size(
                                     egui::pos2(rect.max.x - 10.0, rect.center().y),
                                     egui::vec2(16.0, rect.height() - 8.0),
                                 );
-                                painter.rect_filled(r, 8.0, bg);
-                                painter.text(
-                                    r.center(),
-                                    egui::Align2::CENTER_CENTER,
-                                    vertical,
-                                    font.clone(),
-                                    fg,
-                                );
+                                let sizes = [9.0, 8.0, 7.0];
+                                for sz in sizes {
+                                    let font = egui::FontId::monospace(sz);
+                                    let line_h = (sz + 1.0).max(1.0);
+                                    let max_chars =
+                                        ((r.height() - 6.0) / line_h).floor().max(1.0) as usize;
+                                    let vertical = $text
+                                        .chars()
+                                        .take(max_chars)
+                                        .map(|c| c.to_string())
+                                        .collect::<Vec<_>>()
+                                        .join("\n");
+                                    let center = r.center();
+                                    painter.text(
+                                        center + egui::vec2(1.0, 1.0),
+                                        egui::Align2::CENTER_CENTER,
+                                        vertical.clone(),
+                                        font.clone(),
+                                        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 200),
+                                    );
+                                    painter.text(
+                                        center,
+                                        egui::Align2::CENTER_CENTER,
+                                        vertical,
+                                        font,
+                                        fg,
+                                    );
+                                    break;
+                                }
                             }
                         }
                     };
                 }
 
-                // Keep legacy behavior: the Stream Deck "Title" uses `text_placement`.
-                if show_title {
-                    render_text_at_placement!(title, st.text_placement);
-                }
+                // If both are enabled (and different), force Top/Bottom.
+                if show_title && show_action_name && title != action_name {
+                    render_text_at_placement!(action_name, shared::TextPlacement::Top);
+                    render_text_at_placement!(title, shared::TextPlacement::Bottom);
+                } else {
+                    // Keep legacy behavior: the Stream Deck "Title" uses `text_placement`.
+                    if show_title {
+                        render_text_at_placement!(title, st.text_placement);
+                    }
 
-                // If the title already equals the action name (common default), don't render both.
-                if show_action_name && (!show_title || title != action_name) {
-                    let opposite = |p: shared::TextPlacement| match p {
-                        shared::TextPlacement::Top => shared::TextPlacement::Bottom,
-                        shared::TextPlacement::Bottom => shared::TextPlacement::Top,
-                        shared::TextPlacement::Left => shared::TextPlacement::Right,
-                        shared::TextPlacement::Right => shared::TextPlacement::Left,
-                    };
-                    let placement = if show_title {
-                        opposite(st.text_placement)
-                    } else {
-                        // If there's no title, keep the action name in the familiar place.
-                        shared::TextPlacement::Bottom
-                    };
-                    render_text_at_placement!(action_name, placement);
+                    // If the title already equals the action name (common default), don't render both.
+                    if show_action_name && (!show_title || title != action_name) {
+                        let opposite = |p: shared::TextPlacement| match p {
+                            shared::TextPlacement::Top => shared::TextPlacement::Bottom,
+                            shared::TextPlacement::Bottom => shared::TextPlacement::Top,
+                            shared::TextPlacement::Left => shared::TextPlacement::Right,
+                            shared::TextPlacement::Right => shared::TextPlacement::Left,
+                        };
+                        let placement = if show_title {
+                            opposite(st.text_placement)
+                        } else {
+                            // If there's no title, keep the action name in the familiar place.
+                            shared::TextPlacement::Bottom
+                        };
+                        render_text_at_placement!(action_name, placement);
+                    }
                 }
             }
         } else {
@@ -1620,6 +2200,61 @@ impl eframe::App for RiverDeckApp {
 
         self.poll_ui_events();
 
+        // Poll async cache fetches without blocking the UI thread.
+        // If any fetch is in-flight, we schedule a low-frequency repaint to pick up the result.
+        let mut pending_async = false;
+        if let Some(rx) = self.categories_rx.as_ref() {
+            match rx.try_recv() {
+                Ok(map) => {
+                    let mut cats: Vec<_> = map.into_iter().collect();
+                    cats.sort_by(|(a, _), (b, _)| a.cmp(b));
+                    self.categories_cache = Some(cats);
+                    self.categories_inflight = false;
+                    self.categories_rx = None;
+                    ctx.request_repaint();
+                }
+                Err(mpsc::TryRecvError::Empty) => pending_async = true,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.categories_inflight = false;
+                    self.categories_rx = None;
+                }
+            }
+        }
+        if let Some(rx) = self.plugins_rx.as_ref() {
+            match rx.try_recv() {
+                Ok(list) => {
+                    let mut list = list;
+                    list.sort_by(|a, b| a.name.cmp(&b.name));
+                    self.plugins_cache = Some(list);
+                    self.plugins_inflight = false;
+                    self.plugins_rx = None;
+                    ctx.request_repaint();
+                }
+                Err(mpsc::TryRecvError::Empty) => pending_async = true,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.plugins_inflight = false;
+                    self.plugins_rx = None;
+                }
+            }
+        }
+        if let Some(rx) = self.pages_rx.as_ref() {
+            match rx.try_recv() {
+                Ok((key, pages)) => {
+                    self.pages_cache.insert(key.clone(), pages);
+                    if self.pages_inflight.as_ref() == Some(&key) {
+                        self.pages_inflight = None;
+                    }
+                    self.pages_rx = None;
+                    ctx.request_repaint();
+                }
+                Err(mpsc::TryRecvError::Empty) => pending_async = true,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.pages_inflight = None;
+                    self.pages_rx = None;
+                }
+            }
+        }
+
         // Complete any pending file picks without blocking the UI.
         if let Some((rx, context, state)) = self.pending_icon_pick.as_ref()
             && let Ok(picked) = rx.try_recv()
@@ -1658,6 +2293,16 @@ impl eframe::App for RiverDeckApp {
             }
         }
 
+        // If we're waiting on async results, poll at a low frequency.
+        if pending_async
+            || self.pending_plugin_install_pick.is_some()
+            || self.pending_plugin_install_result.is_some()
+            || self.pending_icon_pick.is_some()
+            || self.pending_screen_bg_pick.is_some()
+        {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+
         // Plugin install flow (non-blocking).
         if let Some(rx) = self.pending_plugin_install_pick.as_ref()
             && let Ok(picked) = rx.try_recv()
@@ -1682,6 +2327,16 @@ impl eframe::App for RiverDeckApp {
             match res {
                 Ok(()) => {
                     self.plugin_manage_error = None;
+                    // Invalidate caches that depend on plugin discovery and refresh plugins.
+                    self.plugins_cache = None;
+                    self.plugins_inflight = false;
+                    self.plugins_rx = None;
+                    self.categories_cache = None;
+                    self.categories_inflight = false;
+                    self.categories_rx = None;
+                    self.runtime.spawn(async {
+                        plugins::initialise_plugins();
+                    });
                 }
                 Err(err) => {
                     self.plugin_manage_error = Some(err);
@@ -1785,20 +2440,33 @@ impl eframe::App for RiverDeckApp {
                             egui::StrokeKind::Inside,
                         );
 
+                        // Important: paint text manually so the whole row stays a single hit target.
+                        // (Widgets like `Label` can capture pointer input and make the row feel flaky.)
                         let inner = rect.shrink2(row_padding);
-                        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(inner), |ui| {
-                            ui.spacing_mut().item_spacing.y = 2.0;
-                            ui.label(egui::RichText::new(entry.value().name.clone()).strong());
-                            ui.label(
-                                egui::RichText::new(id.clone())
-                                    .small()
-                                    .color(ui.visuals().weak_text_color()),
-                            );
-                        });
+                        let painter = ui.painter_at(rect);
+
+                        let name_font = egui::FontId::proportional(14.0);
+                        let id_font = egui::FontId::proportional(11.0);
+
+                        painter.text(
+                            egui::pos2(inner.min.x, inner.min.y),
+                            egui::Align2::LEFT_TOP,
+                            entry.value().name.trim(),
+                            name_font,
+                            ui.visuals().text_color(),
+                        );
+                        painter.text(
+                            egui::pos2(inner.min.x, inner.max.y),
+                            egui::Align2::LEFT_BOTTOM,
+                            id.trim(),
+                            id_font,
+                            ui.visuals().weak_text_color(),
+                        );
 
                         if resp.clicked() {
                             self.selected_device = Some(id);
                             self.selected_slot = None;
+                            self.action_editor_open = false;
                         }
                     }
                 });
@@ -1827,6 +2495,7 @@ impl eframe::App for RiverDeckApp {
         if self.selected_device.is_some() && selected_device.is_none() {
             self.selected_device = None;
             self.selected_slot = None;
+            self.action_editor_open = false;
         }
 
         let selected_profile = selected_device
@@ -1867,9 +2536,11 @@ impl eframe::App for RiverDeckApp {
             if slot.controller == "Encoder" {
                 if slot.position as usize >= device.encoders as usize {
                     self.selected_slot = None;
+                    self.action_editor_open = false;
                 }
             } else if slot.position as usize >= key_count {
                 self.selected_slot = None;
+                self.action_editor_open = false;
             }
         }
 
@@ -1913,23 +2584,40 @@ impl eframe::App for RiverDeckApp {
                     });
                 ui.separator();
 
-                let categories = self
-                    .runtime
-                    .block_on(async { riverdeck_core::api::get_categories().await });
-                let mut cats: Vec<_> = categories.into_iter().collect();
-                cats.sort_by(|(a, _), (b, _)| a.cmp(b));
+                if self.categories_cache.is_none()
+                    && !self.categories_inflight
+                    && self.categories_rx.is_none()
+                {
+                    self.categories_inflight = true;
+                    let (tx, rx) = mpsc::channel();
+                    self.categories_rx = Some(rx);
+                    self.runtime.spawn(async move {
+                        let _ = tx.send(riverdeck_core::api::get_categories().await);
+                    });
+                }
+                // Clone for this frame to avoid borrowing `self` across the ScrollArea closure
+                // (we need `&mut self` inside for `draw_action_row`).
+                let cats = self.categories_cache.clone().unwrap_or_default();
 
                 let search = self.action_search.to_lowercase();
                 let filter_controller = self.action_controller_filter.clone();
                 let row_height = 44.0;
 
                 egui::ScrollArea::vertical().show(ui, |ui| {
+                    if cats.is_empty() && (self.categories_inflight || self.categories_rx.is_some())
+                    {
+                        ui.label(
+                            egui::RichText::new("Loading actions…")
+                                .small()
+                                .color(ui.visuals().weak_text_color()),
+                        );
+                    }
                     for (cat_name, cat) in cats {
                         egui::CollapsingHeader::new(cat_name)
                             .default_open(true)
                             .show(ui, |ui| {
                                 ui.spacing_mut().item_spacing.y = 8.0;
-                                for action in cat.actions {
+                                for action in cat.actions.iter() {
                                     if !action.visible_in_action_list {
                                         continue;
                                     }
@@ -1950,7 +2638,7 @@ impl eframe::App for RiverDeckApp {
                                     let resp = self.draw_action_row(
                                         ui,
                                         ctx,
-                                        &action,
+                                        action,
                                         row_size,
                                         dragging_this,
                                     );
@@ -1963,282 +2651,98 @@ impl eframe::App for RiverDeckApp {
                 });
             });
 
-        // Bottom action editor (PI).
-        egui::TopBottomPanel::bottom("action_editor").show(ctx, |ui| {
-            ui.vertical(|ui| {
-                ui.heading("Action Editor");
-                let Some(device) = &selected_device else {
-                    ui.label("Select a device.");
-                    return;
-                };
-                let Some(snapshot) = &snapshot else {
-                    ui.label("Loading profile…");
-                    return;
-                };
-                let Some(slot) = self.selected_slot.clone() else {
-                    ui.label("Select a key or dial to edit.");
-                    return;
-                };
+        // Bottom action editor: hidden when no slot is selected, otherwise a centered tab that
+        // expands into a full-width bottom sheet (collapsed by default).
+        let editor_visible =
+            selected_device.is_some() && snapshot.is_some() && self.selected_slot.is_some();
+        if !editor_visible {
+            self.action_editor_open = false;
+        } else if let (Some(device), Some(snapshot), Some(slot)) = (
+            &selected_device,
+            snapshot.as_ref(),
+            self.selected_slot.clone(),
+        ) {
+            if !self.action_editor_open {
+                egui::TopBottomPanel::bottom("action_editor_tab")
+                    .exact_height(44.0)
+                    .frame(egui::Frame::NONE.inner_margin(egui::Margin::same(6)))
+                    .show(ctx, |ui| {
+                        ui.vertical_centered(|ui| {
+                            let tab_w = ui.available_width().clamp(240.0, 520.0);
+                            let tab_h = 34.0;
+                            let (rect, resp) = ui.allocate_exact_size(
+                                egui::vec2(tab_w.min(ui.available_width()), tab_h),
+                                egui::Sense::click(),
+                            );
 
-                let instance = match &slot.controller[..] {
-                    "Encoder" => snapshot
-                        .sliders
-                        .get(slot.position as usize)
-                        .and_then(|v| v.as_ref()),
-                    _ => snapshot
-                        .keys
-                        .get(slot.position as usize)
-                        .and_then(|v| v.as_ref()),
-                };
+                            let rounding = egui::CornerRadius::same(12);
+                            let fill = if resp.hovered() {
+                                ui.visuals().widgets.hovered.bg_fill
+                            } else {
+                                ui.visuals().widgets.inactive.bg_fill
+                            };
+                            let stroke = if resp.hovered() {
+                                ui.visuals().widgets.hovered.bg_stroke
+                            } else {
+                                ui.visuals().widgets.inactive.bg_stroke
+                            };
 
-                egui::Frame::group(ui.style())
-                    .corner_radius(egui::CornerRadius::same(12))
-                    .show(ui, |ui| {
-                        ui.vertical(|ui| {
-                            ui.spacing_mut().item_spacing.y = 8.0;
+                            ui.painter().rect(
+                                rect,
+                                rounding,
+                                fill,
+                                stroke,
+                                egui::StrokeKind::Inside,
+                            );
 
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "{} {}",
-                                        slot.controller, slot.position
-                                    ))
-                                    .size(14.0)
-                                    .strong(),
-                                );
-                                ui.add_space(6.0);
-                                if ui
-                                    .add_enabled(instance.is_some(), egui::Button::new("Clear"))
-                                    .on_hover_text("Remove the assigned action from this slot")
-                                    .clicked()
-                                {
-                                    let ctx_to_clear = shared::Context {
-                                        device: device.id.clone(),
-                                        profile: selected_profile.clone(),
-                                        page: snapshot.page_id.clone(),
-                                        controller: slot.controller.clone(),
-                                        position: slot.position,
-                                    };
-                                    let _ = self.runtime.block_on(async {
-                                        riverdeck_core::api::instances::remove_instance(
-                                            shared::ActionContext::from_context(ctx_to_clear, 0),
-                                        )
-                                        .await
-                                    });
-                                }
-                            });
+                            let label =
+                                format!("Action Editor — {} {}", slot.controller, slot.position);
+                            ui.painter().text(
+                                rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                label,
+                                egui::FontId::proportional(13.0),
+                                ui.visuals().text_color(),
+                            );
 
-                            ui.horizontal(|ui| {
-                                if let Some(instance) = instance {
-                                    let icon_size = egui::vec2(28.0, 28.0);
-                                    let img = instance
-                                        .states
-                                        .get(instance.current_state as usize)
-                                        .map(|s| s.image.trim())
-                                        .filter(|s| !s.is_empty() && *s != "actionDefaultImage")
-                                        .map(|s| s.to_owned())
-                                        .unwrap_or_else(|| instance.action.icon.clone());
-                                    if let Some(tex) = self.texture_for_path(ctx, &img) {
-                                        ui.image((tex.id(), icon_size));
-                                    } else {
-                                        ui.allocate_exact_size(icon_size, egui::Sense::hover());
-                                    }
-                                    ui.label(instance.action.name.trim());
-                                } else {
-                                    ui.label(
-                                        egui::RichText::new("No action assigned")
-                                            .color(ui.visuals().weak_text_color()),
-                                    );
-                                }
-                            });
-
-                            if let Some(instance) = instance {
-                                // Keep editor state stable while switching slots.
-                                let needs_reset = match self.button_label_context.as_ref() {
-                                    None => true,
-                                    Some(c) => c != &instance.context,
-                                };
-                                if needs_reset {
-                                    self.button_label_context = Some(instance.context.clone());
-                                    let st = instance.states.get(instance.current_state as usize);
-                                    self.button_label_input = st
-                                        .map(|s| s.text.clone())
-                                        .unwrap_or_else(|| instance.action.name.clone());
-                                    self.button_label_placement = st
-                                        .map(|s| s.text_placement)
-                                        .unwrap_or(shared::TextPlacement::Bottom);
-                                    self.button_show_title = st.map(|s| s.show).unwrap_or(true);
-                                    self.button_show_action_name =
-                                        st.map(|s| s.show_action_name).unwrap_or(true);
-                                }
-
-                                ui.add_space(6.0);
-                                ui.label("Button title (dynamic):");
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.button_label_input)
-                                        .hint_text("Leave empty for clean"),
-                                );
-
-                                ui.horizontal(|ui| {
-                                    ui.checkbox(&mut self.button_show_action_name, "Show action name");
-                                    ui.checkbox(&mut self.button_show_title, "Show title");
-                                });
-
-                                ui.horizontal(|ui| {
-                                    ui.label("Placement:");
-                                    let mut changed = false;
-                                    egui::ComboBox::from_id_salt("button_label_placement")
-                                        .selected_text(match self.button_label_placement {
-                                            shared::TextPlacement::Top => "Top",
-                                            shared::TextPlacement::Bottom => "Bottom",
-                                            shared::TextPlacement::Left => "Left",
-                                            shared::TextPlacement::Right => "Right",
-                                        })
-                                        .show_ui(ui, |ui| {
-                                            changed |= ui
-                                                .selectable_value(
-                                                    &mut self.button_label_placement,
-                                                    shared::TextPlacement::Top,
-                                                    "Top",
-                                                )
-                                                .changed();
-                                            changed |= ui
-                                                .selectable_value(
-                                                    &mut self.button_label_placement,
-                                                    shared::TextPlacement::Bottom,
-                                                    "Bottom",
-                                                )
-                                                .changed();
-                                            changed |= ui
-                                                .selectable_value(
-                                                    &mut self.button_label_placement,
-                                                    shared::TextPlacement::Left,
-                                                    "Left",
-                                                )
-                                                .changed();
-                                            changed |= ui
-                                                .selectable_value(
-                                                    &mut self.button_label_placement,
-                                                    shared::TextPlacement::Right,
-                                                    "Right",
-                                                )
-                                                .changed();
-                                        });
-                                    // Placement changes are staged; saved via the explicit Save button below.
-                                });
+                            if resp.clicked() {
+                                self.action_editor_open = true;
                             }
-
+                        });
+                    });
+            } else {
+                egui::TopBottomPanel::bottom("action_editor_sheet")
+                    .default_height(260.0)
+                    .resizable(true)
+                    .show(ctx, |ui| {
+                        ui.vertical(|ui| {
                             ui.horizontal(|ui| {
-                                if ui.button("Save").clicked()
-                                    && let Some(ctx_to_set) = self.button_label_context.clone()
-                                {
-                                    let text = self.button_label_input.clone();
-                                    let placement = self.button_label_placement;
-                                    let show_title = self.button_show_title;
-                                    let show_action_name = self.button_show_action_name;
-                                    self.runtime.spawn(async move {
-                                        let _ = riverdeck_core::api::instances::set_button_label(
-                                            ctx_to_set.clone(),
-                                            text,
-                                        )
-                                        .await;
-                                        let _ =
-                                            riverdeck_core::api::instances::set_button_label_placement(
-                                                ctx_to_set.clone(),
-                                                placement,
-                                            )
-                                            .await;
-                                        let _ =
-                                            riverdeck_core::api::instances::set_button_show_title(
-                                                ctx_to_set.clone(),
-                                                show_title,
-                                            )
-                                            .await;
-                                        let _ =
-                                            riverdeck_core::api::instances::set_button_show_action_name(
-                                                ctx_to_set,
-                                                show_action_name,
-                                            )
-                                            .await;
-                                    });
-                                }
-                                ui.label(
-                                    egui::RichText::new("Tip: empty label hides text")
-                                        .small()
-                                        .color(ui.visuals().weak_text_color()),
+                                ui.heading("Action Editor");
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui.button("▾").on_hover_text("Collapse").clicked() {
+                                            self.action_editor_open = false;
+                                        }
+                                    },
+                                );
+                            });
+                            ui.add_space(6.0);
+
+                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                self.draw_action_editor_contents(
+                                    ui,
+                                    ctx,
+                                    device,
+                                    snapshot,
+                                    &selected_profile,
+                                    &slot,
                                 );
                             });
                         });
                     });
-
-                if let Some(err) = self.pi_last_error.as_ref() {
-                    ui.colored_label(ui.visuals().error_fg_color, err);
-                }
-
-                if let Some(instance) = instance {
-                    let has_pi = !instance.action.property_inspector.trim().is_empty();
-                    let open_for_this = self
-                        .pi_for_context
-                        .as_ref()
-                        .is_some_and(|c| c == &instance.context)
-                        && self.pi_child.is_some();
-
-                    ui.horizontal(|ui| {
-                        if ui.button("✕").on_hover_text("Remove custom icon").clicked() {
-                            let ctx_to_clear = instance.context.clone();
-                            let state = instance.current_state;
-                            self.runtime.spawn(async move {
-                                let _ = riverdeck_core::api::instances::clear_custom_icon(
-                                    ctx_to_clear,
-                                    Some(state),
-                                )
-                                .await;
-                            });
-                        }
-                        if ui
-                            .button("Upload")
-                            .on_hover_text("Set custom icon")
-                            .clicked()
-                            && self.pending_icon_pick.is_none()
-                        {
-                            let (tx, rx) = mpsc::channel();
-                            std::thread::spawn(move || {
-                                let picked = rfd::FileDialog::new()
-                                    .add_filter("Image", &["png", "jpg", "jpeg"])
-                                    .pick_file();
-                                let _ = tx.send(picked);
-                            });
-                            self.pending_icon_pick =
-                                Some((rx, instance.context.clone(), instance.current_state));
-                        }
-
-                        if ui
-                            .add_enabled(has_pi && !open_for_this, egui::Button::new("Open PI"))
-                            .clicked()
-                        {
-                            let dock = Self::compute_pi_dock_geometry(ctx, 420);
-                            if let Err(err) =
-                                self.open_property_inspector_for_instance(device, instance, dock)
-                            {
-                                self.pi_last_error = Some(err.to_string());
-                            }
-                        }
-                        if ui
-                            .add_enabled(open_for_this, egui::Button::new("Close PI"))
-                            .clicked()
-                        {
-                            self.close_pi();
-                        }
-
-                        if !has_pi {
-                            ui.label("This action has no Property Inspector.");
-                        } else if open_for_this {
-                            ui.label("PI open.");
-                        }
-                    });
-                }
-            });
-        });
+            }
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             let Some(device) = &selected_device else {
@@ -2460,6 +2964,13 @@ impl eframe::App for RiverDeckApp {
                                 self.pending_plugin_install_pick = Some(rx);
                             }
                             if ui.button("Reload").clicked() {
+                                // Invalidate caches that depend on plugin discovery.
+                                self.plugins_cache = None;
+                                self.plugins_inflight = false;
+                                self.plugins_rx = None;
+                                self.categories_cache = None;
+                                self.categories_inflight = false;
+                                self.categories_rx = None;
                                 self.runtime.spawn(async {
                                     plugins::initialise_plugins();
                                 });
@@ -2478,33 +2989,70 @@ impl eframe::App for RiverDeckApp {
                             );
                         }
                         ui.separator();
-
-                        let mut plugins = self.runtime.block_on(async {
-                            riverdeck_core::api::plugins::list_plugins().await.unwrap_or_default()
-                        });
-                        plugins.sort_by(|a, b| a.name.cmp(&b.name));
+                        if self.plugins_cache.is_none()
+                            && !self.plugins_inflight
+                            && self.plugins_rx.is_none()
+                        {
+                            self.plugins_inflight = true;
+                            let (tx, rx) = mpsc::channel();
+                            self.plugins_rx = Some(rx);
+                            self.runtime.spawn(async move {
+                                let list =
+                                    riverdeck_core::api::plugins::list_plugins().await.unwrap_or_default();
+                                let _ = tx.send(list);
+                            });
+                        }
+                        // Clone the display fields we need so we can call `texture_for_path` (needs `&mut self`)
+                        // inside the ScrollArea closure without borrowing `self` immutably.
+                        let plugins: Vec<(String, String, String, String, bool, bool)> = self
+                            .plugins_cache
+                            .as_ref()
+                            .map(|v| {
+                                v.iter()
+                                    .map(|p| {
+                                        (
+                                            p.id.clone(),
+                                            p.name.clone(),
+                                            p.icon.clone(),
+                                            p.version.clone(),
+                                            p.builtin,
+                                            p.registered,
+                                        )
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
 
                         egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
-                            for p in plugins {
+                            if plugins.is_empty()
+                                && (self.plugins_inflight || self.plugins_rx.is_some())
+                            {
+                                ui.label(
+                                    egui::RichText::new("Loading plugins…")
+                                        .small()
+                                        .color(ui.visuals().weak_text_color()),
+                                );
+                            }
+                            for (id, name, icon, version, builtin, registered) in plugins {
                                 egui::Frame::group(ui.style())
                                     .corner_radius(egui::CornerRadius::same(10))
                                     .show(ui, |ui| {
                                         ui.horizontal(|ui| {
                                             let icon_size = egui::vec2(28.0, 28.0);
-                                            if let Some(tex) = self.texture_for_path(ctx, &p.icon) {
+                                            if let Some(tex) = self.texture_for_path(ctx, &icon) {
                                                 ui.image((tex.id(), icon_size));
                                             } else {
                                                 ui.allocate_exact_size(icon_size, egui::Sense::hover());
                                             }
 
                                             ui.vertical(|ui| {
-                                                ui.label(egui::RichText::new(&p.name).strong());
+                                                ui.label(egui::RichText::new(&name).strong());
                                                 ui.label(
-                                                    egui::RichText::new(format!("{} • v{}", p.id, p.version))
+                                                    egui::RichText::new(format!("{id} • v{version}"))
                                                         .small()
                                                         .color(ui.visuals().weak_text_color()),
                                                 );
-                                                if !p.registered {
+                                                if !registered {
                                                     ui.label(
                                                         egui::RichText::new("Not running / not registered")
                                                             .small()
@@ -2514,15 +3062,22 @@ impl eframe::App for RiverDeckApp {
                                             });
 
                                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                let remove = ui.add_enabled(!p.builtin, egui::Button::new("Remove"));
+                                                let remove = ui.add_enabled(!builtin, egui::Button::new("Remove"));
                                                 if remove.clicked() {
-                                                    let id = p.id.clone();
+                                                    // Invalidate caches that depend on plugin discovery.
+                                                    self.plugins_cache = None;
+                                                    self.plugins_inflight = false;
+                                                    self.plugins_rx = None;
+                                                    self.categories_cache = None;
+                                                    self.categories_inflight = false;
+                                                    self.categories_rx = None;
+                                                    let id = id.clone();
                                                     self.runtime.spawn(async move {
                                                         let _ = riverdeck_core::api::plugins::remove_plugin(id).await;
                                                         plugins::initialise_plugins();
                                                     });
                                                 }
-                                                if p.builtin {
+                                                if builtin {
                                                     ui.label(
                                                         egui::RichText::new("built-in")
                                                             .small()
@@ -2548,28 +3103,89 @@ impl eframe::App for RiverDeckApp {
                 return;
             };
 
-            let key_size = egui::vec2(88.0, 88.0);
-            let cols = device.columns as usize;
-            let rows = device.rows as usize;
-            // Center the keypad grid.
-            let grid_spacing_x = ui.spacing().item_spacing.x;
-            let grid_width = cols as f32 * key_size.x + (cols.saturating_sub(1) as f32) * grid_spacing_x;
-            let left_pad = ((ui.available_width() - grid_width) * 0.5).max(0.0);
-            ui.horizontal(|ui| {
-                ui.add_space(left_pad);
-                ui.vertical(|ui| {
-                    for r in 0..rows {
-                        ui.horizontal(|ui| {
-                            for c in 0..cols {
-                                let pos = (r * cols + c) as u8;
+            // Preview-area click target: clicking truly empty space deselects the active slot.
+            // (We intentionally keep this scoped to the preview area, not the whole center panel.)
+            let (preview_rect, preview_resp) =
+                ui.allocate_exact_size(ui.available_size(), egui::Sense::click());
+            if preview_resp.clicked()
+                && self.selected_slot.is_some()
+                && self.drag_payload.is_none()
+            {
+                self.selected_slot = None;
+                self.action_editor_open = false;
+            }
+
+            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(preview_rect), |ui| {
+                let key_size = egui::vec2(88.0, 88.0);
+                let cols = device.columns as usize;
+                let rows = device.rows as usize;
+                // Center the keypad grid.
+                let grid_spacing_x = ui.spacing().item_spacing.x;
+                let grid_width = cols as f32 * key_size.x
+                    + (cols.saturating_sub(1) as f32) * grid_spacing_x;
+                let left_pad = ((ui.available_width() - grid_width) * 0.5).max(0.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(left_pad);
+                    ui.vertical(|ui| {
+                        for r in 0..rows {
+                            ui.horizontal(|ui| {
+                                for c in 0..cols {
+                                    let pos = (r * cols + c) as u8;
+                                    let slot = SelectedSlot {
+                                        controller: "Keypad".to_owned(),
+                                        position: pos,
+                                    };
+                                    let instance = snapshot
+                                        .keys
+                                        .get(pos as usize)
+                                        .and_then(|v| v.as_ref());
+                                    let selected = self.selected_slot.as_ref() == Some(&slot);
+                                    let resp = self.draw_slot_preview(
+                                        ui,
+                                        ctx,
+                                        key_size,
+                                        &slot,
+                                        instance,
+                                        selected,
+                                        drag_action.as_ref(),
+                                    );
+                                    if resp.clicked() {
+                                        self.selected_slot = Some(slot);
+                                        // Collapsed by default on selection.
+                                        self.action_editor_open = false;
+                                    }
+                                }
+                            });
+                        }
+                    });
+                });
+
+                // Stream Deck+ style screen strip between keypad and encoders.
+                self.draw_screen_strip(
+                    ui,
+                    ctx,
+                    device,
+                    snapshot,
+                    &selected_profile,
+                    left_pad,
+                    grid_width,
+                );
+
+                if device.encoders > 0 {
+                    // Tight spacing: encoders should sit closer to the strip/grid.
+                    ui.add_space(4.0);
+                    // Align encoders with the keypad grid start (same left padding).
+                    ui.horizontal(|ui| {
+                        ui.add_space(left_pad);
+                        ui.horizontal_wrapped(|ui| {
+                            for i in 0..(device.encoders as usize) {
                                 let slot = SelectedSlot {
-                                    controller: "Keypad".to_owned(),
-                                    position: pos,
+                                    controller: "Encoder".to_owned(),
+                                    position: i as u8,
                                 };
-                                let instance =
-                                    snapshot.keys.get(pos as usize).and_then(|v| v.as_ref());
+                                let instance = snapshot.sliders.get(i).and_then(|v| v.as_ref());
                                 let selected = self.selected_slot.as_ref() == Some(&slot);
-                                let resp = self.draw_slot_preview(
+                                let resp = self.draw_encoder_dial_preview(
                                     ui,
                                     ctx,
                                     key_size,
@@ -2580,109 +3196,109 @@ impl eframe::App for RiverDeckApp {
                                 );
                                 if resp.clicked() {
                                     self.selected_slot = Some(slot);
+                                    // Collapsed by default on selection.
+                                    self.action_editor_open = false;
                                 }
                             }
                         });
-                    }
-                });
-            });
+                    });
+                }
 
-            // Stream Deck+ style screen strip between keypad and encoders.
-            self.draw_screen_strip(ui, ctx, device, snapshot, &selected_profile, left_pad, grid_width);
+                // Pages (real pages inside the selected profile).
+                ui.add_space(10.0);
+                let pages_key = (device.id.clone(), selected_profile.clone());
+                if !self.pages_cache.contains_key(&pages_key)
+                    && self.pages_inflight.as_ref() != Some(&pages_key)
+                    && self.pages_rx.is_none()
+                {
+                    self.pages_inflight = Some(pages_key.clone());
+                    let (tx, rx) = mpsc::channel();
+                    self.pages_rx = Some(rx);
+                    let (device_id, profile_id) = pages_key.clone();
+                    self.runtime.spawn(async move {
+                        let pages = riverdeck_core::api::pages::get_pages(
+                            device_id.clone(),
+                            profile_id.clone(),
+                        )
+                        .await
+                        .unwrap_or_else(|_| vec!["1".to_owned()]);
+                        let _ = tx.send(((device_id, profile_id), pages));
+                    });
+                }
+                let pages = self
+                    .pages_cache
+                    .get(&pages_key)
+                    .cloned()
+                    .unwrap_or_else(|| vec!["1".to_owned()]);
+                let selected_page = snapshot.page_id.clone();
 
-            if device.encoders > 0 {
-                // Tight spacing: encoders should sit closer to the strip/grid.
-                ui.add_space(4.0);
-                // Align encoders with the keypad grid start (same left padding).
                 ui.horizontal(|ui| {
+                    // Center the page bar under the grid by reusing the same padding.
                     ui.add_space(left_pad);
-                    ui.horizontal_wrapped(|ui| {
-                        for i in 0..(device.encoders as usize) {
-                            let slot = SelectedSlot {
-                                controller: "Encoder".to_owned(),
-                                position: i as u8,
+                    ui.horizontal(|ui| {
+                        ui.label("Pages:");
+
+                        for page_id in pages.iter() {
+                            let label = if let Ok(n) = page_id.parse::<u32>() {
+                                n.to_string()
+                            } else {
+                                page_id.clone()
                             };
-                            let instance = snapshot.sliders.get(i).and_then(|v| v.as_ref());
-                            let selected = self.selected_slot.as_ref() == Some(&slot);
-                            let resp = self.draw_encoder_dial_preview(
-                                ui,
-                                ctx,
-                                key_size,
-                                &slot,
-                                instance,
-                                selected,
-                                drag_action.as_ref(),
-                            );
+
+                            let selected = page_id == &selected_page;
+                            let resp = ui.selectable_label(selected, label);
+
                             if resp.clicked() {
-                                self.selected_slot = Some(slot);
+                                let device_id = device.id.clone();
+                                let profile_id = selected_profile.clone();
+                                let page_id = page_id.clone();
+                                self.runtime.spawn(async move {
+                                    let _ = riverdeck_core::api::pages::set_selected_page(
+                                        device_id,
+                                        profile_id,
+                                        page_id,
+                                    )
+                                    .await;
+                                });
+                            }
+
+                            // Right-click delete page (keep at least one page).
+                            if pages.len() > 1 {
+                                resp.context_menu(|ui| {
+                                    if ui.button("Delete page").clicked() {
+                                        ui.close_menu();
+                                        // Invalidate cached page list; it will be refetched asynchronously.
+                                        self.pages_cache.remove(&pages_key);
+                                        let device_id = device.id.clone();
+                                        let profile_id = selected_profile.clone();
+                                        let page_id = page_id.clone();
+                                        self.runtime.spawn(async move {
+                                            let _ = riverdeck_core::api::pages::delete_page(
+                                                device_id,
+                                                profile_id,
+                                                page_id,
+                                            )
+                                            .await;
+                                        });
+                                    }
+                                });
                             }
                         }
-                    });
-                });
-            }
 
-            // Pages (real pages inside the selected profile).
-            ui.add_space(10.0);
-            let pages = self.runtime.block_on(async {
-                riverdeck_core::api::pages::get_pages(device.id.clone(), selected_profile.clone())
-                    .await
-                    .unwrap_or_else(|_| vec!["1".to_owned()])
-            });
-            let selected_page = snapshot.page_id.clone();
-
-            ui.horizontal(|ui| {
-                // Center the page bar under the grid by reusing the same padding.
-                ui.add_space(left_pad);
-                ui.horizontal(|ui| {
-                    ui.label("Pages:");
-
-                    for page_id in pages.iter() {
-                        let label = if let Ok(n) = page_id.parse::<u32>() {
-                            n.to_string()
-                        } else {
-                            page_id.clone()
-                        };
-
-                        let selected = page_id == &selected_page;
-                        let resp = ui.selectable_label(selected, label);
-
-                        if resp.clicked() {
+                        if ui.button("+").clicked() {
+                            // Invalidate cached page list; it will be refetched asynchronously.
+                            self.pages_cache.remove(&pages_key);
                             let device_id = device.id.clone();
                             let profile_id = selected_profile.clone();
-                            let page_id = page_id.clone();
-                            let _ = self.runtime.block_on(async {
-                                riverdeck_core::api::pages::set_selected_page(device_id, profile_id, page_id).await
+                            self.runtime.spawn(async move {
+                                let _ = riverdeck_core::api::pages::create_page_and_select(
+                                    device_id,
+                                    profile_id,
+                                )
+                                .await;
                             });
                         }
-
-                        // Right-click delete page (keep at least one page).
-                        if pages.len() > 1 {
-                            resp.context_menu(|ui| {
-                                if ui.button("Delete page").clicked() {
-                                    ui.close_menu();
-                                    let device_id = device.id.clone();
-                                    let profile_id = selected_profile.clone();
-                                    let page_id = page_id.clone();
-                                    self.runtime.spawn(async move {
-                                        let _ = riverdeck_core::api::pages::delete_page(
-                                            device_id,
-                                            profile_id,
-                                            page_id,
-                                        )
-                                        .await;
-                                    });
-                                }
-                            });
-                        }
-                    }
-
-                    if ui.button("+").clicked() {
-                        let device_id = device.id.clone();
-                        let profile_id = selected_profile.clone();
-                        self.runtime.spawn(async move {
-                            let _ = riverdeck_core::api::pages::create_page_and_select(device_id, profile_id).await;
-                        });
-                    }
+                    });
                 });
             });
         });
@@ -2741,9 +3357,11 @@ impl eframe::App for RiverDeckApp {
             }
         }
 
-        // Active refresh for live previews (e.g. Stream Deck+ strip, animations, etc.).
-        // 60 FPS ~= 16.67ms
-        ctx.request_repaint_after(std::time::Duration::from_secs_f32(1.0 / 60.0));
+        // Avoid unconditional 60 FPS redraws; only repaint aggressively when needed.
+        // (Dragging, pending async refresh, or active preview updates should request repaints explicitly.)
+        if self.drag_payload.is_some() {
+            ctx.request_repaint();
+        }
     }
 }
 
@@ -2751,6 +3369,10 @@ impl Drop for RiverDeckApp {
     fn drop(&mut self) {
         self.close_pi();
         self.close_marketplace();
+        // Ensure we don't orphan plugin subprocesses (native/node/wine) on window close or tray quit.
+        // This is synchronous so it runs even if the UI is exiting.
+        self.runtime
+            .block_on(async { riverdeck_core::lifecycle::shutdown_all().await });
     }
 }
 
@@ -3058,7 +3680,18 @@ fn spawn_pi_process(
             .arg("1");
     }
 
-    Ok(cmd.spawn()?)
+    let child = cmd.spawn()?;
+    riverdeck_core::runtime_processes::record_process(
+        child.id(),
+        "riverdeck_pi",
+        vec![
+            "--label".to_owned(),
+            label.to_owned(),
+            "--ws-port".to_owned(),
+            port.to_string(),
+        ],
+    );
+    Ok(child)
 }
 
 fn spawn_web_process(
@@ -3082,7 +3715,13 @@ fn spawn_web_process(
             .arg("1");
     }
 
-    Ok(cmd.spawn()?)
+    let child = cmd.spawn()?;
+    riverdeck_core::runtime_processes::record_process(
+        child.id(),
+        "riverdeck_pi_web",
+        vec!["--label".to_owned(), label.to_owned(), "--url".to_owned()],
+    );
+    Ok(child)
 }
 
 fn pi_exe_basename() -> &'static str {
