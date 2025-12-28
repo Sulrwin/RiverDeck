@@ -1,12 +1,12 @@
 
 <p align="center">
-  <img src=".github/readme/logotrans2.png" alt="RiverDeck logo" />
+  <img src=".github/readme/logotrans.png" alt="RiverDeck logo" />
 </p>
 
 ---
 
 <p align="center">
-  <strong>Linux software for your Elgato Stream Deck</strong>
+  <strong>Cross-platform software for your Elgato Stream Deck</strong>
 </p>
 
 <p align="center">
@@ -88,8 +88,8 @@ To change other options, open Settings. From here, you can also view information
 	- The log directory can be opened from the settings page of RiverDeck, or alternatively located manually at paths similar to the below:
 		- Linux: `~/.local/share/io.github.sulrwin.riverdeck/logs/`
 		- Flatpak: `~/.var/app/io.github.sulrwin.riverdeck/data/io.github.sulrwin.riverdeck/logs/`
-		- Windows: `%appdata%\\io.github.sulrwin.riverdeck\\logs\\`
-		- macOS: `~/Library/Logs/io.github.sulrwin.riverdeck/`
+		- Windows: `%APPDATA%\io.github.sulrwin.riverdeck\logs\`
+		- macOS: `~/Library/Application Support/io.github.sulrwin.riverdeck/logs/`
 - When trying to run plugins built for Windows (which are the majority of plugins) on Linux or macOS, please ensure you have the latest version of Wine (and Wine Mono) installed on your system.
 - If your device isn't showing up, ensure you have the correct permissions to access it (e.g. on Linux, installing udev subsystem rules and restarting your system), and that you have restarted RiverDeck since connecting it.
 
@@ -115,8 +115,8 @@ On Linux, the default `riverdeck-egui` build enables tray support, which require
 RiverDeck no longer depends on Tauri.
 
 Before each commit, please ensure that all of the following are completed:
-1. Rust code has been linted using `cargo clippy` and it discovers no violations
-2. Rust code has been formatted using `cargo fmt`
+1. Rust code has been linted using `cargo clippy --workspace --all-targets -- -D warnings`
+2. Rust code has been formatted using `cargo fmt --all`
 
 When submitting contributions, please adhere to the [Conventional Commits specification](https://conventionalcommits.org/) for commit messages. You will also need to [sign your commits](https://docs.github.com/en/authentication/managing-commit-signature-verification/signing-commits). Feel free to reach out on the support channels above for guidance when contributing!
 

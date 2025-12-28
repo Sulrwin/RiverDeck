@@ -19,6 +19,22 @@
 		{
 			"type": "lldb",
 			"request": "launch",
+			"name": "Debug (egui + spawn all devices)",
+			"stopOnEntry": false,
+			"cargo": {
+				"args": [
+					"run",
+					"-p",
+					"riverdeck-egui",
+					"--",
+					"--replace",
+					"--spawn-all-devices"
+				]
+			}
+		},
+		{
+			"type": "lldb",
+			"request": "launch",
 			"name": "Show existing (egui)",
 			"stopOnEntry": false,
 			"cargo": {

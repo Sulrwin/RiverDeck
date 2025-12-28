@@ -1,12 +1,67 @@
 use super::{GenericInstancePayload, send_to_plugin};
 
-use crate::shared::{ActionContext, Context, DEVICES};
+use crate::shared::{ActionContext, ActionInstance, Context, DEVICES};
 use crate::store::profiles::{acquire_locks_mut, get_slot_mut, save_profile};
 use crate::ui::{self, UiEvent};
 
 use std::time::Duration;
 
 use serde::Serialize;
+
+fn multi_action_run_on(settings: &serde_json::Value) -> &'static str {
+    match settings
+        .get("runOn")
+        .and_then(|v| v.as_str())
+        .unwrap_or("keyDown")
+    {
+        "keyUp" => "keyUp",
+        _ => "keyDown",
+    }
+}
+
+async fn execute_multi_action(
+    instance: &mut ActionInstance,
+) -> Result<Vec<ActionContext>, anyhow::Error> {
+    let Some(children) = instance.children.as_mut() else {
+        return Ok(vec![]);
+    };
+
+    for child in children.iter_mut() {
+        send_to_plugin(
+            &child.action.plugin,
+            &KeyEvent {
+                event: "keyDown",
+                action: child.action.uuid.clone(),
+                context: child.context.clone(),
+                device: child.context.device.clone(),
+                payload: GenericInstancePayload::new(child),
+            },
+        )
+        .await?;
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        if child.states.len() == 2 && !child.action.disable_automatic_states {
+            child.current_state = (child.current_state + 1) % (child.states.len() as u16);
+        }
+
+        send_to_plugin(
+            &child.action.plugin,
+            &KeyEvent {
+                event: "keyUp",
+                action: child.action.uuid.clone(),
+                context: child.context.clone(),
+                device: child.context.device.clone(),
+                payload: GenericInstancePayload::new(child),
+            },
+        )
+        .await?;
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    Ok(children.iter().map(|c| c.context.clone()).collect())
+}
 
 #[derive(Serialize)]
 struct KeyEvent {
@@ -44,52 +99,15 @@ pub async fn key_down(device: &str, key: u8) -> Result<(), anyhow::Error> {
         return Ok(());
     };
     if crate::shared::is_multi_action_uuid(instance.action.uuid.as_str()) {
-        for child in instance.children.as_mut().unwrap() {
-            send_to_plugin(
-                &child.action.plugin,
-                &KeyEvent {
-                    event: "keyDown",
-                    action: child.action.uuid.clone(),
-                    context: child.context.clone(),
-                    device: child.context.device.clone(),
-                    payload: GenericInstancePayload::new(child),
-                },
-            )
-            .await?;
+        if multi_action_run_on(&instance.settings) == "keyDown" {
+            let contexts = execute_multi_action(instance).await?;
 
-            tokio::time::sleep(Duration::from_millis(100)).await;
-
-            if child.states.len() == 2 && !child.action.disable_automatic_states {
-                child.current_state = (child.current_state + 1) % (child.states.len() as u16);
+            for child in contexts {
+                ui::emit(UiEvent::ActionStateChanged { context: child });
             }
 
-            send_to_plugin(
-                &child.action.plugin,
-                &KeyEvent {
-                    event: "keyUp",
-                    action: child.action.uuid.clone(),
-                    context: child.context.clone(),
-                    device: child.context.device.clone(),
-                    payload: GenericInstancePayload::new(child),
-                },
-            )
-            .await?;
-
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            save_profile(device, &mut locks).await?;
         }
-
-        let contexts = instance
-            .children
-            .as_ref()
-            .unwrap()
-            .iter()
-            .map(|x| x.context.clone())
-            .collect::<Vec<_>>();
-        for child in contexts {
-            ui::emit(UiEvent::ActionStateChanged { context: child });
-        }
-
-        save_profile(device, &mut locks).await?;
     } else if crate::shared::is_toggle_action_uuid(instance.action.uuid.as_str()) {
         let children = instance.children.as_ref().unwrap();
         if children.is_empty() {
@@ -169,7 +187,14 @@ pub async fn key_up(device: &str, key: u8) -> Result<(), anyhow::Error> {
         )
         .await?;
         instance.current_state = ((index + 1) % instance.children.as_ref().unwrap().len()) as u16;
-    } else if !crate::shared::is_multi_action_uuid(instance.action.uuid.as_str()) {
+    } else if crate::shared::is_multi_action_uuid(instance.action.uuid.as_str()) {
+        if multi_action_run_on(&instance.settings) == "keyUp" {
+            let contexts = execute_multi_action(instance).await?;
+            for child in contexts {
+                ui::emit(UiEvent::ActionStateChanged { context: child });
+            }
+        }
+    } else {
         if instance.states.len() == 2 && !instance.action.disable_automatic_states {
             instance.current_state = (instance.current_state + 1) % (instance.states.len() as u16);
         }

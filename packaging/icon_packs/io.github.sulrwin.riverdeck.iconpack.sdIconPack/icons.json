@@ -1,0 +1,16 @@
+{
+  "icons": [
+    {
+      "path": "riverdeck/multi-action.png",
+      "name": "Multi Action",
+      "tags": ["riverdeck", "multi", "action"]
+    },
+    {
+      "path": "riverdeck/toggle-action.png",
+      "name": "Toggle Action",
+      "tags": ["riverdeck", "toggle", "action"]
+    }
+  ]
+}
+
+

@@ -3,6 +3,7 @@ use std::env::var;
 use std::path::{Path, PathBuf};
 
 use directories::BaseDirs;
+use log::warn;
 use serde::{Deserialize, Deserializer, Serialize, de::Visitor};
 use serde_inline_default::serde_inline_default;
 
@@ -172,6 +173,33 @@ pub fn data_dir() -> std::path::PathBuf {
 
 pub fn resource_dir() -> Option<PathBuf> {
     paths().resource_dir.clone()
+}
+
+/// Ensure core built-in action icons exist on disk.
+///
+/// Core built-ins reference `riverdeck/*.png` paths. In packaged builds these typically live under
+/// `resource_dir`, but in dev/debug builds we may not have bundled resources. To keep built-in
+/// actions functional (and avoid noisy "image path not found" warnings), create placeholder icons
+/// under `config_dir/riverdeck/` if they are missing.
+pub fn ensure_builtin_icons() {
+    let dir = config_dir().join("riverdeck");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+
+    fn ensure_solid_png(path: &Path, rgba: [u8; 4]) {
+        if path.is_file() {
+            return;
+        }
+        let img = image::RgbaImage::from_pixel(96, 96, image::Rgba(rgba));
+        if let Err(err) = img.save_with_format(path, image::ImageFormat::Png) {
+            warn!("Failed to create builtin icon {}: {}", path.display(), err);
+        }
+    }
+
+    // Minimal placeholders; devices/UI will scale these as needed.
+    ensure_solid_png(&dir.join("multi-action.png"), [0x2d, 0x9c, 0xdb, 0xff]);
+    ensure_solid_png(&dir.join("toggle-action.png"), [0xf2, 0xc9, 0x4c, 0xff]);
 }
 
 /// Get whether or not the application is running inside the Flatpak sandbox.

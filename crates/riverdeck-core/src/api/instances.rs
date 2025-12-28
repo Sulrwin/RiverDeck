@@ -6,6 +6,32 @@ use crate::ui::{self, UiEvent};
 
 use tokio::fs::remove_dir_all;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MultiActionRunOn {
+    KeyDown,
+    KeyUp,
+}
+
+impl MultiActionRunOn {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::KeyDown => "keyDown",
+            Self::KeyUp => "keyUp",
+        }
+    }
+}
+
+fn parse_multi_action_run_on(settings: &serde_json::Value) -> MultiActionRunOn {
+    match settings
+        .get("runOn")
+        .and_then(|v| v.as_str())
+        .unwrap_or("keyDown")
+    {
+        "keyUp" => MultiActionRunOn::KeyUp,
+        _ => MultiActionRunOn::KeyDown,
+    }
+}
+
 pub async fn create_instance(
     action: Action,
     context: Context,
@@ -34,6 +60,16 @@ pub async fn create_instance(
         let Some(children) = &mut parent.children else {
             return Ok(None);
         };
+        // When adding a child to a Multi/Toggle action, enforce multi-action constraints.
+        if crate::shared::is_multi_action_uuid(action.uuid.as_str())
+            || crate::shared::is_toggle_action_uuid(action.uuid.as_str())
+        {
+            return Ok(None);
+        }
+        if !action.supported_in_multi_actions {
+            return Ok(None);
+        }
+
         let index = match children.last() {
             None => 1,
             Some(instance) => instance.context.index + 1,
@@ -89,6 +125,93 @@ pub async fn create_instance(
 
         Ok(slot)
     }
+}
+
+pub async fn set_multi_action_run_on(
+    parent_ctx: ActionContext,
+    run_on: MultiActionRunOn,
+) -> Result<(), anyhow::Error> {
+    let mut locks = acquire_locks_mut().await;
+    let device_id = {
+        let Some(instance) =
+            crate::store::profiles::get_instance_mut(&parent_ctx, &mut locks).await?
+        else {
+            return Ok(());
+        };
+
+        // Only parent instances (index 0) can be Multi Actions.
+        if instance.context.index != 0
+            || !crate::shared::is_multi_action_uuid(instance.action.uuid.as_str())
+        {
+            return Ok(());
+        }
+
+        let current = parse_multi_action_run_on(&instance.settings);
+        if current == run_on {
+            return Ok(());
+        }
+
+        let settings_obj = match instance.settings.as_object_mut() {
+            Some(obj) => obj,
+            None => {
+                instance.settings = serde_json::Value::Object(serde_json::Map::new());
+                instance.settings.as_object_mut().unwrap()
+            }
+        };
+        settings_obj.insert(
+            "runOn".to_owned(),
+            serde_json::Value::String(run_on.as_str().to_owned()),
+        );
+
+        ui::emit(UiEvent::ActionStateChanged {
+            context: instance.context.clone(),
+        });
+        instance.context.device.clone()
+    };
+
+    save_profile(&device_id, &mut locks).await?;
+    Ok(())
+}
+
+pub async fn reorder_multi_action_child(
+    parent_ctx: ActionContext,
+    from: usize,
+    to: usize,
+) -> Result<(), anyhow::Error> {
+    if from == to {
+        return Ok(());
+    }
+    let mut locks = acquire_locks_mut().await;
+    let device_id = {
+        let Some(instance) =
+            crate::store::profiles::get_instance_mut(&parent_ctx, &mut locks).await?
+        else {
+            return Ok(());
+        };
+        if instance.context.index != 0
+            || !crate::shared::is_multi_action_uuid(instance.action.uuid.as_str())
+        {
+            return Ok(());
+        }
+        let Some(children) = instance.children.as_mut() else {
+            return Ok(());
+        };
+        if from >= children.len() || to >= children.len() {
+            return Ok(());
+        }
+
+        // Preserve child contexts; ordering is what matters for execution.
+        let child = children.remove(from);
+        children.insert(to, child);
+
+        ui::emit(UiEvent::ActionStateChanged {
+            context: instance.context.clone(),
+        });
+        instance.context.device.clone()
+    };
+
+    save_profile(&device_id, &mut locks).await?;
+    Ok(())
 }
 
 pub async fn set_button_label(context: ActionContext, label: String) -> Result<(), anyhow::Error> {
@@ -365,8 +488,12 @@ pub async fn set_custom_icon_from_path(
         .unwrap_or("png")
         .to_lowercase();
     let ext = match ext.as_str() {
-        "png" | "jpg" | "jpeg" => ext,
-        _ => return Err(anyhow::anyhow!("unsupported image type (use png/jpg/jpeg)")),
+        "png" | "jpg" | "jpeg" | "webp" => ext,
+        _ => {
+            return Err(anyhow::anyhow!(
+                "unsupported image type (use png/jpg/jpeg/webp)"
+            ));
+        }
     };
 
     let mut locks = acquire_locks_mut().await;
@@ -561,6 +688,173 @@ pub async fn move_instance(
     });
 
     Ok(Some(new))
+}
+
+/// Swap two action instances between slots.
+///
+/// Semantics:
+/// - If both slots are empty: no-op.
+/// - If exactly one slot is occupied: moves the instance to the other slot (source becomes empty).
+/// - If both slots are occupied: swaps the two instances.
+///
+/// Constraints:
+/// - Only supports swapping within the same controller type (Keypad↔Keypad or Encoder↔Encoder).
+/// - Both contexts must refer to the same device/profile/page (UI expectation).
+pub async fn swap_instances(a: Context, b: Context) -> Result<(), anyhow::Error> {
+    if a == b {
+        return Ok(());
+    }
+    if a.controller != b.controller {
+        return Ok(());
+    }
+    if a.device != b.device || a.profile != b.profile || a.page != b.page {
+        return Err(anyhow::anyhow!(
+            "swap_instances requires same device/profile/page"
+        ));
+    }
+
+    // Snapshot occupancy first (read-only lock).
+    let (a_has, b_has) = {
+        let locks = crate::store::profiles::acquire_locks().await;
+        let a_slot = crate::store::profiles::get_slot(&a, &locks).await?;
+        let b_slot = crate::store::profiles::get_slot(&b, &locks).await?;
+        (a_slot.is_some(), b_slot.is_some())
+    };
+
+    match (a_has, b_has) {
+        (false, false) => Ok(()),
+        (true, false) => {
+            let _ = move_instance(a, b, false).await?;
+            Ok(())
+        }
+        (false, true) => {
+            let _ = move_instance(b, a, false).await?;
+            Ok(())
+        }
+        (true, true) => {
+            let mut locks = acquire_locks_mut().await;
+
+            // Take both instances out of their slots (avoid holding two mutable borrows at once).
+            let mut a_inst = {
+                let slot = get_slot_mut(&a, &mut locks).await?;
+                slot.take()
+            }
+            .unwrap();
+            let mut b_inst = {
+                let slot = get_slot_mut(&b, &mut locks).await?;
+                slot.take()
+            }
+            .unwrap();
+
+            // Preserve old contexts for willDisappear notifications.
+            let a_old_inst = a_inst.clone();
+            let b_old_inst = b_inst.clone();
+
+            let a_old_ctx = a_inst.context.clone();
+            let b_old_ctx = b_inst.context.clone();
+
+            // Retarget contexts (including children) to the new slot coordinates.
+            let retarget = |instance: &mut ActionInstance, destination: &Context| {
+                instance.context = ActionContext::from_context(destination.clone(), 0);
+                if let Some(children) = &mut instance.children {
+                    for (index, child) in children.iter_mut().enumerate() {
+                        child.context =
+                            ActionContext::from_context(destination.clone(), index as u16 + 1);
+                        // Keep child state images valid (match existing move_instance behavior).
+                        for (i, st) in child.states.iter_mut().enumerate() {
+                            if !child.action.states[i].image.is_empty() {
+                                st.image = child.action.states[i].image.clone();
+                            } else {
+                                st.image = child.action.icon.clone();
+                            }
+                        }
+                    }
+                }
+            };
+            retarget(&mut a_inst, &b);
+            retarget(&mut b_inst, &a);
+
+            // Swap custom icon directories (index 0) and rewrite any state image paths that point
+            // inside those directories.
+            let a_old_dir = instance_images_dir(&a_old_ctx);
+            let b_old_dir = instance_images_dir(&b_old_ctx);
+            let a_new_dir = instance_images_dir(&a_inst.context);
+            let b_new_dir = instance_images_dir(&b_inst.context);
+
+            // Best-effort directory swap. If a dir doesn't exist, treat it as empty.
+            let safe = |s: &str| s.replace(['/', '\\'], "_");
+            let tmp_dir = config_dir().join("images").join(format!(
+                "__swap_tmp_{}_{}_{}_{}_{}_{}",
+                safe(&a.device),
+                safe(&a.profile),
+                safe(&a.page),
+                safe(&a.controller),
+                a.position,
+                b.position
+            ));
+            let _ = remove_dir_all(&tmp_dir).await;
+            let _ = tokio::fs::create_dir_all(tmp_dir.parent().unwrap()).await;
+            if a_old_dir.exists() {
+                let _ = tokio::fs::rename(&a_old_dir, &tmp_dir).await;
+            }
+            if b_old_dir.exists() {
+                let _ = tokio::fs::create_dir_all(a_old_dir.parent().unwrap()).await;
+                let _ = tokio::fs::rename(&b_old_dir, &a_old_dir).await;
+            }
+            if tmp_dir.exists() {
+                let _ = tokio::fs::create_dir_all(b_old_dir.parent().unwrap()).await;
+                let _ = tokio::fs::rename(&tmp_dir, &b_old_dir).await;
+            }
+
+            for st in a_inst.states.iter_mut() {
+                let path = std::path::Path::new(&st.image);
+                if path.starts_with(&a_old_dir) {
+                    st.image = a_new_dir
+                        .join(path.strip_prefix(&a_old_dir).unwrap())
+                        .to_string_lossy()
+                        .into_owned();
+                }
+            }
+            for st in b_inst.states.iter_mut() {
+                let path = std::path::Path::new(&st.image);
+                if path.starts_with(&b_old_dir) {
+                    st.image = b_new_dir
+                        .join(path.strip_prefix(&b_old_dir).unwrap())
+                        .to_string_lossy()
+                        .into_owned();
+                }
+            }
+
+            // Notify plugins that the instances disappeared from their old contexts.
+            // We ignore errors here as in other APIs (best-effort).
+            let _ = crate::events::outbound::will_appear::will_disappear(&a_old_inst, true).await;
+            let _ = crate::events::outbound::will_appear::will_disappear(&b_old_inst, true).await;
+
+            // Put swapped instances back into their new slots.
+            {
+                let slot = get_slot_mut(&a, &mut locks).await?;
+                *slot = Some(b_inst.clone());
+            }
+            {
+                let slot = get_slot_mut(&b, &mut locks).await?;
+                *slot = Some(a_inst.clone());
+            }
+
+            // Notify plugins that the instances appeared at their new contexts.
+            let _ = crate::events::outbound::will_appear::will_appear(&b_inst).await;
+            let _ = crate::events::outbound::will_appear::will_appear(&a_inst).await;
+
+            save_profile(&a.device, &mut locks).await?;
+            ui::emit(UiEvent::ActionStateChanged {
+                context: a_inst.context.clone(),
+            });
+            ui::emit(UiEvent::ActionStateChanged {
+                context: b_inst.context.clone(),
+            });
+
+            Ok(())
+        }
+    }
 }
 
 pub async fn remove_instance(context: ActionContext) -> Result<(), anyhow::Error> {

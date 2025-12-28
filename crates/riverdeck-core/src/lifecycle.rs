@@ -20,8 +20,11 @@ pub async fn shutdown_all() {
     let _ = tokio::time::timeout(Duration::from_millis(500), crate::elgato::reset_devices()).await;
 
     // Kill any plugin instances we know about.
-    let _ = tokio::time::timeout(Duration::from_secs(2), crate::plugins::deactivate_all_plugins())
-        .await;
+    let _ = tokio::time::timeout(
+        Duration::from_secs(2),
+        crate::plugins::deactivate_all_plugins(),
+    )
+    .await;
 
     // As a last-resort, try to kill anything recorded in the process registry too.
     // (This helps for SIGTERM shutdown paths where frontends might not drop cleanly.)

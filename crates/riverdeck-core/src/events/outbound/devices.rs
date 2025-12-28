@@ -53,9 +53,7 @@ pub async fn update_image(
     update_image_with_overlays(context, image, None).await
 }
 
-pub(crate) fn overlays_for_instance(
-    instance: &ActionInstance,
-) -> Option<Vec<(String, TextPlacement)>> {
+pub fn overlays_for_instance(instance: &ActionInstance) -> Option<Vec<(String, TextPlacement)>> {
     let st = instance.states.get(instance.current_state as usize)?;
 
     let title = st.text.trim();

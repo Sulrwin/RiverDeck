@@ -1,3 +1,4 @@
+pub mod icon_packs;
 pub mod instances;
 pub mod pages;
 pub mod plugins;

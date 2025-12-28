@@ -2,7 +2,7 @@
 Type=Application
 Name=RiverDeck
 Comment=Use stream controllers
-Exec=riverdeck
+Exec=riverdeck --replace %u
 Icon=riverdeck
 Terminal=false
 Categories=Utility;
