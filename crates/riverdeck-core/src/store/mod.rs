@@ -156,6 +156,8 @@ pub struct Settings {
     pub separatewine: bool,
     pub developer: bool,
     pub disableelgato: bool,
+    /// Plugin IDs (folder names) that should not be launched at startup.
+    pub disabled_plugins: Vec<String>,
 }
 
 impl Default for Settings {
@@ -174,6 +176,7 @@ impl Default for Settings {
             separatewine: false,
             developer: false,
             disableelgato: false,
+            disabled_plugins: vec![],
         }
     }
 }

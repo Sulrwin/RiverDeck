@@ -580,6 +580,7 @@ fn read_lock_ipc_port(lock_file: &mut std::fs::File) -> Option<u16> {
 
 fn is_deep_link_arg(arg: &str) -> bool {
     arg.starts_with("openaction://")
+        || arg.starts_with("opendeck://")
         || arg.starts_with("streamdeck://")
         || arg.starts_with("riverdeck://")
 }
@@ -630,7 +631,16 @@ async fn start_ipc_server() -> anyhow::Result<u16> {
                             }
                             Ok(())
                         }
-                        IpcRequest::DeepLink { url } => handle_deep_link_arg(&url).await,
+                        IpcRequest::DeepLink { url } => {
+                            log::info!("IPC deep link received: {url}");
+                            match handle_deep_link_arg(&url).await {
+                                Ok(()) => Ok(()),
+                                Err(err) => {
+                                    log::warn!("IPC deep link handling failed: {err:#}");
+                                    Err(err)
+                                }
+                            }
+                        }
                         IpcRequest::MarketplaceToken { token } => {
                             log::info!(
                                 "Marketplace token received via IPC (len={})",
@@ -804,6 +814,7 @@ fn handle_startup_args(runtime: Arc<Runtime>, args: Vec<String>) {
     runtime.spawn(async move {
         for arg in &args {
             if arg.starts_with("openaction://")
+                || arg.starts_with("opendeck://")
                 || arg.starts_with("streamdeck://")
                 || arg.starts_with("riverdeck://")
             {
@@ -834,16 +845,180 @@ async fn handle_deep_link_arg(arg: &str) -> anyhow::Result<()> {
     let kind = segments.first().copied().unwrap_or_default();
     let raw_id = segments.get(1).copied().unwrap_or_default();
 
+    // OpenAction Marketplace (`marketplace.rivul.us`) installs currently trigger OpenDeck-style
+    // deep links like `opendeck://installPlugin/<pluginId>`.
+    if url.scheme() == "opendeck" && host.eq_ignore_ascii_case("installPlugin") {
+        let plugin_id = url
+            .path_segments()
+            .and_then(|mut s| s.next())
+            .unwrap_or_default()
+            .trim();
+        if plugin_id.is_empty() {
+            return Ok(());
+        }
+
+        let resolved =
+            match riverdeck_core::openaction_marketplace::resolve_install(plugin_id).await {
+                Ok(r) => r,
+                Err(e) => {
+                    let msg = format!("OpenAction marketplace install failed: {e:#}");
+                    riverdeck_core::ui::emit(riverdeck_core::ui::UiEvent::PluginInstall {
+                        id: plugin_id.to_owned(),
+                        phase: riverdeck_core::ui::PluginInstallPhase::Finished {
+                            ok: false,
+                            error: Some(msg.clone()),
+                        },
+                    });
+                    return Err(anyhow::anyhow!(msg));
+                }
+            };
+
+        if let Some(download_url) = resolved.download_url.as_deref() {
+            log::info!(
+                "Installing plugin via OpenAction marketplace: id={}, url={}",
+                resolved.plugin_id,
+                download_url
+            );
+            if let Err(err) = riverdeck_core::api::plugins::install_plugin(
+                Some(download_url.to_owned()),
+                None,
+                Some(resolved.plugin_id.clone()),
+            )
+            .await
+            {
+                riverdeck_core::ui::emit(riverdeck_core::ui::UiEvent::PluginInstall {
+                    id: resolved.plugin_id.clone(),
+                    phase: riverdeck_core::ui::PluginInstallPhase::Finished {
+                        ok: false,
+                        error: Some(format!("{err:#}")),
+                    },
+                });
+                return Err(err);
+            }
+            riverdeck_core::plugins::initialise_plugins();
+            return Ok(());
+        }
+
+        // No direct download artifact found. Open the repository (best-effort) and surface a clear
+        // message so this doesn't feel like a no-op.
+        if let Some(repo) = resolved.repository_url.as_deref() {
+            open_url_in_browser(repo);
+        }
+        riverdeck_core::ui::emit(riverdeck_core::ui::UiEvent::PluginInstall {
+            id: resolved.plugin_id.clone(),
+            phase: riverdeck_core::ui::PluginInstallPhase::Finished {
+                ok: false,
+                error: Some(
+                    "This OpenAction marketplace entry does not provide an installable download artifact. RiverDeck tried the repo’s GitHub releases, but couldn’t find a `.streamDeckPlugin`/`.zip` asset. Please download the plugin bundle from the repository and install it via Settings → Plugins → Install…"
+                        .to_owned(),
+                ),
+            },
+        });
+        return Ok(());
+    }
+
     // Plugin deep-link handling (existing behavior).
     //
     // Note: The Elgato marketplace has used multiple path forms over time, e.g.
     // `streamdeck://plugins/message/<id>` and `streamdeck://plugins/install/<id>`.
     // Treat both as "install/route to plugin" requests.
     if host == "plugins" && (kind == "message" || kind == "install") {
-        // Newer marketplace deep links (`.../install/<uuid>`) often only include a marketplace
-        // *variant id* and require a Marketplace session token to resolve into a signed download
-        // URL. We capture this token from the Marketplace webview (best-effort) and use it here.
-        if kind == "install" && !raw_id.is_empty() {
+        // The Elgato marketplace uses `streamdeck://plugins/message/<id>`.
+        // In RiverDeck we represent plugin IDs as `<id>.sdPlugin`.
+        let plugin_id = if raw_id.is_empty() {
+            String::new()
+        } else if url.scheme() == "streamdeck" && !raw_id.ends_with(".sdPlugin") {
+            format!("{raw_id}.sdPlugin")
+        } else {
+            raw_id.to_owned()
+        };
+
+        // If plugin is already installed, forward deep link to it (Stream Deck SDK behavior).
+        if !plugin_id.is_empty() {
+            let installed = shared::config_dir()
+                .join("plugins")
+                .join(&plugin_id)
+                .is_dir();
+            if installed {
+                let _ = riverdeck_core::events::outbound::deep_link::did_receive_deep_link(
+                    &plugin_id,
+                    arg.to_owned(),
+                )
+                .await;
+                return Ok(());
+            }
+        }
+
+        // Not installed: treat as marketplace "install" request.
+        if let Some(download_url) = extract_plugin_download_url(&url) {
+            let download_l = download_url.to_lowercase();
+            let is_icon_pack = download_l.contains(".streamdeckiconpack")
+                || download_l.contains("streamdeckiconpack");
+
+            if is_icon_pack {
+                log::info!("Installing icon pack via deep link: id={raw_id}, url={download_url}");
+                let fallback_id = raw_id.to_owned();
+                let _installed_id = riverdeck_core::api::icon_packs::install_icon_pack(
+                    download_url,
+                    Some(fallback_id),
+                )
+                .await?;
+                return Ok(());
+            }
+
+            // Some deep links omit the plugin id in the path. Try to infer a stable-ish fallback id
+            // from the download URL, otherwise fall back to an empty id (the installer still works).
+            let inferred_fallback_id = reqwest::Url::parse(&download_url)
+                .ok()
+                .and_then(|u| {
+                    u.path_segments()
+                        .and_then(|mut s| s.next_back().map(|x| x.to_owned()))
+                })
+                .unwrap_or_default()
+                .trim()
+                .trim_end_matches(".streamDeckPlugin")
+                .trim_end_matches(".streamdeckplugin")
+                .trim_end_matches(".zip")
+                .to_owned();
+            let fallback_id = if !plugin_id.is_empty() {
+                plugin_id
+                    .strip_suffix(".sdPlugin")
+                    .unwrap_or(plugin_id.as_str())
+                    .to_owned()
+            } else if !raw_id.is_empty() {
+                raw_id.to_owned()
+            } else if !inferred_fallback_id.is_empty() {
+                inferred_fallback_id
+            } else {
+                "plugin".to_owned()
+            };
+
+            let log_id = if plugin_id.is_empty() {
+                fallback_id.as_str()
+            } else {
+                plugin_id.as_str()
+            };
+            log::info!("Installing plugin via deep link: id={log_id}, url={download_url}");
+            riverdeck_core::api::plugins::install_plugin(
+                Some(download_url),
+                None,
+                Some(fallback_id),
+            )
+            .await?;
+            // Make it available immediately (best-effort).
+            riverdeck_core::plugins::initialise_plugins();
+            return Ok(());
+        }
+
+        // If we couldn't extract a direct download URL, fall back to Elgato-specific resolution
+        // for Stream Deck marketplace install links like `streamdeck://plugins/install/<variantId>`.
+        //
+        // Important: only do this for `streamdeck://...` links so we don't block other ecosystems
+        // (e.g. OpenAction/OpenDeck style deep links).
+        if kind == "install" && url.scheme() == "streamdeck" && !raw_id.is_empty() {
+            // Newer marketplace deep links (`.../install/<uuid>`) often only include a marketplace
+            // *variant id* and require a Marketplace session token to resolve into a signed download
+            // URL. We capture this token from the Marketplace webview (best-effort) and use it here.
             if let Some(tok) = riverdeck_core::marketplace::marketplace_access_token()
                 && let Some(links) = riverdeck_core::marketplace::purchase_link(&tok, raw_id).await
             {
@@ -863,7 +1038,7 @@ async fn handle_deep_link_arg(arg: &str) -> anyhow::Result<()> {
                     });
                 if let Some(download_url) = candidate {
                     log::info!(
-                        "Installing plugin via marketplace token: id={raw_id}, url={download_url}"
+                        "Installing plugin via Elgato marketplace token: id={raw_id}, url={download_url}"
                     );
                     let res = riverdeck_core::api::plugins::install_plugin(
                         Some(download_url),
@@ -968,98 +1143,11 @@ async fn handle_deep_link_arg(arg: &str) -> anyhow::Result<()> {
                 phase: riverdeck_core::ui::PluginInstallPhase::Finished {
                     ok: false,
                     error: Some(
-                        "Marketplace install links require a Marketplace session token to resolve into a download URL. Open the Marketplace window in RiverDeck (so it can capture your session), then try again — or download the .streamDeckPlugin and install via Settings → Plugins → Install…"
+                        "Elgato Marketplace install links require a Marketplace session token to resolve into a download URL. Open the Marketplace window in RiverDeck (so it can capture your session), then try again — or download the .streamDeckPlugin and install via Settings → Plugins → Install…"
                             .to_owned(),
                     ),
                 },
             });
-            return Ok(());
-        }
-
-        // The Elgato marketplace uses `streamdeck://plugins/message/<id>`.
-        // In RiverDeck we represent plugin IDs as `<id>.sdPlugin`.
-        let plugin_id = if raw_id.is_empty() {
-            String::new()
-        } else if url.scheme() == "streamdeck" && !raw_id.ends_with(".sdPlugin") {
-            format!("{raw_id}.sdPlugin")
-        } else {
-            raw_id.to_owned()
-        };
-
-        // If plugin is already installed, forward deep link to it (Stream Deck SDK behavior).
-        if !plugin_id.is_empty() {
-            let installed = shared::config_dir()
-                .join("plugins")
-                .join(&plugin_id)
-                .is_dir();
-            if installed {
-                let _ = riverdeck_core::events::outbound::deep_link::did_receive_deep_link(
-                    &plugin_id,
-                    arg.to_owned(),
-                )
-                .await;
-                return Ok(());
-            }
-        }
-
-        // Not installed: treat as marketplace "install" request.
-        if let Some(download_url) = extract_plugin_download_url(&url) {
-            let download_l = download_url.to_lowercase();
-            let is_icon_pack = download_l.contains(".streamdeckiconpack")
-                || download_l.contains("streamdeckiconpack");
-
-            if is_icon_pack {
-                log::info!("Installing icon pack via deep link: id={raw_id}, url={download_url}");
-                let fallback_id = raw_id.to_owned();
-                let _installed_id = riverdeck_core::api::icon_packs::install_icon_pack(
-                    download_url,
-                    Some(fallback_id),
-                )
-                .await?;
-                return Ok(());
-            }
-
-            // Some deep links omit the plugin id in the path. Try to infer a stable-ish fallback id
-            // from the download URL, otherwise fall back to an empty id (the installer still works).
-            let inferred_fallback_id = reqwest::Url::parse(&download_url)
-                .ok()
-                .and_then(|u| {
-                    u.path_segments()
-                        .and_then(|mut s| s.next_back().map(|x| x.to_owned()))
-                })
-                .unwrap_or_default()
-                .trim()
-                .trim_end_matches(".streamDeckPlugin")
-                .trim_end_matches(".streamdeckplugin")
-                .trim_end_matches(".zip")
-                .to_owned();
-            let fallback_id = if !plugin_id.is_empty() {
-                plugin_id
-                    .strip_suffix(".sdPlugin")
-                    .unwrap_or(plugin_id.as_str())
-                    .to_owned()
-            } else if !raw_id.is_empty() {
-                raw_id.to_owned()
-            } else if !inferred_fallback_id.is_empty() {
-                inferred_fallback_id
-            } else {
-                "plugin".to_owned()
-            };
-
-            let log_id = if plugin_id.is_empty() {
-                fallback_id.as_str()
-            } else {
-                plugin_id.as_str()
-            };
-            log::info!("Installing plugin via deep link: id={log_id}, url={download_url}");
-            riverdeck_core::api::plugins::install_plugin(
-                Some(download_url),
-                None,
-                Some(fallback_id),
-            )
-            .await?;
-            // Make it available immediately (best-effort).
-            riverdeck_core::plugins::initialise_plugins();
             return Ok(());
         }
 
@@ -1358,6 +1446,25 @@ struct RiverDeckApp {
     button_label_placement: shared::TextPlacement,
     button_show_title: bool,
     button_show_action_name: bool,
+    // Native action options editor (replaces PI for supported actions).
+    options_editor_context: Option<shared::ActionContext>,
+    // Starterpack: Run Command
+    sp_run_command_down: String,
+    sp_run_command_up: String,
+    sp_run_command_rotate: String,
+    sp_run_command_file: String,
+    sp_run_command_show: bool,
+    // Starterpack: Input Simulation
+    sp_input_sim_down: String,
+    sp_input_sim_up: String,
+    sp_input_sim_anticlockwise: String,
+    sp_input_sim_clockwise: String,
+    // Starterpack: Switch Profile
+    sp_switch_profile_device: String,
+    sp_switch_profile_profile: String,
+    // Starterpack: Device Brightness
+    sp_device_brightness_action: String, // "set" | "increase" | "decrease"
+    sp_device_brightness_value: i32,     // 0..=100
     action_search: String,
     texture_cache: HashMap<String, CachedTexture>,
 
@@ -1366,9 +1473,9 @@ struct RiverDeckApp {
     categories_inflight: bool,
     categories_rx: Option<mpsc::Receiver<std::collections::HashMap<String, shared::Category>>>,
 
-    plugins_cache: Option<Vec<riverdeck_core::api::plugins::PluginInfo>>,
+    plugins_cache: Option<Vec<riverdeck_core::plugins::marketplace::LocalPluginEntry>>,
     plugins_inflight: bool,
-    plugins_rx: Option<mpsc::Receiver<Vec<riverdeck_core::api::plugins::PluginInfo>>>,
+    plugins_rx: Option<mpsc::Receiver<Vec<riverdeck_core::plugins::marketplace::LocalPluginEntry>>>,
 
     pages_cache: HashMap<(String, String), Vec<String>>, // (device_id, profile_id) -> pages
     pages_inflight: Option<(String, String)>,
@@ -1389,11 +1496,6 @@ struct RiverDeckApp {
     settings_screensaver: bool,
     settings_error: Option<String>,
 
-    // Action editor / Property Inspector (PI) window state.
-    pi_child: Option<std::process::Child>,
-    pi_for_context: Option<shared::ActionContext>,
-    pi_last_error: Option<String>,
-
     // Marketplace window state (a simple webview window via `riverdeck-pi`).
     marketplace_child: Option<std::process::Child>,
     marketplace_last_error: Option<String>,
@@ -1406,6 +1508,7 @@ struct RiverDeckApp {
     // Plugin management UI.
     show_manage_plugins: bool,
     plugin_manage_error: Option<String>,
+    #[allow(dead_code)]
     pending_plugin_install_pick: Option<mpsc::Receiver<Option<PathBuf>>>,
     pending_plugin_install_result: Option<mpsc::Receiver<Result<(), String>>>,
 
@@ -1436,6 +1539,19 @@ enum ToastLevel {
     Info,
     Success,
     Error,
+}
+
+#[derive(Debug, Clone)]
+struct LocalMarketplacePluginRow {
+    id: String,
+    name: String,
+    icon: Option<String>,
+    version: Option<String>,
+    installed: bool,
+    enabled: bool,
+    source: riverdeck_core::plugins::marketplace::PluginSource,
+    support: riverdeck_core::plugins::marketplace::PluginSupport,
+    path: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1693,6 +1809,20 @@ impl RiverDeckApp {
             button_label_placement: shared::TextPlacement::Bottom,
             button_show_title: true,
             button_show_action_name: true,
+            options_editor_context: None,
+            sp_run_command_down: String::new(),
+            sp_run_command_up: String::new(),
+            sp_run_command_rotate: String::new(),
+            sp_run_command_file: String::new(),
+            sp_run_command_show: false,
+            sp_input_sim_down: String::new(),
+            sp_input_sim_up: String::new(),
+            sp_input_sim_anticlockwise: String::new(),
+            sp_input_sim_clockwise: String::new(),
+            sp_switch_profile_device: String::new(),
+            sp_switch_profile_profile: "Default".to_owned(),
+            sp_device_brightness_action: "set".to_owned(),
+            sp_device_brightness_value: 50,
             action_search: String::new(),
             texture_cache: HashMap::new(),
             categories_cache: None,
@@ -1714,9 +1844,6 @@ impl RiverDeckApp {
             settings_autostart: false,
             settings_screensaver: false,
             settings_error: None,
-            pi_child: None,
-            pi_for_context: None,
-            pi_last_error: None,
             marketplace_child: None,
             marketplace_last_error: None,
             show_profile_editor: false,
@@ -1744,6 +1871,376 @@ impl RiverDeckApp {
     #[cfg(feature = "tray")]
     fn hide_to_tray_available(&self) -> bool {
         self.tray.is_some() && self.tray_hide_ok
+    }
+
+    fn native_options_kind(action_uuid: &str) -> Option<&'static str> {
+        match action_uuid {
+            "io.github.sulrwin.riverdeck.starterpack.runcommand" => Some("starterpack_runcommand"),
+            "io.github.sulrwin.riverdeck.starterpack.inputsimulation" => {
+                Some("starterpack_inputsimulation")
+            }
+            "io.github.sulrwin.riverdeck.starterpack.switchprofile" => {
+                Some("starterpack_switchprofile")
+            }
+            "io.github.sulrwin.riverdeck.starterpack.devicebrightness" => {
+                Some("starterpack_devicebrightness")
+            }
+            _ => None,
+        }
+    }
+
+    fn ensure_options_editor_state(
+        &mut self,
+        device: &shared::DeviceInfo,
+        instance: &shared::ActionInstance,
+    ) {
+        let needs_reset = match self.options_editor_context.as_ref() {
+            None => true,
+            Some(c) => c != &instance.context,
+        };
+        if !needs_reset {
+            return;
+        }
+
+        self.options_editor_context = Some(instance.context.clone());
+
+        let s = &instance.settings;
+        let get_s =
+            |k: &str| -> String { s.get(k).and_then(|v| v.as_str()).unwrap_or("").to_owned() };
+        let get_bool = |k: &str, default: bool| -> bool {
+            s.get(k).and_then(|v| v.as_bool()).unwrap_or(default)
+        };
+        let get_i = |k: &str, default: i32| -> i32 {
+            s.get(k)
+                .and_then(|v| v.as_i64())
+                .map(|v| v as i32)
+                .unwrap_or(default)
+        };
+
+        match Self::native_options_kind(instance.action.uuid.as_str()) {
+            Some("starterpack_runcommand") => {
+                self.sp_run_command_down = get_s("down");
+                self.sp_run_command_up = get_s("up");
+                self.sp_run_command_rotate = get_s("rotate");
+                self.sp_run_command_file = get_s("file");
+                self.sp_run_command_show = get_bool("show", false);
+            }
+            Some("starterpack_inputsimulation") => {
+                self.sp_input_sim_down = get_s("down");
+                self.sp_input_sim_up = get_s("up");
+                self.sp_input_sim_anticlockwise = get_s("anticlockwise");
+                self.sp_input_sim_clockwise = get_s("clockwise");
+            }
+            Some("starterpack_switchprofile") => {
+                self.sp_switch_profile_device = s
+                    .get("device")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(device.id.as_str())
+                    .to_owned();
+                self.sp_switch_profile_profile = s
+                    .get("profile")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Default")
+                    .to_owned();
+            }
+            Some("starterpack_devicebrightness") => {
+                self.sp_device_brightness_action = s
+                    .get("action")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("set")
+                    .to_owned();
+                self.sp_device_brightness_value = get_i("value", 50).clamp(0, 100);
+            }
+            _ => {}
+        }
+    }
+
+    fn spawn_set_instance_settings(&self, ctx: shared::ActionContext, settings: serde_json::Value) {
+        self.runtime.spawn(async move {
+            let _ = riverdeck_core::api::instances::set_instance_settings(ctx, settings).await;
+        });
+    }
+
+    fn draw_action_editor_native_options_right_column(
+        &mut self,
+        ui: &mut egui::Ui,
+        device: &shared::DeviceInfo,
+        instance: &shared::ActionInstance,
+    ) {
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new("Options").strong());
+
+        match Self::native_options_kind(instance.action.uuid.as_str()) {
+            Some("starterpack_runcommand") => {
+                let is_encoder = instance.context.controller == "Encoder";
+                let down_label = if is_encoder { "Dial down" } else { "Key down" };
+                let up_label = if is_encoder { "Dial up" } else { "Key up" };
+
+                ui.add_space(4.0);
+                ui.label(down_label);
+                let changed_down = ui
+                    .add_sized(
+                        [ui.available_width(), 0.0],
+                        egui::TextEdit::singleline(&mut self.sp_run_command_down)
+                            .font(egui::TextStyle::Monospace),
+                    )
+                    .changed();
+
+                ui.label(up_label);
+                let changed_up = ui
+                    .add_sized(
+                        [ui.available_width(), 0.0],
+                        egui::TextEdit::singleline(&mut self.sp_run_command_up)
+                            .font(egui::TextStyle::Monospace),
+                    )
+                    .changed();
+
+                let mut changed_rotate = false;
+                if is_encoder {
+                    ui.label("Dial rotate");
+                    changed_rotate = ui
+                        .add_sized(
+                            [ui.available_width(), 0.0],
+                            egui::TextEdit::singleline(&mut self.sp_run_command_rotate)
+                                .font(egui::TextStyle::Monospace),
+                        )
+                        .changed();
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(
+                                "Tip: %d is replaced with the number of ticks (negative = CCW, positive = CW).",
+                            )
+                            .small()
+                            .color(ui.visuals().weak_text_color()),
+                        )
+                        .wrap(),
+                    );
+                }
+
+                ui.add_space(6.0);
+                ui.label("Write to path");
+                let changed_file = ui
+                    .add_sized(
+                        [ui.available_width(), 0.0],
+                        egui::TextEdit::singleline(&mut self.sp_run_command_file)
+                            .font(egui::TextStyle::Monospace),
+                    )
+                    .changed();
+
+                let changed_show = ui
+                    .checkbox(&mut self.sp_run_command_show, "Show on key")
+                    .changed();
+
+                if changed_down || changed_up || changed_rotate || changed_file || changed_show {
+                    let ctx_to_set = instance.context.clone();
+                    let settings = serde_json::json!({
+                        "down": self.sp_run_command_down,
+                        "up": self.sp_run_command_up,
+                        "rotate": self.sp_run_command_rotate,
+                        "file": self.sp_run_command_file,
+                        "show": self.sp_run_command_show,
+                    });
+                    self.spawn_set_instance_settings(ctx_to_set, settings);
+                }
+            }
+            Some("starterpack_inputsimulation") => {
+                let is_encoder = instance.context.controller == "Encoder";
+                let down_label = if is_encoder { "Dial down" } else { "Key down" };
+                let up_label = if is_encoder { "Dial up" } else { "Key up" };
+
+                ui.add_space(4.0);
+                ui.label(down_label);
+                let changed_down = ui
+                    .add_sized(
+                        [ui.available_width(), 0.0],
+                        egui::TextEdit::singleline(&mut self.sp_input_sim_down)
+                            .font(egui::TextStyle::Monospace)
+                            .hint_text("Input to be executed on key/dial down"),
+                    )
+                    .changed();
+
+                ui.label(up_label);
+                let changed_up = ui
+                    .add_sized(
+                        [ui.available_width(), 0.0],
+                        egui::TextEdit::singleline(&mut self.sp_input_sim_up)
+                            .font(egui::TextStyle::Monospace)
+                            .hint_text("Input to be executed on key/dial up"),
+                    )
+                    .changed();
+
+                let mut changed_enc = false;
+                if is_encoder {
+                    ui.add_space(4.0);
+                    ui.label("Dial rotate anticlockwise");
+                    changed_enc |= ui
+                        .add_sized(
+                            [ui.available_width(), 0.0],
+                            egui::TextEdit::singleline(&mut self.sp_input_sim_anticlockwise)
+                                .font(egui::TextStyle::Monospace)
+                                .hint_text("Input to be executed on dial rotate anticlockwise"),
+                        )
+                        .changed();
+                    ui.label("Dial rotate clockwise");
+                    changed_enc |= ui
+                        .add_sized(
+                            [ui.available_width(), 0.0],
+                            egui::TextEdit::singleline(&mut self.sp_input_sim_clockwise)
+                                .font(egui::TextStyle::Monospace)
+                                .hint_text("Input to be executed on dial rotate clockwise"),
+                        )
+                        .changed();
+                }
+
+                if changed_down || changed_up || changed_enc {
+                    let ctx_to_set = instance.context.clone();
+                    let settings = serde_json::json!({
+                        "down": self.sp_input_sim_down,
+                        "up": self.sp_input_sim_up,
+                        "anticlockwise": self.sp_input_sim_anticlockwise,
+                        "clockwise": self.sp_input_sim_clockwise,
+                    });
+                    self.spawn_set_instance_settings(ctx_to_set, settings);
+                }
+
+                ui.add_space(6.0);
+                egui::CollapsingHeader::new("Details")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(
+                                    "[t(\"hello world!\"),m(10,10,r),s(5),b(l),k(ctrl,p),k(uni('a')),k(ctrl,r)]",
+                                )
+                                .monospace(),
+                            )
+                            .wrap(),
+                        );
+                        ui.add_space(4.0);
+                        ui.label("The example above becomes something like this:");
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(
+                                    "[\n  Text(\"hello world!\"),\n  MoveMouse(10, 10, Relative),\n  Scroll(5, Vertical),\n  Button(Left, Click),\n  Key(Control, Press),\n  Key(Unicode('a'), Click),\n  Key(Control, Release),\n]",
+                                )
+                                .monospace(),
+                            )
+                            .wrap(),
+                        );
+                        ui.add_space(4.0);
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(
+                                    "Tip: keycodes/buttons/axes are defined by enigo; see their docs for the full list.",
+                                )
+                                .small()
+                                .color(ui.visuals().weak_text_color()),
+                            )
+                            .wrap(),
+                        );
+                    });
+            }
+            Some("starterpack_switchprofile") => {
+                ui.add_space(4.0);
+                ui.label("Device ID");
+                let changed_dev = ui
+                    .add_sized(
+                        [ui.available_width(), 0.0],
+                        egui::TextEdit::singleline(&mut self.sp_switch_profile_device)
+                            .hint_text(device.id.as_str()),
+                    )
+                    .changed();
+                ui.label("Profile");
+                let changed_prof = ui
+                    .add_sized(
+                        [ui.available_width(), 0.0],
+                        egui::TextEdit::singleline(&mut self.sp_switch_profile_profile)
+                            .hint_text("Default"),
+                    )
+                    .changed();
+
+                if changed_dev || changed_prof {
+                    let ctx_to_set = instance.context.clone();
+                    let device_id = if self.sp_switch_profile_device.trim().is_empty() {
+                        device.id.clone()
+                    } else {
+                        self.sp_switch_profile_device.clone()
+                    };
+                    let settings = serde_json::json!({
+                        "device": device_id,
+                        "profile": self.sp_switch_profile_profile,
+                    });
+                    self.spawn_set_instance_settings(ctx_to_set, settings);
+                }
+            }
+            Some("starterpack_devicebrightness") => {
+                if instance.context.controller == "Encoder" {
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new("Not available for dials.")
+                            .small()
+                            .color(ui.visuals().weak_text_color()),
+                    );
+                    return;
+                }
+
+                ui.add_space(4.0);
+                let old_action = self.sp_device_brightness_action.clone();
+                ui.horizontal(|ui| {
+                    ui.label("Action:");
+                    egui::ComboBox::from_id_salt("sp_device_brightness_action")
+                        .width(ui.available_width().min(220.0))
+                        .selected_text(match self.sp_device_brightness_action.as_str() {
+                            "increase" => "Increase",
+                            "decrease" => "Decrease",
+                            _ => "Set",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.sp_device_brightness_action,
+                                "set".to_owned(),
+                                "Set",
+                            );
+                            ui.selectable_value(
+                                &mut self.sp_device_brightness_action,
+                                "increase".to_owned(),
+                                "Increase",
+                            );
+                            ui.selectable_value(
+                                &mut self.sp_device_brightness_action,
+                                "decrease".to_owned(),
+                                "Decrease",
+                            );
+                        });
+                });
+                let changed_action = old_action != self.sp_device_brightness_action;
+
+                ui.label(format!("Value ({}%)", self.sp_device_brightness_value));
+                let changed_value = ui
+                    .add(egui::Slider::new(
+                        &mut self.sp_device_brightness_value,
+                        0..=100,
+                    ))
+                    .changed();
+
+                if changed_value || changed_action {
+                    let ctx_to_set = instance.context.clone();
+                    let settings = serde_json::json!({
+                        "action": self.sp_device_brightness_action,
+                        "value": self.sp_device_brightness_value,
+                    });
+                    self.spawn_set_instance_settings(ctx_to_set, settings);
+                }
+            }
+            _ => {
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new("No native editor for this action yet.")
+                        .small()
+                        .color(ui.visuals().weak_text_color()),
+                );
+            }
+        }
     }
 
     #[allow(dead_code)]
@@ -1828,6 +2325,11 @@ impl RiverDeckApp {
                     if let Some(instance) = instance {
                         let is_multi_action =
                             shared::is_multi_action_uuid(instance.action.uuid.as_str());
+                        let has_native_options =
+                            Self::native_options_kind(instance.action.uuid.as_str()).is_some();
+                        if has_native_options {
+                            self.ensure_options_editor_state(device, instance);
+                        }
 
                         // Keep editor state stable while switching slots.
                         let needs_reset = match self.button_label_context.as_ref() {
@@ -1854,7 +2356,8 @@ impl RiverDeckApp {
                         let gap = 6.0;
                         let avail_w = ui.available_width().max(0.0);
                         let show_right = is_multi_action
-                            || shared::is_toggle_action_uuid(instance.action.uuid.as_str());
+                            || shared::is_toggle_action_uuid(instance.action.uuid.as_str())
+                            || has_native_options;
 
                         if show_right {
                             // True split down the middle (matches the mental model in the UI).
@@ -1881,6 +2384,10 @@ impl RiverDeckApp {
                                             self.draw_action_editor_multi_action_right_column(
                                                 ui, ctx, instance,
                                             );
+                                        } else if has_native_options {
+                                            self.draw_action_editor_native_options_right_column(
+                                                ui, device, instance,
+                                            );
                                         } else {
                                             // Toggle Action doesn't have a custom right panel (yet).
                                             ui.label(
@@ -1903,16 +2410,14 @@ impl RiverDeckApp {
                 });
             });
 
-        if let Some(err) = self.pi_last_error.as_ref() {
-            ui.colored_label(ui.visuals().error_fg_color, err);
-        }
+        // PI is intentionally not part of the default action editing flow anymore.
     }
 
     fn draw_action_editor_left_column(
         &mut self,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
-        device: &shared::DeviceInfo,
+        _device: &shared::DeviceInfo,
         instance: &shared::ActionInstance,
     ) {
         ui.add_space(6.0);
@@ -2014,13 +2519,6 @@ impl RiverDeckApp {
 
         ui.separator();
 
-        let has_pi = !instance.action.property_inspector.trim().is_empty();
-        let open_for_this = self
-            .pi_for_context
-            .as_ref()
-            .is_some_and(|c| c == &instance.context)
-            && self.pi_child.is_some();
-
         // Wrap this row so it doesn't collapse the last label into 1-character columns
         // (which looks like "vertical text") when the editor is narrow.
         ui.horizontal_wrapped(|ui| {
@@ -2075,27 +2573,21 @@ impl RiverDeckApp {
                 self.marketplace_last_error = Some(err.to_string());
             }
 
-            if ui
-                .add_enabled(has_pi && !open_for_this, egui::Button::new("Open PI"))
-                .clicked()
-            {
-                let dock = Self::compute_pi_dock_geometry(ctx, 420);
-                if let Err(err) = self.open_property_inspector_for_instance(device, instance, dock)
-                {
-                    self.pi_last_error = Some(err.to_string());
-                }
-            }
-            if ui
-                .add_enabled(open_for_this, egui::Button::new("Close PI"))
-                .clicked()
-            {
-                self.close_pi();
-            }
-
-            if !has_pi {
-                ui.add(egui::Label::new("This action has no Property Inspector.").wrap());
-            } else if open_for_this {
-                ui.label("PI open.");
+            // No PI button: native editors live in the Action Editor.
+            let has_native_options =
+                Self::native_options_kind(instance.action.uuid.as_str()).is_some();
+            if has_native_options {
+                ui.label(
+                    egui::RichText::new("Options are shown on the right.")
+                        .small()
+                        .color(ui.visuals().weak_text_color()),
+                );
+            } else if !instance.action.property_inspector.trim().is_empty() {
+                ui.label(
+                    egui::RichText::new("This action uses a legacy Property Inspector (disabled).")
+                        .small()
+                        .color(ui.visuals().weak_text_color()),
+                );
             }
         });
     }
@@ -2717,18 +3209,6 @@ impl RiverDeckApp {
         });
     }
 
-    fn close_pi(&mut self) {
-        if let Some(mut child) = self.pi_child.take() {
-            riverdeck_core::runtime_processes::unrecord_process(child.id());
-            let _ = child.kill();
-            // Don't block the UI thread on `wait()` (can hang); reap on a background thread.
-            std::thread::spawn(move || {
-                let _ = child.wait();
-            });
-        }
-        self.pi_for_context = None;
-    }
-
     fn close_marketplace(&mut self) {
         if let Some(mut child) = self.marketplace_child.take() {
             riverdeck_core::runtime_processes::unrecord_process(child.id());
@@ -2762,11 +3242,12 @@ impl RiverDeckApp {
         }
 
         // Open the marketplace in a dedicated webview window.
-        // Note: the Elgato marketplace uses `streamdeck://...` deep links. We rely on the
-        // webview's navigation handler (in `riverdeck-pi`) + RiverDeck's startup arg handler.
+        // Note: marketplaces may use custom deep links (e.g. `streamdeck://...`, `opendeck://...`).
+        // We rely on the webview's navigation handler (in `riverdeck-pi`) + RiverDeck's startup
+        // arg handler.
         let dock = Self::compute_marketplace_geometry(ctx);
 
-        let child = match spawn_web_process("Elgato Marketplace", marketplace_url, dock) {
+        let child = match spawn_web_process("Marketplace", marketplace_url, dock) {
             Ok(child) => child,
             Err(err) if is_process_not_found(&err) => {
                 // Dev/packaging fallback: if the webview helper isn't available, open in browser
@@ -2784,121 +3265,7 @@ impl RiverDeckApp {
     }
 
     fn open_marketplace(&mut self, ctx: &egui::Context) -> anyhow::Result<()> {
-        self.open_marketplace_url(ctx, "https://marketplace.elgato.com/stream-deck/plugins")
-    }
-
-    fn compute_pi_dock_geometry(
-        ctx: &egui::Context,
-        desired_h: i32,
-    ) -> Option<(i32, i32, i32, i32)> {
-        let outer = ctx.input(|i| i.viewport().outer_rect)?;
-        let w = outer.width().round().max(200.0) as i32;
-        let x = outer.min.x.round() as i32;
-        let y = outer.max.y.round() as i32;
-        Some((x, y, w, desired_h.max(200)))
-    }
-
-    fn open_property_inspector_for_instance(
-        &mut self,
-        device: &shared::DeviceInfo,
-        instance: &shared::ActionInstance,
-        dock: Option<(i32, i32, i32, i32)>,
-    ) -> anyhow::Result<()> {
-        if instance.action.property_inspector.trim().is_empty() {
-            return Err(anyhow::anyhow!("action has no property inspector"));
-        }
-
-        // If already open for this context, do nothing.
-        if self
-            .pi_for_context
-            .as_ref()
-            .is_some_and(|c| c == &instance.context)
-            && self.pi_child.is_some()
-        {
-            return Ok(());
-        }
-
-        // Close any previous PI.
-        self.close_pi();
-
-        let port_base = *riverdeck_core::plugins::PORT_BASE;
-        let manifest = riverdeck_core::plugins::manifest::read_manifest(
-            &shared::config_dir()
-                .join("plugins")
-                .join(&instance.action.plugin),
-        )?;
-        let info = self.runtime.block_on(async {
-            riverdeck_core::plugins::info_param::make_info(
-                instance.action.plugin.clone(),
-                manifest.version,
-                false,
-            )
-            .await
-        });
-
-        let coordinates = if instance.context.controller == "Encoder" {
-            serde_json::json!({ "row": 0, "column": instance.context.position })
-        } else {
-            serde_json::json!({
-                "row": (instance.context.position / device.columns),
-                "column": (instance.context.position % device.columns)
-            })
-        };
-
-        let connect_payload = serde_json::json!({
-            "action": instance.action.uuid,
-            "context": instance.context.to_string(),
-            "device": device.id,
-            "payload": {
-                "settings": instance.settings,
-                "coordinates": coordinates,
-                "controller": instance.context.controller,
-                "state": instance.current_state,
-                "isInMultiAction": instance.context.index != 0,
-            }
-        });
-
-        let origin = format!("http://localhost:{}", port_base + 2);
-        let pi_token = riverdeck_core::plugins::property_inspector_token();
-        let pi_src = format!(
-            "{origin}/{}|riverdeck_property_inspector?riverdeck_token={pi_token}",
-            instance.action.property_inspector
-        );
-        let label = format!("pi_{}", instance.context.to_string().replace('.', "_"));
-        let storage_dir = riverdeck_core::shared::data_dir()
-            .join("webview")
-            .join("pi")
-            .join(sanitize_webview_profile(&instance.action.plugin));
-
-        let info_json = serde_json::to_string(&info)?;
-        let connect_json = serde_json::to_string(&connect_payload)?;
-
-        let child = spawn_pi_process(
-            &label,
-            &pi_src,
-            &origin,
-            port_base,
-            &instance.context.to_string(),
-            &info_json,
-            &connect_json,
-            dock,
-            &storage_dir,
-        )?;
-
-        self.pi_child = Some(child);
-        self.pi_for_context = Some(instance.context.clone());
-        self.pi_last_error = None;
-
-        // Best-effort: notify plugin that PI appeared.
-        self.runtime.block_on(async {
-            let _ = riverdeck_core::events::outbound::property_inspector::property_inspector_did_appear(
-                instance.context.clone(),
-                "propertyInspectorDidAppear",
-            )
-            .await;
-        });
-
-        Ok(())
+        self.open_marketplace_url(ctx, riverdeck_core::openaction_marketplace::MARKETPLACE_URL)
     }
 
     fn draw_action_row(
@@ -3650,7 +4017,6 @@ impl eframe::App for RiverDeckApp {
 
         // If we're waiting on async results, poll at a low frequency.
         if pending_async
-            || self.pending_plugin_install_pick.is_some()
             || self.pending_plugin_install_result.is_some()
             || self.pending_icon_pick.is_some()
             || self.pending_screen_bg_pick.is_some()
@@ -3659,23 +4025,7 @@ impl eframe::App for RiverDeckApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
-        // Plugin install flow (non-blocking).
-        if let Some(rx) = self.pending_plugin_install_pick.as_ref()
-            && let Ok(picked) = rx.try_recv()
-        {
-            self.pending_plugin_install_pick = None;
-            if let Some(path) = picked {
-                let path = path.to_string_lossy().into_owned();
-                let (tx, rx_done) = mpsc::channel();
-                self.pending_plugin_install_result = Some(rx_done);
-                self.runtime.spawn(async move {
-                    let res = riverdeck_core::api::plugins::install_plugin(None, Some(path), None)
-                        .await
-                        .map_err(|e| e.to_string());
-                    let _ = tx.send(res);
-                });
-            }
-        }
+        // Plugin management operations (non-blocking result channel).
         if let Some(rx) = self.pending_plugin_install_result.as_ref()
             && let Ok(res) = rx.try_recv()
         {
@@ -3889,22 +4239,6 @@ impl eframe::App for RiverDeckApp {
             .as_ref()
             .and_then(|d| self.load_profile_snapshot(d, &selected_profile).ok());
 
-        // If the current selection no longer matches the open PI (device/profile switched, etc.),
-        // close it to avoid drifting state.
-        if let Some(open_ctx) = self.pi_for_context.clone() {
-            let still_selected = self.selected_slot.as_ref().is_some_and(|slot| {
-                selected_device
-                    .as_ref()
-                    .is_some_and(|dev| dev.id == open_ctx.device)
-                    && selected_profile == open_ctx.profile
-                    && slot.controller == open_ctx.controller
-                    && slot.position == open_ctx.position
-            });
-            if !still_selected {
-                self.close_pi();
-            }
-        }
-
         if let (Some(device), Some(slot)) = (&selected_device, &self.selected_slot) {
             let key_count = (device.rows as usize) * (device.columns as usize);
             if slot.controller == "Encoder" {
@@ -3979,10 +4313,8 @@ impl eframe::App for RiverDeckApp {
                     self.plugins_inflight = true;
                     let (tx, rx) = mpsc::channel();
                     self.plugins_rx = Some(rx);
-                    self.runtime.spawn(async move {
-                        let list = riverdeck_core::api::plugins::list_plugins()
-                            .await
-                            .unwrap_or_default();
+                    std::thread::spawn(move || {
+                        let list = riverdeck_core::plugins::marketplace::list_local_plugins();
                         let _ = tx.send(list);
                     });
                 }
@@ -4083,9 +4415,10 @@ impl eframe::App for RiverDeckApp {
                     .get(slot.position as usize)
                     .and_then(|v| v.as_ref()),
             };
-            let selected_is_multi_action = selected_instance.is_some_and(|i| {
+            let selected_uses_two_cols = selected_instance.is_some_and(|i| {
                 shared::is_multi_action_uuid(i.action.uuid.as_str())
                     || shared::is_toggle_action_uuid(i.action.uuid.as_str())
+                    || Self::native_options_kind(i.action.uuid.as_str()).is_some()
             });
 
             let instance_present = match &slot.controller[..] {
@@ -4116,7 +4449,7 @@ impl eframe::App for RiverDeckApp {
                 // editor actually shows more UI (e.g. Multi Action / Toggle Action).
                 let col_min_w = 360.0;
                 let cols_gap = 6.0;
-                let content_min_w: f32 = if selected_is_multi_action {
+                let content_min_w: f32 = if selected_uses_two_cols {
                     (col_min_w * 2.0) + cols_gap
                 } else {
                     col_min_w
@@ -4437,17 +4770,20 @@ impl eframe::App for RiverDeckApp {
                             .inner_margin(egui::Margin::same(12))
                             .show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            if ui.button("Install…").clicked()
-                                && self.pending_plugin_install_pick.is_none()
-                            {
-                                let (tx, rx) = mpsc::channel();
-                                std::thread::spawn(move || {
-                                    let picked = rfd::FileDialog::new()
-                                        .add_filter("Stream Deck plugins", &["streamDeckPlugin", "zip"])
-                                        .pick_file();
-                                    let _ = tx.send(picked);
-                                });
-                                self.pending_plugin_install_pick = Some(rx);
+                            if ui.button("Open installed plugins folder").clicked() {
+                                let dir = riverdeck_core::shared::config_dir().join("plugins");
+                                #[cfg(target_os = "linux")]
+                                {
+                                    let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
+                                }
+                                #[cfg(target_os = "macos")]
+                                {
+                                    let _ = std::process::Command::new("open").arg(dir).spawn();
+                                }
+                                #[cfg(target_os = "windows")]
+                                {
+                                    let _ = std::process::Command::new("explorer").arg(dir).spawn();
+                                }
                             }
                             if ui.button("Reload").clicked() {
                                 // Invalidate caches that depend on plugin discovery.
@@ -4482,28 +4818,28 @@ impl eframe::App for RiverDeckApp {
                             self.plugins_inflight = true;
                             let (tx, rx) = mpsc::channel();
                             self.plugins_rx = Some(rx);
-                            self.runtime.spawn(async move {
-                                let list =
-                                    riverdeck_core::api::plugins::list_plugins().await.unwrap_or_default();
+                            std::thread::spawn(move || {
+                                let list = riverdeck_core::plugins::marketplace::list_local_plugins();
                                 let _ = tx.send(list);
                             });
                         }
                         // Clone the display fields we need so we can call `texture_for_path` (needs `&mut self`)
                         // inside the ScrollArea closure without borrowing `self` immutably.
-                        let plugins: Vec<(String, String, String, String, bool, bool)> = self
+                        let plugins: Vec<LocalMarketplacePluginRow> = self
                             .plugins_cache
                             .as_ref()
                             .map(|v| {
                                 v.iter()
-                                    .map(|p| {
-                                        (
-                                            p.id.clone(),
-                                            p.name.clone(),
-                                            p.icon.clone(),
-                                            p.version.clone(),
-                                            p.builtin,
-                                            p.registered,
-                                        )
+                                    .map(|p| LocalMarketplacePluginRow {
+                                        id: p.id.clone(),
+                                        name: p.name.clone(),
+                                        icon: p.icon.clone(),
+                                        version: p.version.clone(),
+                                        installed: p.installed,
+                                        enabled: p.enabled,
+                                        source: p.source,
+                                        support: p.support.clone(),
+                                        path: p.path.to_string_lossy().to_string(),
                                     })
                                     .collect()
                             })
@@ -4519,13 +4855,26 @@ impl eframe::App for RiverDeckApp {
                                         .color(ui.visuals().weak_text_color()),
                                 );
                             }
-                            for (id, name, icon, version, builtin, registered) in plugins {
+                            for LocalMarketplacePluginRow {
+                                id,
+                                name,
+                                icon,
+                                version,
+                                installed,
+                                enabled,
+                                source,
+                                support,
+                                path,
+                            } in plugins
+                            {
                                 egui::Frame::group(ui.style())
                                     .corner_radius(egui::CornerRadius::same(10))
                                     .show(ui, |ui| {
                                         ui.horizontal(|ui| {
                                             let icon_size = egui::vec2(28.0, 28.0);
-                                            if let Some(tex) = self.texture_for_path(ctx, &icon) {
+                                            if let Some(icon) = icon.as_ref()
+                                                && let Some(tex) = self.texture_for_path(ctx, icon)
+                                            {
                                                 ui.image((tex.id(), icon_size));
                                             } else {
                                                 ui.allocate_exact_size(icon_size, egui::Sense::hover());
@@ -4534,41 +4883,102 @@ impl eframe::App for RiverDeckApp {
                                             ui.vertical(|ui| {
                                                 ui.label(egui::RichText::new(&name).strong());
                                                 ui.label(
-                                                    egui::RichText::new(format!("{id} • v{version}"))
+                                                    egui::RichText::new(format!(
+                                                        "{id}{}{}",
+                                                        version
+                                                            .as_ref()
+                                                            .map(|v| format!(" • v{v}"))
+                                                            .unwrap_or_default(),
+                                                        if installed { " • installed" } else { " • available" },
+                                                    ))
                                                         .small()
                                                         .color(ui.visuals().weak_text_color()),
                                                 );
-                                                if !registered {
-                                                    ui.label(
-                                                        egui::RichText::new("Not running / not registered")
-                                                            .small()
-                                                            .color(ui.visuals().weak_text_color()),
-                                                    );
+                                                let source_label = match source {
+                                                    riverdeck_core::plugins::marketplace::PluginSource::Workspace => "workspace",
+                                                    riverdeck_core::plugins::marketplace::PluginSource::Config => "config",
+                                                };
+                                                ui.label(
+                                                    egui::RichText::new(format!("source: {source_label}"))
+                                                        .small()
+                                                        .color(ui.visuals().weak_text_color()),
+                                                );
+                                                match &support {
+                                                    riverdeck_core::plugins::marketplace::PluginSupport::Supported => {}
+                                                    riverdeck_core::plugins::marketplace::PluginSupport::Unsupported(reason) => {
+                                                        ui.label(
+                                                            egui::RichText::new("unsupported")
+                                                                .small()
+                                                                .color(ui.visuals().error_fg_color),
+                                                        )
+                                                        .on_hover_text(reason);
+                                                    }
                                                 }
                                             });
 
                                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                let remove = ui.add_enabled(!builtin, egui::Button::new("Remove"));
-                                                if remove.clicked() {
-                                                    // Invalidate caches that depend on plugin discovery.
-                                                    self.plugins_cache = None;
-                                                    self.plugins_inflight = false;
-                                                    self.plugins_rx = None;
-                                                    self.categories_cache = None;
-                                                    self.categories_inflight = false;
-                                                    self.categories_rx = None;
-                                                    let id = id.clone();
-                                                    self.runtime.spawn(async move {
-                                                        let _ = riverdeck_core::api::plugins::remove_plugin(id).await;
-                                                        plugins::initialise_plugins();
-                                                    });
+                                                if installed {
+                                                    if ui.button("Open").clicked() {
+                                                        #[cfg(target_os = "linux")]
+                                                        {
+                                                            let _ = std::process::Command::new("xdg-open")
+                                                                .arg(&path)
+                                                                .spawn();
+                                                        }
+                                                        #[cfg(target_os = "macos")]
+                                                        {
+                                                            let _ = std::process::Command::new("open")
+                                                                .arg(&path)
+                                                                .spawn();
+                                                        }
+                                                        #[cfg(target_os = "windows")]
+                                                        {
+                                                            let _ = std::process::Command::new("explorer")
+                                                                .arg(&path)
+                                                                .spawn();
+                                                        }
+                                                    }
+                                                } else if matches!(
+                                                    source,
+                                                    riverdeck_core::plugins::marketplace::PluginSource::Workspace
+                                                ) && matches!(
+                                                    support,
+                                                    riverdeck_core::plugins::marketplace::PluginSupport::Supported
+                                                ) && ui.button("Install").clicked()
+                                                    && self.pending_plugin_install_result.is_none()
+                                                {
+                                                        let (tx, rx_done) = mpsc::channel();
+                                                        self.pending_plugin_install_result = Some(rx_done);
+                                                        let id = id.clone();
+                                                        std::thread::spawn(move || {
+                                                            let res = (|| -> anyhow::Result<()> {
+                                                                riverdeck_core::plugins::marketplace::install_from_workspace(&id)?;
+                                                                riverdeck_core::plugins::marketplace::set_plugin_enabled(&id, true)?;
+                                                                Ok(())
+                                                            })()
+                                                            .map_err(|e| e.to_string());
+                                                            let _ = tx.send(res);
+                                                        });
                                                 }
-                                                if builtin {
-                                                    ui.label(
-                                                        egui::RichText::new("built-in")
-                                                            .small()
-                                                            .color(ui.visuals().weak_text_color()),
-                                                    );
+
+                                                let mut enabled_local = enabled;
+                                                let toggle = ui.checkbox(&mut enabled_local, "Enabled");
+                                                if toggle.changed() {
+                                                    if let Err(err) = riverdeck_core::plugins::marketplace::set_plugin_enabled(&id, enabled_local) {
+                                                        self.plugin_manage_error = Some(err.to_string());
+                                                    } else {
+                                                        self.plugin_manage_error = None;
+                                                        // Invalidate caches that depend on plugin discovery.
+                                                        self.plugins_cache = None;
+                                                        self.plugins_inflight = false;
+                                                        self.plugins_rx = None;
+                                                        self.categories_cache = None;
+                                                        self.categories_inflight = false;
+                                                        self.categories_rx = None;
+                                                        self.runtime.spawn(async {
+                                                            plugins::initialise_plugins();
+                                                        });
+                                                    }
                                                 }
                                             });
                                         });
@@ -5217,7 +5627,6 @@ impl eframe::App for RiverDeckApp {
 
 impl Drop for RiverDeckApp {
     fn drop(&mut self) {
-        self.close_pi();
         self.close_marketplace();
         // Ensure we don't orphan plugin subprocesses (native/node/wine) on window close or tray quit.
         // This is synchronous so it runs even if the UI is exiting.
@@ -5499,73 +5908,6 @@ fn load_tray_icon() -> anyhow::Result<Icon> {
     Ok(Icon::from_rgba(rgba, width, height)?)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn spawn_pi_process(
-    label: &str,
-    pi_src: &str,
-    origin: &str,
-    port: u16,
-    context: &str,
-    info_json: &str,
-    connect_json: &str,
-    dock: Option<(i32, i32, i32, i32)>,
-    storage_dir: &std::path::Path,
-) -> anyhow::Result<std::process::Child> {
-    let mut cmd = std::process::Command::new(resolve_pi_exe()?);
-    configure_pi_webview_env(&mut cmd);
-    cmd.arg("--label")
-        .arg(label)
-        .arg("--pi-src")
-        .arg(pi_src)
-        .arg("--origin")
-        .arg(origin)
-        .arg("--ws-port")
-        .arg(port.to_string())
-        .arg("--context")
-        .arg(context)
-        .arg("--info-json")
-        .arg(info_json)
-        .arg("--connect-json")
-        .arg(connect_json)
-        .arg("--storage-dir")
-        .arg(storage_dir);
-
-    if let Some((x, y, w, h)) = dock {
-        cmd.arg("--x")
-            .arg(x.to_string())
-            .arg("--y")
-            .arg(y.to_string())
-            .arg("--w")
-            .arg(w.to_string())
-            .arg("--h")
-            .arg(h.to_string())
-            .arg("--decorations")
-            .arg("1");
-    }
-
-    // Capture helper output to the normal RiverDeck log dir so "white window" failures
-    // are diagnosable from support bundles / Settings → Open log directory.
-    let pi_log_dir = riverdeck_core::shared::log_dir().join("pi");
-    let _ = std::fs::create_dir_all(&pi_log_dir);
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let log_file_path = pi_log_dir.join(format!("riverdeck-pi-{ts}.log"));
-    let child = spawn_child_with_captured_pi_logs(cmd, &log_file_path)?;
-    riverdeck_core::runtime_processes::record_process(
-        child.id(),
-        "riverdeck_pi",
-        vec![
-            "--label".to_owned(),
-            label.to_owned(),
-            "--ws-port".to_owned(),
-            port.to_string(),
-        ],
-    );
-    Ok(child)
-}
-
 fn spawn_web_process(
     label: &str,
     url: &str,
@@ -5733,19 +6075,6 @@ fn configure_pi_webview_env(cmd: &mut std::process::Command) {
             cmd.env("__NV_DISABLE_EXPLICIT_SYNC", "1");
         }
     }
-}
-
-fn sanitize_webview_profile(s: &str) -> String {
-    // Avoid path traversal / separators; keep it stable for cookie storage.
-    s.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
 }
 
 fn pi_exe_basename() -> &'static str {

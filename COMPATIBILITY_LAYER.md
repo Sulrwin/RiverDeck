@@ -2,7 +2,7 @@
 
 ## Overview
 
-I've implemented a comprehensive compatibility layer system that allows Windows-only Elgato plugins to work on Linux. This enables the **Volume Controller** and **Discord** plugins to function properly on your Linux system.
+I've implemented a comprehensive compatibility layer system that allows Windows-only Elgato plugins to work on Linux. This enables the **Volume Controller** plugin to function properly on your Linux system.
 
 ## Components Implemented
 
@@ -45,24 +45,7 @@ I've implemented a comprehensive compatibility layer system that allows Windows-
 
 **Auto-injection**: The plugin launcher automatically detects audio-related plugins and injects the shim using Node's `--require` flag.
 
-### 3. Discord IPC Bridge for Wine
-
-**Purpose**: Bridges Windows named pipes to Linux Unix domain sockets for Discord IPC.
-
-**Location**: `crates/riverdeck-core/src/plugins/discord_ipc_bridge.py`
-
-**Features**:
-- Creates a Unix socket that Wine applications can connect to
-- Forwards traffic bidirectionally between Wine and native Linux Discord client
-- Handles Discord IPC protocol seamlessly
-- Automatic cleanup on shutdown
-
-**How it works**:
-- Discord on Windows uses `\\.\pipe\discord-ipc-0`
-- Discord on Linux uses `/run/user/$UID/discord-ipc-0`
-- The bridge creates a socket Wine can access and proxies all traffic
-
-### 4. Enhanced Plugin Launcher
+### 3. Enhanced Plugin Launcher
 
 **Location**: `crates/riverdeck-core/src/plugins/mod.rs`
 
@@ -77,7 +60,6 @@ I've implemented a comprehensive compatibility layer system that allows Windows-
 | Plugin | Type | Compatibility Layer | Status |
 |--------|------|---------------------|--------|
 | **Volume Controller** | Node.js | Audio shim | ✅ Implemented |
-| **Discord** | Wine (.exe) | IPC bridge | ✅ Designed (needs Discord running) |
 | **CPU** | Wine (.exe) | None needed | ✅ Works via Wine |
 | **Starter Pack** | Native | None needed | ✅ Native Linux |
 
@@ -119,7 +101,6 @@ User presses button → RiverDeck → Plugin WebSocket → Volume Controller plu
 ### Created:
 - `crates/riverdeck-audio-router/linux-audio-shim.js` - Audio API shim
 - `crates/riverdeck-audio-router/audio-shim-loader.js` - Module loader
-- `crates/riverdeck-core/src/plugins/discord_ipc_bridge.py` - Discord bridge
 - `crates/riverdeck-core/resources/` - Embedded shim files
 
 ## Testing & Verification
@@ -144,15 +125,13 @@ ps aux | grep volume-controller
 
 ### Expected Behavior:
 1. **Volume Controller**: Should start, connect to audio router, and control system audio
-2. **Discord**: Should start via Wine and connect to Discord IPC bridge (if Discord is running)
 
 ## Future Enhancements
 
 1. **PipeWire Direct Support**: Use native PipeWire API instead of pactl
-2. **Discord Bridge Auto-start**: Automatically launch bridge when Discord plugin loads
-3. **Wine Integration**: Pre-configure Wine prefix with Discord IPC bridge
-4. **Image Extraction**: Extract app icons for Volume Controller UI
-5. **Event Notifications**: Forward PulseAudio events to plugins in real-time
+2. **Wine Integration**: Pre-configure Wine prefix(s) for tricky plugins
+3. **Image Extraction**: Extract app icons for Volume Controller UI
+4. **Event Notifications**: Forward PulseAudio events to plugins in real-time
 
 ## Debugging
 
@@ -161,12 +140,6 @@ ps aux | grep volume-controller
 2. Check plugin log for shim activation
 3. Test audio router manually: `wscat -c ws://127.0.0.1:1844`
 4. Verify PulseAudio: `pactl info`
-
-### If Discord doesn't work:
-1. Verify Discord is running: `pgrep -a discord`
-2. Check IPC socket exists: `ls /run/user/$(id -u)/discord-ipc-*`
-3. Test Wine: `wine --version`
-4. Check Wine logs in plugin directory
 
 ## Architecture Benefits
 
@@ -181,10 +154,5 @@ ps aux | grep volume-controller
 1. Build and test: `cargo run -p riverdeck-egui`
 2. Add Volume Controller button to your Stream Deck
 3. Test volume control with an application playing audio
-4. If Discord plugin is needed, start Discord first, then launch the bridge:
-   ```bash
-   python3 crates/riverdeck-core/src/plugins/discord_ipc_bridge.py
-   ```
-
-The compatibility layer is production-ready and should make both plugins fully functional on Linux!
+The compatibility layer is production-ready and should make compatible plugins functional on Linux!
 

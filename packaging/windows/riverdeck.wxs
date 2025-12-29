@@ -46,6 +46,15 @@
 				</RegistryKey>
 			</RegistryKey>
 		</Component>
+		<Component Id="cmpUrlProtocolOpenDeck" Guid="D3D18C20-3D6F-4DF4-9F8A-8F0D8E9A1A45">
+			<RegistryKey Root="HKCR" Key="opendeck">
+				<RegistryValue Type="string" Value="URL:OpenDeck Protocol" />
+				<RegistryValue Name="URL Protocol" Type="string" Value="" />
+				<RegistryKey Key="shell\\open\\command">
+					<RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]riverdeck.exe&quot; &quot;%1&quot;" />
+				</RegistryKey>
+			</RegistryKey>
+		</Component>
 		<Component Id="cmpUrlProtocolStreamDeck" Guid="A3B8E26C-53B8-43AE-8C35-3A0D7E0C35CB">
 			<RegistryKey Root="HKCR" Key="streamdeck">
 				<RegistryValue Type="string" Value="URL:StreamDeck Protocol" />
@@ -61,6 +70,7 @@
 			<ComponentRef Id="cmpRiverDeckPiExe" />
 			<ComponentRef Id="cmpUrlProtocolRiverDeck" />
 			<ComponentRef Id="cmpUrlProtocolOpenAction" />
+			<ComponentRef Id="cmpUrlProtocolOpenDeck" />
 			<ComponentRef Id="cmpUrlProtocolStreamDeck" />
 		</Feature>
 	</Product>

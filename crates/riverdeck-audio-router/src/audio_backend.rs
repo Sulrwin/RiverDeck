@@ -1,5 +1,5 @@
-use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 /// Information about an audio application/stream
 #[derive(Debug, Clone)]
@@ -144,10 +144,14 @@ impl PulseAudioBackend {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            log::error!("pactl list sink-inputs failed with exit code {:?}: {}", output.status.code(), stderr);
+            log::error!(
+                "pactl list sink-inputs failed with exit code {:?}: {}",
+                output.status.code(),
+                stderr
+            );
             return Err(anyhow::anyhow!("pactl command failed: {}", stderr));
         }
-        
+
         log::trace!("pactl list sink-inputs succeeded");
 
         let output_str = String::from_utf8_lossy(&output.stdout);
@@ -179,11 +183,17 @@ impl PulseAudioBackend {
                 }
             } else if let Some(ref mut input) = current_input {
                 if line.starts_with("application.process.id = ") {
-                    if let Some(pid_str) = line.strip_prefix("application.process.id = \"").and_then(|s| s.strip_suffix("\"")) {
+                    if let Some(pid_str) = line
+                        .strip_prefix("application.process.id = \"")
+                        .and_then(|s| s.strip_suffix("\""))
+                    {
                         input.pid = pid_str.parse().ok();
                     }
                 } else if line.starts_with("application.name = ") {
-                    if let Some(name_str) = line.strip_prefix("application.name = \"").and_then(|s| s.strip_suffix("\"")) {
+                    if let Some(name_str) = line
+                        .strip_prefix("application.name = \"")
+                        .and_then(|s| s.strip_suffix("\""))
+                    {
                         input.name = name_str.to_string();
                     }
                 } else if line.starts_with("Volume:") {
@@ -216,21 +226,29 @@ impl PulseAudioBackend {
 
     fn get_sink_input_by_pid(&self, pid: u32) -> Option<SinkInputInfo> {
         let inputs = self.sink_inputs.lock().unwrap();
-        inputs.values()
+        inputs
+            .values()
             .find(|input| input.pid == Some(pid))
             .cloned()
     }
 
     fn set_sink_input_volume_by_index(&self, index: u32, volume: f32) -> anyhow::Result<()> {
         use std::process::Command;
-        
+
         let volume_pct = (volume * 100.0).round() as u32;
         let output = Command::new("pactl")
-            .args(["set-sink-input-volume", &index.to_string(), &format!("{}%", volume_pct)])
+            .args([
+                "set-sink-input-volume",
+                &index.to_string(),
+                &format!("{}%", volume_pct),
+            ])
             .output()?;
 
         if !output.status.success() {
-            return Err(anyhow::anyhow!("Failed to set volume: {}", String::from_utf8_lossy(&output.stderr)));
+            return Err(anyhow::anyhow!(
+                "Failed to set volume: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
         }
 
         Ok(())
@@ -238,14 +256,17 @@ impl PulseAudioBackend {
 
     fn set_sink_input_mute_by_index(&self, index: u32, mute: bool) -> anyhow::Result<()> {
         use std::process::Command;
-        
+
         let mute_str = if mute { "1" } else { "0" };
         let output = Command::new("pactl")
             .args(["set-sink-input-mute", &index.to_string(), mute_str])
             .output()?;
 
         if !output.status.success() {
-            return Err(anyhow::anyhow!("Failed to set mute: {}", String::from_utf8_lossy(&output.stderr)));
+            return Err(anyhow::anyhow!(
+                "Failed to set mute: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
         }
 
         Ok(())
@@ -264,8 +285,9 @@ impl Default for PulseAudioBackend {
 impl AudioBackend for PulseAudioBackend {
     fn list_applications(&self) -> Vec<ApplicationInfo> {
         let inputs = self.sink_inputs.lock().unwrap();
-        
-        inputs.values()
+
+        inputs
+            .values()
             .filter_map(|input| {
                 input.pid.map(|pid| {
                     // Try to get executable name from /proc
@@ -296,9 +318,10 @@ impl AudioBackend for PulseAudioBackend {
     }
 
     fn set_app_volume(&self, pid: u32, volume: f32) -> anyhow::Result<()> {
-        let input = self.get_sink_input_by_pid(pid)
+        let input = self
+            .get_sink_input_by_pid(pid)
             .ok_or_else(|| anyhow::anyhow!("Application with PID {} not found", pid))?;
-        
+
         self.set_sink_input_volume_by_index(input.index, volume)
     }
 
@@ -307,9 +330,10 @@ impl AudioBackend for PulseAudioBackend {
     }
 
     fn set_app_mute(&self, pid: u32, mute: bool) -> anyhow::Result<()> {
-        let input = self.get_sink_input_by_pid(pid)
+        let input = self
+            .get_sink_input_by_pid(pid)
             .ok_or_else(|| anyhow::anyhow!("Application with PID {} not found", pid))?;
-        
+
         self.set_sink_input_mute_by_index(input.index, mute)
     }
 
@@ -325,14 +349,12 @@ impl AudioBackend for PulseAudioBackend {
 
     fn get_device_volume(&self, device_id: &str) -> Option<f32> {
         let sinks = self.sinks.lock().unwrap();
-        sinks.values()
-            .find(|d| d.id == device_id)
-            .map(|d| d.volume)
+        sinks.values().find(|d| d.id == device_id).map(|d| d.volume)
     }
 
     fn set_device_volume(&self, device_id: &str, volume: f32) -> anyhow::Result<()> {
         use std::process::Command;
-        
+
         let volume_pct = (volume * 100.0).round() as u32;
         let output = Command::new("pactl")
             .args(["set-sink-volume", device_id, &format!("{}%", volume_pct)])
@@ -347,14 +369,12 @@ impl AudioBackend for PulseAudioBackend {
 
     fn get_device_mute(&self, device_id: &str) -> Option<bool> {
         let sinks = self.sinks.lock().unwrap();
-        sinks.values()
-            .find(|d| d.id == device_id)
-            .map(|d| d.mute)
+        sinks.values().find(|d| d.id == device_id).map(|d| d.mute)
     }
 
     fn set_device_mute(&self, device_id: &str, mute: bool) -> anyhow::Result<()> {
         use std::process::Command;
-        
+
         let mute_str = if mute { "1" } else { "0" };
         let output = Command::new("pactl")
             .args(["set-sink-mute", device_id, mute_str])

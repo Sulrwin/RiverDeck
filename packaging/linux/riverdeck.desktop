@@ -6,6 +6,6 @@ Exec=riverdeck --replace %u
 Icon=riverdeck
 Terminal=false
 Categories=Utility;
-MimeType=x-scheme-handler/riverdeck;x-scheme-handler/openaction;x-scheme-handler/streamdeck;
+MimeType=x-scheme-handler/riverdeck;x-scheme-handler/openaction;x-scheme-handler/opendeck;x-scheme-handler/streamdeck;
 
 

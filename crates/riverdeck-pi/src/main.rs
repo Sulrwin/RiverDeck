@@ -163,6 +163,7 @@ fn build_pi_webview(
             // Allow regular browsing, but hand off deep-links to the OS.
             // This is important for things like Elgato Marketplace "Open in Stream Deck" links.
             if url.starts_with("openaction://")
+                || url.starts_with("opendeck://")
                 || url.starts_with("streamdeck://")
                 || url.starts_with("riverdeck://")
             {
@@ -235,6 +236,7 @@ fn build_url_webview(
                 return false;
             }
             if url.starts_with("openaction://")
+                || url.starts_with("opendeck://")
                 || url.starts_with("streamdeck://")
                 || url.starts_with("riverdeck://")
             {
@@ -312,6 +314,51 @@ fn handle_riverdeck_ipc_url(ipc_port: u16, url: &str) -> std::io::Result<()> {
 fn marketplace_token_capture_script() -> &'static str {
     r#"
 (() => {
+  // OpenAction Marketplace uses a hidden <iframe> with src="opendeck://installPlugin/<id>".
+  // Some webview backends don't surface iframe navigations to the host navigation handler.
+  // To make installs work reliably, we "promote" deep-link iframe navigations to top-level
+  // navigations, which the host intercepts and forwards to RiverDeck.
+  const __riverdeck_is_deeplink = (u) => {
+    try {
+      if (!u || typeof u !== "string") return false;
+      return (
+        u.startsWith("openaction://") ||
+        u.startsWith("opendeck://") ||
+        u.startsWith("streamdeck://") ||
+        u.startsWith("riverdeck://")
+      );
+    } catch (_) {
+      return false;
+    }
+  };
+  let __riverdeck_last_deeplink = "";
+  let __riverdeck_last_deeplink_at = 0;
+  const __riverdeck_trigger_deeplink = (u) => {
+    try {
+      if (__riverdeck_is_deeplink(u)) {
+        const s = String(u);
+        // De-dupe/throttle identical deep links (some pages repeatedly set iframe src).
+        try {
+          const now = Date.now();
+          if (s === __riverdeck_last_deeplink && now - __riverdeck_last_deeplink_at < 3000) {
+            return;
+          }
+          __riverdeck_last_deeplink = s;
+          __riverdeck_last_deeplink_at = now;
+        } catch (_) {}
+        // Prefer IPC (more reliable than navigation for iframe-triggered deep links).
+        try {
+          if (window.ipc && window.ipc.postMessage) {
+            window.ipc.postMessage(JSON.stringify({ type: "deepLink", url: s }));
+            return;
+          }
+        } catch (_) {}
+        // Fallback: this will be intercepted by the webview navigation handler and forwarded.
+        location.href = s;
+      }
+    } catch (_) {}
+  };
+
   // Best-effort: capture Marketplace access token when running on marketplace.elgato.com.
   // The token is used by the host to resolve `.../install/<variant_id>` deep links into signed
   // download URLs. We intentionally keep this minimal and defensive.
@@ -422,6 +469,81 @@ fn marketplace_token_capture_script() -> &'static str {
     setTimeout(poll, 5000);
   }
   poll();
+
+  // Strategy C: promote iframe deep-link navigations (OpenDeck/OpenAction marketplaces).
+  try {
+    const desc = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, "src");
+    if (desc && typeof desc.set === "function") {
+      Object.defineProperty(HTMLIFrameElement.prototype, "src", {
+        configurable: true,
+        enumerable: desc.enumerable,
+        get: desc.get,
+        set: function (v) {
+          try {
+            const s = String(v || "");
+            if (__riverdeck_is_deeplink(s)) {
+              __riverdeck_trigger_deeplink(s);
+              return;
+            }
+          } catch (_) {}
+          return desc.set.call(this, v);
+        },
+      });
+    }
+  } catch (_) {}
+
+  try {
+    const _setAttribute = Element.prototype.setAttribute;
+    Element.prototype.setAttribute = function (k, v) {
+      try {
+        if (
+          this &&
+          this.tagName === "IFRAME" &&
+          String(k || "").toLowerCase() === "src" &&
+          __riverdeck_is_deeplink(String(v || ""))
+        ) {
+          __riverdeck_trigger_deeplink(String(v || ""));
+          return;
+        }
+      } catch (_) {}
+      return _setAttribute.call(this, k, v);
+    };
+  } catch (_) {}
+
+  try {
+    const _open = window.open;
+    window.open = function (u, ...rest) {
+      try {
+        if (__riverdeck_is_deeplink(u)) {
+          __riverdeck_trigger_deeplink(String(u || ""));
+          return null;
+        }
+      } catch (_) {}
+      return _open ? _open.call(window, u, ...rest) : null;
+    };
+  } catch (_) {}
+
+  // Strategy D: periodic fallback (covers cases where overriding setters doesn't catch it).
+  try {
+    const seen = new Set();
+    setInterval(() => {
+      try {
+        const iframes = document.querySelectorAll("iframe");
+        for (const f of iframes) {
+          let s = "";
+          try {
+            s = String(f.getAttribute("src") || f.src || "");
+          } catch (_) {
+            s = String(f.getAttribute("src") || "");
+          }
+          if (__riverdeck_is_deeplink(s) && !seen.has(s)) {
+            seen.add(s);
+            __riverdeck_trigger_deeplink(s);
+          }
+        }
+      } catch (_) {}
+    }, 250);
+  } catch (_) {}
 })();
 "#
 }
@@ -596,6 +718,8 @@ fn default_storage_dir() -> Option<std::path::PathBuf> {
 enum IpcRequest {
     #[serde(rename = "openUrl")]
     OpenUrl { url: String },
+    #[serde(rename = "deepLink")]
+    DeepLink { url: String },
     #[serde(rename = "fetch")]
     Fetch {
         id: u64,
@@ -631,6 +755,26 @@ fn handle_ipc(req: Request<String>, proxy: EventLoopProxy<PiEvent>, ipc_port: Op
         IpcRequest::OpenUrl { url } => {
             let u = url.trim();
             if u.len() <= 2048 && (u.starts_with("http://") || u.starts_with("https://")) {
+                let _ = open::that_detached(u);
+            }
+        }
+        IpcRequest::DeepLink { url } => {
+            let u = url.trim();
+            if u.is_empty() || u.len() > 4096 {
+                return;
+            }
+            if !(u.starts_with("openaction://")
+                || u.starts_with("opendeck://")
+                || u.starts_with("streamdeck://")
+                || u.starts_with("riverdeck://"))
+            {
+                return;
+            }
+
+            log::info!("deep link requested via IPC: {u}");
+            if let Some(port) = ipc_port {
+                let _ = send_deep_link_ipc(port, u);
+            } else {
                 let _ = open::that_detached(u);
             }
         }

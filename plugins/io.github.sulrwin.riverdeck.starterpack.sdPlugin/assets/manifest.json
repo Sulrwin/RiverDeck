@@ -3,6 +3,7 @@
 	"Description": "RiverDeck starter pack plugin",
 	"Author": "Aman Khanna (nekename)",
 	"Version": "2.7.1",
+	"RiverDeck": { "ManifestVersion": 1 },
 	"CodePathWin": "windows/bin/riverdeck-starterpack.exe",
 	"CodePathMac": "darwin/bin/riverdeck-starterpack",
 	"CodePathLin": "linux/bin/riverdeck-starterpack",

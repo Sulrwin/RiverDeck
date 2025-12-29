@@ -33,6 +33,7 @@
 			<array>
 				<string>riverdeck</string>
 				<string>openaction</string>
+				<string>opendeck</string>
 				<string>streamdeck</string>
 			</array>
 		</dict>

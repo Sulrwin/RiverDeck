@@ -121,3 +121,7 @@ Before each commit, please ensure that all of the following are completed:
 When submitting contributions, please adhere to the [Conventional Commits specification](https://conventionalcommits.org/) for commit messages. You will also need to [sign your commits](https://docs.github.com/en/authentication/managing-commit-signature-verification/signing-commits). Feel free to reach out on the support channels above for guidance when contributing!
 
 RiverDeck is licensed under the GNU General Public License version 3.0 or later. For more details, see the LICENSE.md file.
+
+## Native plugins
+
+RiverDeck is moving to a **RiverDeck-native** plugin ecosystem (Linux-first). See [`docs/plugins.md`](docs/plugins.md).

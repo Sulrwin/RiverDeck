@@ -173,6 +173,27 @@ pub async fn set_multi_action_run_on(
     Ok(())
 }
 
+/// Host-side helper to update an instance's settings and notify the plugin (like a Property Inspector would).
+pub async fn set_instance_settings(
+    context: ActionContext,
+    settings: serde_json::Value,
+) -> Result<(), anyhow::Error> {
+    let mut locks = acquire_locks_mut().await;
+
+    if let Some(instance) = crate::store::profiles::get_instance_mut(&context, &mut locks).await? {
+        instance.settings = settings;
+        // Notify the plugin (not the PI).
+        crate::events::outbound::settings::did_receive_settings(instance, false).await?;
+        // Best-effort UI refresh for hosts that cache snapshots.
+        ui::emit(UiEvent::ActionStateChanged {
+            context: instance.context.clone(),
+        });
+        save_profile(&context.device, &mut locks).await?;
+    }
+
+    Ok(())
+}
+
 pub async fn reorder_multi_action_child(
     parent_ctx: ActionContext,
     from: usize,

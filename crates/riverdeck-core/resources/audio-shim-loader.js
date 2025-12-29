@@ -31,8 +31,9 @@ Module.prototype.require = function(id) {
     if (id.includes('AudioDeviceService') || 
         id.includes('winAudioDeviceService') || 
         id.includes('macAudioDeviceService') ||
+        id.includes('linAudioDeviceService') ||
         id.includes('macIntelAudioDeviceService') ||
-        (typeof id === 'string' && id.endsWith('.node') && id.includes('audio'))) {
+        (typeof id === 'string' && id.endsWith('.node') && (id.includes('audio') || id.includes('Audio')))) {
         
         console.log('[AudioShimLoader] ***** INTERCEPTED AUDIO MODULE *****');
         console.log('[AudioShimLoader] Original module:', id);

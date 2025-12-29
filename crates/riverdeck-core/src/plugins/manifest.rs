@@ -5,6 +5,12 @@ use crate::shared::{Action, ActionState};
 use serde::Deserialize;
 use serde_inline_default::serde_inline_default;
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct RiverDeckMeta {
+    #[serde(alias = "ManifestVersion")]
+    pub manifest_version: u32,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct OS {
     #[serde(alias = "Platform")]
@@ -15,6 +21,11 @@ pub struct OS {
 #[serde_inline_default]
 #[derive(Deserialize)]
 pub struct PluginManifest {
+    /// RiverDeck-native marker. If this is missing, the plugin is treated as unsupported by default.
+    /// (We allow a small compatibility exception for our own legacy plugins by UUID prefix.)
+    #[serde(alias = "RiverDeck")]
+    pub riverdeck: Option<RiverDeckMeta>,
+
     #[serde(alias = "Name")]
     pub name: String,
 
@@ -68,13 +79,66 @@ pub struct PluginManifest {
     pub has_settings_interface: Option<bool>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnsupportedPluginReason {
+    MissingRiverDeckMarker,
+    MissingLinuxCodePath,
+    MissingLinuxOsSupport,
+    RequiresNonNativeRunner(String),
+}
+
+pub fn validate_riverdeck_native(
+    plugin_uuid: &str,
+    manifest: &PluginManifest,
+) -> Result<(), UnsupportedPluginReason> {
+    // Allow our own legacy plugins while we migrate manifests.
+    // (Example: `io.github.sulrwin.riverdeck.starterpack.sdPlugin`.)
+    let is_legacy_riverdeck_plugin = plugin_uuid.starts_with("io.github.sulrwin.riverdeck.");
+
+    if manifest.riverdeck.is_none() && !is_legacy_riverdeck_plugin {
+        return Err(UnsupportedPluginReason::MissingRiverDeckMarker);
+    }
+
+    // Native-first: do not allow Node/HTML/Wine plugins as RiverDeck-native.
+    // We only allow native executables referenced via `CodePathLin` on Linux.
+    #[cfg(target_os = "linux")]
+    {
+        let linux_os_supported = manifest.os.iter().any(|o| o.platform == "linux");
+        if !linux_os_supported {
+            return Err(UnsupportedPluginReason::MissingLinuxOsSupport);
+        }
+
+        let Some(code_path_linux) = manifest.code_path_linux.as_deref() else {
+            return Err(UnsupportedPluginReason::MissingLinuxCodePath);
+        };
+
+        let cp = code_path_linux.to_lowercase();
+        if cp.ends_with(".js") || cp.ends_with(".mjs") || cp.ends_with(".cjs") {
+            return Err(UnsupportedPluginReason::RequiresNonNativeRunner(
+                "node".to_owned(),
+            ));
+        }
+        if cp.ends_with(".html") || cp.ends_with(".htm") || cp.ends_with(".xhtml") {
+            return Err(UnsupportedPluginReason::RequiresNonNativeRunner(
+                "webview".to_owned(),
+            ));
+        }
+        if cp.ends_with(".exe") {
+            return Err(UnsupportedPluginReason::RequiresNonNativeRunner(
+                "wine".to_owned(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 pub fn read_manifest(base_path: &std::path::Path) -> Result<PluginManifest, anyhow::Error> {
     use anyhow::Context;
 
     fn decode_manifest(bytes: &[u8]) -> anyhow::Result<String> {
         // Some Marketplace plugins ship a proprietary binary "manifest.json" container.
-        // (Observed header: "ELGATO"). We can't decode this format yet, but we can synthesize
-        // a manifest from the plugin's metadata files (localization, icon paths, etc).
+        // (Observed header: "ELGATO"). RiverDeck does not support this format.
         if bytes.starts_with(b"ELGATO") {
             return Err(anyhow::anyhow!(
                 "manifest is in Elgato-protected binary format (ELGATO header), not JSON text"
@@ -207,7 +271,7 @@ pub fn read_manifest(base_path: &std::path::Path) -> Result<PluginManifest, anyh
 
     let raw = std::fs::read(base_path.join("manifest.json")).context("failed to read manifest")?;
 
-    // Try to decode the manifest; if it's ELGATO format, synthesize from metadata instead.
+    // Try to decode the manifest. Unsupported formats (e.g. ELGATO binary container) are rejected.
     let manifest = match decode_manifest(&raw) {
         Ok(text) => {
             let text = text.trim_start_matches("\u{feff}");
@@ -225,24 +289,17 @@ pub fn read_manifest(base_path: &std::path::Path) -> Result<PluginManifest, anyh
 
             serde_json::from_value(manifest).context("failed to parse manifest")?
         }
-        Err(e) if e.to_string().contains("ELGATO") => {
-            // ELGATO binary format detected - synthesize manifest from plugin metadata
-            log::info!(
-                "ELGATO manifest format detected at {}, synthesizing from metadata",
-                base_path.display()
-            );
-            synthesize_manifest_from_bundle(base_path)?
-        }
         Err(e) => return Err(e),
     };
 
     Ok(manifest)
 }
 
-/// Synthesize a manifest from plugin bundle metadata (for ELGATO-format plugins).
+/// Legacy helper from a previous compatibility attempt.
 ///
-/// This scans the plugin folder for localization files (`en.json`, etc), icons, and
-/// property inspectors to construct a valid manifest without decoding the binary container.
+/// RiverDeck no longer synthesizes manifests from ELGATO-format bundles. Kept only so
+/// existing development branches can be rebased without losing work; not used in production.
+#[allow(dead_code)]
 fn synthesize_manifest_from_bundle(
     base_path: &std::path::Path,
 ) -> Result<PluginManifest, anyhow::Error> {
@@ -320,9 +377,10 @@ fn synthesize_manifest_from_bundle(
                 let file_name = entry.file_name();
                 let name_str = file_name.to_string_lossy();
                 if name_str.starts_with("ESD")
-                    && (name_str.ends_with(".exe") || !name_str.contains('.')) {
-                        found_exes.push(name_str.to_string());
-                    }
+                    && (name_str.ends_with(".exe") || !name_str.contains('.'))
+                {
+                    found_exes.push(name_str.to_string());
+                }
             }
         }
 
@@ -378,11 +436,8 @@ fn synthesize_manifest_from_bundle(
                 .map(|e| e.clone());
 
             // Fall back to .exe for Wine if no native binary found
-            let found_exe = preferred.or_else(|| {
-                found_exes
-                    .iter()
-                    .find(|e| e.ends_with(".exe")).cloned()
-            });
+            let found_exe =
+                preferred.or_else(|| found_exes.iter().find(|e| e.ends_with(".exe")).cloned());
 
             if found_exe.is_some() {
                 found_exe
@@ -781,6 +836,7 @@ fn synthesize_manifest_from_bundle(
     };
 
     let manifest = PluginManifest {
+        riverdeck: None,
         name: plugin_name,
         author: "Elgato".to_owned(), // Could be inferred from plugin ID namespace
         version: "1.0.0".to_owned(), // Could try to parse from filename or assume default

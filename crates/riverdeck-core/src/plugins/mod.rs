@@ -1,5 +1,6 @@
 pub mod info_param;
 pub mod manifest;
+pub mod marketplace;
 mod webserver;
 
 use crate::shared::{CATEGORIES, Category, config_dir, convert_icon, is_flatpak, log_dir};
@@ -131,6 +132,16 @@ pub async fn initialise_plugin(path: &path::Path) -> anyhow::Result<()> {
 
     let mut manifest = manifest::read_manifest(path)?;
     log::info!("Manifest read successfully for {}", plugin_uuid);
+
+    // RiverDeck-native only: refuse non-native plugins early with a clear reason.
+    if let Err(reason) = manifest::validate_riverdeck_native(plugin_uuid, &manifest) {
+        log::warn!(
+            "Plugin {} is unsupported (not RiverDeck-native): {:?}",
+            plugin_uuid,
+            reason
+        );
+        return Err(anyhow!("unsupported plugin (not RiverDeck-native)"));
+    }
 
     // RiverDeck branding: treat legacy OpenDeck categories as our built-in category.
     // This covers plugins installed under the user's config dir that still declare `"Category": "OpenDeck"`.
@@ -777,6 +788,11 @@ pub fn initialise_plugins() {
         }
     }
 
+    let disabled_plugins = crate::store::get_settings()
+        .ok()
+        .map(|s| s.value.disabled_plugins)
+        .unwrap_or_default();
+
     let entries = match fs::read_dir(&plugin_dir) {
         Ok(p) => p,
         Err(error) => {
@@ -829,6 +845,15 @@ pub fn initialise_plugins() {
                 Err(_) => continue,
             };
             if metadata.is_dir() {
+                // Folder name is the plugin ID used throughout RiverDeck.
+                let plugin_id = match path.file_name().and_then(|s| s.to_str()) {
+                    Some(s) => s.to_owned(),
+                    None => continue,
+                };
+                if disabled_plugins.contains(&plugin_id) {
+                    log::info!("Skipping disabled plugin {}", plugin_id);
+                    continue;
+                }
                 tokio::spawn(async move {
                     if let Err(error) = initialise_plugin(&path).await {
                         warn!(
