@@ -2473,6 +2473,11 @@ impl RiverDeckApp {
         selected_profile: &str,
         slot: &SelectedSlot,
     ) {
+        // In two-column mode we want the editor content to *fill* the Action Editor overlay height
+        // so the per-column scroll areas expand vertically instead of the whole panel looking
+        // "compressed" at the top with empty space below.
+        let parent_available_h = ui.available_height().max(0.0);
+
         let instance = match &slot.controller[..] {
             "Encoder" => snapshot
                 .sliders
@@ -2487,12 +2492,6 @@ impl RiverDeckApp {
         egui::Frame::group(ui.style())
             .corner_radius(egui::CornerRadius::same(12))
             .show(ui, |ui| {
-                // Make the editor content fill the available height of the Action Editor overlay.
-                // Without this, the inner layout can shrink to its content, which makes two-column
-                // editors feel "half height" even when the overlay is taller.
-                let fill_h = ui.available_height();
-                ui.set_min_height(fill_h);
-
                 ui.spacing_mut().item_spacing.y = 8.0;
                 // Add a bit of top padding so the first row doesn't sit flush against the frame,
                 // which can make the whole editor feel "too high".
@@ -2528,6 +2527,11 @@ impl RiverDeckApp {
                     || has_native_options
                     || has_schema;
 
+                // Only force-fill in the layouts where we rely on per-column scrolling.
+                if show_right {
+                    ui.set_min_height(parent_available_h);
+                }
+
                 if has_native_options {
                     self.ensure_options_editor_state(device, instance);
                 }
@@ -2560,116 +2564,125 @@ impl RiverDeckApp {
                     // Split from the top: both columns start at the same height as the slot header.
                     let usable = (avail_w - gap).max(0.0);
                     let col_w = (usable * 0.5).max(0.0);
-                    ui.horizontal(|ui| {
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(col_w, ui.available_height()),
-                            egui::Layout::top_down(egui::Align::Min),
-                            |ui| {
-                                // Left column (header + left editor), with its own scrolling.
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        egui::RichText::new(format!(
-                                            "{} {}",
-                                            slot.controller, slot.position
-                                        ))
-                                        .size(14.0)
-                                        .strong(),
-                                    );
-                                    ui.add_space(6.0);
-                                    if ui
-                                        .add_enabled(true, egui::Button::new("Clear"))
-                                        .on_hover_text("Remove the assigned action from this slot")
-                                        .clicked()
-                                    {
-                                        let ctx_to_clear = shared::Context {
-                                            device: device.id.clone(),
-                                            profile: selected_profile.to_owned(),
-                                            page: snapshot.page_id.clone(),
-                                            controller: slot.controller.clone(),
-                                            position: slot.position,
-                                        };
-                                        let _ = self.runtime.block_on(async {
-                                            riverdeck_core::api::instances::remove_instance(
-                                                shared::ActionContext::from_context(
-                                                    ctx_to_clear,
-                                                    0,
-                                                ),
+                    // Allocate a fixed-height row for the split. `ui.horizontal` can shrink-to-fit,
+                    // which collapses both columns (and their scroll areas) to content height.
+                    let row_h = ui.available_height().max(0.0);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(avail_w, row_h),
+                        egui::Layout::left_to_right(egui::Align::Min),
+                        |ui| {
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(col_w, row_h),
+                                egui::Layout::top_down(egui::Align::Min),
+                                |ui| {
+                                    // Left column (header + left editor), with its own scrolling.
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "{} {}",
+                                                slot.controller, slot.position
+                                            ))
+                                            .size(14.0)
+                                            .strong(),
+                                        );
+                                        ui.add_space(6.0);
+                                        if ui
+                                            .add_enabled(true, egui::Button::new("Clear"))
+                                            .on_hover_text(
+                                                "Remove the assigned action from this slot",
                                             )
-                                            .await
-                                        });
-                                    }
-                                });
-
-                                ui.horizontal(|ui| {
-                                    let icon_size = egui::vec2(28.0, 28.0);
-                                    let img = instance
-                                        .states
-                                        .get(instance.current_state as usize)
-                                        .map(|s| s.image.trim())
-                                        .filter(|s| !s.is_empty() && *s != "actionDefaultImage")
-                                        .map(|s| s.to_owned())
-                                        .unwrap_or_else(|| instance.action.icon.clone());
-                                    if let Some(tex) = self.texture_for_path(ctx, &img) {
-                                        ui.image((tex.id(), icon_size));
-                                    } else {
-                                        ui.allocate_exact_size(icon_size, egui::Sense::hover());
-                                    }
-                                    ui.label(instance.action.name.trim());
-                                });
-
-                                // Keep the left column height consistent with the editor and avoid
-                                // ID collisions with the right column scroll area.
-                                let scroll_h = ui.available_height().max(0.0);
-                                egui::ScrollArea::vertical()
-                                    .id_salt("action_editor_left_column_scroll")
-                                    .auto_shrink([false, false])
-                                    .min_scrolled_height(scroll_h)
-                                    .max_height(scroll_h)
-                                    .show(ui, |ui| {
-                                        self.draw_action_editor_left_column(
-                                            ui, ctx, device, instance,
-                                        )
-                                    });
-                            },
-                        );
-
-                        ui.add_space(gap);
-
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(col_w, ui.available_height()),
-                            egui::Layout::top_down(egui::Align::Min),
-                            |ui| {
-                                // Right column: cap height and scroll internally to keep editor size consistent.
-                                let scroll_h = ui.available_height().max(0.0);
-                                egui::ScrollArea::vertical()
-                                    .id_salt("action_editor_right_column_scroll")
-                                    .auto_shrink([false, false])
-                                    .min_scrolled_height(scroll_h)
-                                    .max_height(scroll_h)
-                                    .show(ui, |ui| {
-                                        if is_multi_action {
-                                            self.draw_action_editor_multi_action_right_column(
-                                                ui, ctx, instance,
-                                            );
-                                        } else if has_schema {
-                                            self.draw_action_editor_schema_right_column(
-                                                ui, instance,
-                                            );
-                                        } else if has_native_options {
-                                            self.draw_action_editor_native_options_right_column(
-                                                ui, device, instance,
-                                            );
-                                        } else {
-                                            ui.label(
-                                                egui::RichText::new("Toggle Action")
-                                                    .small()
-                                                    .color(ui.visuals().weak_text_color()),
-                                            );
+                                            .clicked()
+                                        {
+                                            let ctx_to_clear = shared::Context {
+                                                device: device.id.clone(),
+                                                profile: selected_profile.to_owned(),
+                                                page: snapshot.page_id.clone(),
+                                                controller: slot.controller.clone(),
+                                                position: slot.position,
+                                            };
+                                            let _ = self.runtime.block_on(async {
+                                                riverdeck_core::api::instances::remove_instance(
+                                                    shared::ActionContext::from_context(
+                                                        ctx_to_clear,
+                                                        0,
+                                                    ),
+                                                )
+                                                .await
+                                            });
                                         }
                                     });
-                            },
-                        );
-                    });
+
+                                    ui.horizontal(|ui| {
+                                        let icon_size = egui::vec2(28.0, 28.0);
+                                        let img = instance
+                                            .states
+                                            .get(instance.current_state as usize)
+                                            .map(|s| s.image.trim())
+                                            .filter(|s| !s.is_empty() && *s != "actionDefaultImage")
+                                            .map(|s| s.to_owned())
+                                            .unwrap_or_else(|| instance.action.icon.clone());
+                                        if let Some(tex) = self.texture_for_path(ctx, &img) {
+                                            ui.image((tex.id(), icon_size));
+                                        } else {
+                                            ui.allocate_exact_size(icon_size, egui::Sense::hover());
+                                        }
+                                        ui.label(instance.action.name.trim());
+                                    });
+
+                                    // Keep the left column height consistent with the editor and avoid
+                                    // ID collisions with the right column scroll area.
+                                    let scroll_h = ui.available_height().max(0.0);
+                                    egui::ScrollArea::vertical()
+                                        .id_salt("action_editor_left_column_scroll")
+                                        .auto_shrink([false, false])
+                                        .min_scrolled_height(scroll_h)
+                                        .max_height(scroll_h)
+                                        .show(ui, |ui| {
+                                            self.draw_action_editor_left_column(
+                                                ui, ctx, device, instance,
+                                            )
+                                        });
+                                },
+                            );
+
+                            ui.add_space(gap);
+
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(col_w, row_h),
+                                egui::Layout::top_down(egui::Align::Min),
+                                |ui| {
+                                    // Right column: cap height and scroll internally to keep editor size consistent.
+                                    let scroll_h = ui.available_height().max(0.0);
+                                    egui::ScrollArea::vertical()
+                                        .id_salt("action_editor_right_column_scroll")
+                                        .auto_shrink([false, false])
+                                        .min_scrolled_height(scroll_h)
+                                        .max_height(scroll_h)
+                                        .show(ui, |ui| {
+                                            if is_multi_action {
+                                                self.draw_action_editor_multi_action_right_column(
+                                                    ui, ctx, instance,
+                                                );
+                                            } else if has_schema {
+                                                self.draw_action_editor_schema_right_column(
+                                                    ui, instance,
+                                                );
+                                            } else if has_native_options {
+                                                self.draw_action_editor_native_options_right_column(
+                                                ui, device, instance,
+                                            );
+                                            } else {
+                                                ui.label(
+                                                    egui::RichText::new("Toggle Action")
+                                                        .small()
+                                                        .color(ui.visuals().weak_text_color()),
+                                                );
+                                            }
+                                        });
+                                },
+                            );
+                        },
+                    );
                 } else {
                     // Single column: keep the header visible and only scroll the options portion.
                     ui.horizontal(|ui| {
@@ -4953,20 +4966,27 @@ impl eframe::App for RiverDeckApp {
                 // not on `available_rect()` (which varies as side panels/content change).
                 // Size the editor as a bottom sheet. Keep it large enough for option-heavy actions,
                 // but avoid pushing the top up into the center on common window sizes.
-                // Keep the bottom-sheet feel without pushing the top too far up.
-                let target_h = (screen.height() * 0.55).clamp(320.0, 600.0);
+                // Use different heights for 1-column vs 2-column editors:
+                // - 1-column: keep it compact (matches the older behavior, sits lower on screen)
+                // - 2-column: a bit taller, but still avoids pushing the top up toward center
+                // Use a single height policy so 1-column and 2-column editors sit at the same
+                // vertical position (same bottom margin, same top edge behavior).
+                let target_h = (screen.height() * 0.45).clamp(260.0, 460.0);
                 let current_h = target_h * anim_t;
 
-                // Keep a small gap above the bottom edge for visual separation.
+                // Keep a small *visible* gap above the bottom edge for visual separation.
+                // Note: the popup frame draws a shadow that can extend below `rect`, so we also
+                // reserve extra space for that bleed instead of clipping it off.
                 let margin = 20.0;
+                let shadow_bleed = frame_margin + 24.0;
                 let center_x = self.preview_center_x.unwrap_or_else(|| avail.center().x);
                 let x = center_x - (target_w * 0.5);
-                let y = (screen.bottom() - margin - current_h).max(screen.top());
+                let y = (screen.bottom() - margin - shadow_bleed - current_h).max(screen.top());
                 let rect =
                     egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(target_w, current_h));
                 // Clip slightly *outside* the overlay rect so the popup frame's stroke/rounding
                 // (and any AA/shadow bleed) doesn't get cut off at the edges.
-                let clip_rect = rect.expand(frame_margin + 24.0);
+                let clip_rect = rect.expand(shadow_bleed);
 
                 egui::Area::new("action_editor_overlay".into())
                     .order(egui::Order::Foreground)
