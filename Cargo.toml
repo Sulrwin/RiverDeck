@@ -3,7 +3,6 @@ members = [
 	"crates/riverdeck-core",
 	"crates/riverdeck-egui",
 	"crates/riverdeck-pi",
-	"crates/riverdeck-audio-router",
 	"plugins/io.github.sulrwin.riverdeck.starterpack.sdPlugin",
 ]
 resolver = "3"

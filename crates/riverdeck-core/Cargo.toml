@@ -10,7 +10,6 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0"
 active-win-pos-rs = "0.9"
-riverdeck-audio-router = { path = "../riverdeck-audio-router" }
 resvg = "0.44"
 usvg = "0.44"
 tiny-skia = "0.11"

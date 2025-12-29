@@ -87,6 +87,35 @@ pub enum UnsupportedPluginReason {
     RequiresNonNativeRunner(String),
 }
 
+pub(crate) fn host_target_triple() -> String {
+    // Prefer runtime override if present (dev builds can set it), otherwise best-effort guess
+    // based on the current host architecture/OS.
+    if let Ok(t) = std::env::var("RIVERDECK_PLUGIN_BUILD_TARGET") {
+        let t = t.trim().to_owned();
+        if !t.is_empty() {
+            return t;
+        }
+    }
+    if let Ok(t) = std::env::var("TARGET") {
+        let t = t.trim().to_owned();
+        if !t.is_empty() {
+            return t;
+        }
+    }
+
+    let arch = std::env::consts::ARCH;
+    let os = std::env::consts::OS;
+    match (arch, os) {
+        ("x86_64", "linux") => "x86_64-unknown-linux-gnu".to_owned(),
+        ("aarch64", "linux") => "aarch64-unknown-linux-gnu".to_owned(),
+        ("x86_64", "macos") => "x86_64-apple-darwin".to_owned(),
+        ("aarch64", "macos") => "aarch64-apple-darwin".to_owned(),
+        ("x86_64", "windows") => "x86_64-pc-windows-msvc".to_owned(),
+        ("aarch64", "windows") => "aarch64-pc-windows-msvc".to_owned(),
+        _ => format!("{arch}-{os}"),
+    }
+}
+
 pub fn validate_riverdeck_native(
     plugin_uuid: &str,
     manifest: &PluginManifest,
@@ -95,22 +124,38 @@ pub fn validate_riverdeck_native(
     // (Example: `io.github.sulrwin.riverdeck.starterpack.sdPlugin`.)
     let is_legacy_riverdeck_plugin = plugin_uuid.starts_with("io.github.sulrwin.riverdeck.");
 
-    if manifest.riverdeck.is_none() && !is_legacy_riverdeck_plugin {
-        return Err(UnsupportedPluginReason::MissingRiverDeckMarker);
-    }
-
     // Native-first: do not allow Node/HTML/Wine plugins as RiverDeck-native.
     // We only allow native executables referenced via `CodePathLin` on Linux.
     #[cfg(target_os = "linux")]
     {
+        let host_target = host_target_triple();
         let linux_os_supported = manifest.os.iter().any(|o| o.platform == "linux");
         if !linux_os_supported {
             return Err(UnsupportedPluginReason::MissingLinuxOsSupport);
         }
 
-        let Some(code_path_linux) = manifest.code_path_linux.as_deref() else {
+        let code_path_linux = manifest.code_path_linux.as_deref().or_else(|| {
+            manifest
+                .code_paths
+                .as_ref()
+                .and_then(|p| p.get(&host_target).map(|s| s.as_str()))
+        });
+        let Some(code_path_linux) = code_path_linux else {
             return Err(UnsupportedPluginReason::MissingLinuxCodePath);
         };
+
+        // RiverDeck-native marker is optional for "OpenAction-native" bundles that ship a
+        // prebuilt native executable via `CodePaths` for the host target.
+        if manifest.riverdeck.is_none() && !is_legacy_riverdeck_plugin {
+            let is_openaction_native = manifest
+                .code_paths
+                .as_ref()
+                .and_then(|p| p.get(&host_target))
+                .is_some();
+            if !is_openaction_native {
+                return Err(UnsupportedPluginReason::MissingRiverDeckMarker);
+            }
+        }
 
         let cp = code_path_linux.to_lowercase();
         if cp.ends_with(".js") || cp.ends_with(".mjs") || cp.ends_with(".cjs") {

@@ -128,19 +128,19 @@ pub static PORT_BASE: Lazy<u16> = Lazy::new(|| {
 pub async fn initialise_plugin(path: &path::Path) -> anyhow::Result<()> {
     let plugin_uuid = path.file_name().unwrap().to_str().unwrap();
     log::info!("Attempting to initialise plugin: {}", plugin_uuid);
-    let target = std::env::var("TARGET").unwrap_or_default();
+    let target = manifest::host_target_triple();
 
     let mut manifest = manifest::read_manifest(path)?;
     log::info!("Manifest read successfully for {}", plugin_uuid);
 
-    // RiverDeck-native only: refuse non-native plugins early with a clear reason.
+    // Native binary plugins only: refuse non-native plugins early with a clear reason.
     if let Err(reason) = manifest::validate_riverdeck_native(plugin_uuid, &manifest) {
         log::warn!(
-            "Plugin {} is unsupported (not RiverDeck-native): {:?}",
+            "Plugin {} is unsupported by policy: {:?}",
             plugin_uuid,
             reason
         );
-        return Err(anyhow!("unsupported plugin (not RiverDeck-native)"));
+        return Err(anyhow!("unsupported plugin"));
     }
 
     // RiverDeck branding: treat legacy OpenDeck categories as our built-in category.
@@ -435,43 +435,6 @@ pub async fn initialise_plugin(path: &path::Path) -> anyhow::Result<()> {
             let mut cmd = Command::new(command);
             cmd.current_dir(path).args(extra_args);
 
-            // Detect if this is a plugin that needs audio compatibility layer
-            let needs_audio_shim = plugin_uuid == "com.elgato.volume-controller"
-                || plugin_uuid.contains("volume")
-                || plugin_uuid.contains("audio");
-
-            #[cfg(target_os = "linux")]
-            if needs_audio_shim {
-                // Install audio shim to plugin directory if not already present
-                let shim_loader = path.join("audio-shim-loader.js");
-                let shim_impl = path.join("linux-audio-shim.js");
-
-                if !shim_loader.exists() || !shim_impl.exists() {
-                    // Embedded shim files
-                    const SHIM_LOADER: &str = include_str!("../../resources/audio-shim-loader.js");
-                    const SHIM_IMPL: &str = include_str!("../../resources/linux-audio-shim.js");
-
-                    if let Err(e) = fs::write(&shim_loader, SHIM_LOADER) {
-                        log::warn!("Failed to write audio shim loader: {}", e);
-                    } else if let Err(e) = fs::write(&shim_impl, SHIM_IMPL) {
-                        log::warn!("Failed to write audio shim implementation: {}", e);
-                    } else {
-                        log::info!(
-                            "Installed audio compatibility shim for plugin {}",
-                            plugin_uuid
-                        );
-                    }
-                }
-
-                if shim_loader.exists() {
-                    log::info!(
-                        "Injecting audio compatibility shim for plugin {}",
-                        plugin_uuid
-                    );
-                    cmd.arg("--require").arg(&shim_loader);
-                }
-            }
-
             cmd.arg(code_path)
                 .args(args)
                 .arg(serde_json::to_string(&info)?)
@@ -706,14 +669,6 @@ pub fn initialise_plugins() {
         log::info!("Starting plugin servers for the first time");
         tokio::spawn(init_websocket_server());
         tokio::spawn(webserver::init_webserver(config_dir()));
-
-        // Start the audio router server for any audio plugins (Volume Controller, etc)
-        tokio::spawn(async {
-            let backend = riverdeck_audio_router::PulseAudioBackend::new();
-            if let Err(e) = riverdeck_audio_router::start_audio_router_server(backend).await {
-                log::error!("Audio Router server failed: {:#}", e);
-            }
-        });
     } else {
         log::debug!("Plugin servers already running; skipping server init");
     }

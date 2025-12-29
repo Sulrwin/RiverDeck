@@ -127,17 +127,56 @@ struct GithubRelease {
     assets: Option<Vec<GithubReleaseAsset>>,
 }
 
-async fn github_latest_release_download(repo_url: &str) -> Option<String> {
+fn default_user_agent() -> &'static str {
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) RiverDeck/1.0"
+}
+
+async fn github_try_latest_download(owner: &str, repo: &str, filename: &str) -> Option<String> {
+    let filename = filename.trim();
+    if filename.is_empty() || filename.len() > 512 {
+        return None;
+    }
+    let url = format!("https://github.com/{owner}/{repo}/releases/latest/download/{filename}");
+    let client = reqwest::Client::new();
+    let resp = client
+        .head(&url)
+        .header("accept", "*/*")
+        .header("user-agent", default_user_agent())
+        .send()
+        .await
+        .ok()?;
+    let status = resp.status();
+    if status.is_success() || status.is_redirection() {
+        return Some(url);
+    }
+    None
+}
+
+async fn github_latest_release_download(repo_url: &str, plugin_id: &str) -> Option<String> {
     let (owner, repo) = github_owner_repo(repo_url)?;
+
+    // First: avoid GitHub API rate limits by probing conventional release asset names.
+    // Many OpenAction repos publish `<plugin_id>.zip` as the bundle.
+    let candidates = [
+        format!("{plugin_id}.zip"),
+        format!("{plugin_id}.streamDeckPlugin"),
+        format!("{plugin_id}.streamDeckIconPack"),
+        format!("{plugin_id}.sdPlugin.zip"),
+        format!("{plugin_id}.sdPlugin"),
+    ];
+    for c in candidates {
+        if let Some(u) = github_try_latest_download(&owner, &repo, &c).await {
+            return Some(u);
+        }
+    }
+
+    // Fallback: query GitHub API for the latest release assets (best-effort; can be rate-limited).
     let api = format!("https://api.github.com/repos/{owner}/{repo}/releases/latest");
     let client = reqwest::Client::new();
     let resp = client
         .get(api)
         .header("accept", "application/vnd.github+json")
-        .header(
-            "user-agent",
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) RiverDeck/1.0",
-        )
+        .header("user-agent", default_user_agent())
         .send()
         .await
         .ok()?;
@@ -207,7 +246,7 @@ pub async fn resolve_install(plugin_id: &str) -> anyhow::Result<ResolvedInstall>
 
     // Best-effort fallback: look for a release artifact on GitHub.
     if let Some(repo) = repo_url.as_deref()
-        && let Some(dl) = github_latest_release_download(repo).await
+        && let Some(dl) = github_latest_release_download(repo, &plugin_id).await
     {
         return Ok(ResolvedInstall {
             plugin_id,
