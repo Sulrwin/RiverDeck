@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="144" height="144" viewBox="0 0 144 144">
+  <!-- RiverDeck built-in icon: Multi Action (matches starterpack icon style) -->
+  <rect x="0" y="0" width="144" height="144" fill="#3b3640"/>
+  <g fill="none" stroke="#e8e8e8" stroke-width="10" stroke-linecap="round" stroke-linejoin="round">
+    <!-- Three stacked action "cards" -->
+    <rect x="34" y="54" width="64" height="64" rx="10"/>
+    <rect x="42" y="46" width="64" height="64" rx="10"/>
+    <rect x="50" y="38" width="64" height="64" rx="10"/>
+    <!-- Small execute chevron inside the front card -->
+    <path d="M74 62 L86 72 L74 82"/>
+  </g>
+</svg>
+
+

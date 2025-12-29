@@ -15,6 +15,13 @@ pub fn startup_cleanup() {
 ///
 /// This focuses on subprocesses (plugins, helpers), since background tasks die with the runtime.
 pub async fn shutdown_all() {
+    // Best-effort: flush any debounced profile saves so recent plugin-driven updates persist.
+    let _ = tokio::time::timeout(
+        Duration::from_millis(500),
+        crate::store::profiles::flush_pending_saves(),
+    )
+    .await;
+
     // Best-effort: reset Stream Deck devices so they don't remain "stuck" on the last rendered
     // frame after RiverDeck exits. This must not block shutdown.
     let _ = tokio::time::timeout(Duration::from_millis(500), crate::elgato::reset_devices()).await;

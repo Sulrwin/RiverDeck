@@ -11,3 +11,4 @@ This is a minimal template for creating **RiverDeck-native** plugins.
 
 
 
+

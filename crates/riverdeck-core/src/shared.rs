@@ -187,19 +187,75 @@ pub fn ensure_builtin_icons() {
         return;
     }
 
-    fn ensure_solid_png(path: &Path, rgba: [u8; 4]) {
+    const MULTI_SVG: &[u8] = include_bytes!("../assets/riverdeck/multi-action.svg");
+    const TOGGLE_SVG: &[u8] = include_bytes!("../assets/riverdeck/toggle-action.svg");
+
+    fn ensure_file(path: &Path, bytes: &[u8]) {
         if path.is_file() {
             return;
         }
-        let img = image::RgbaImage::from_pixel(96, 96, image::Rgba(rgba));
+        if let Err(err) = std::fs::write(path, bytes) {
+            warn!("Failed to write builtin icon {}: {}", path.display(), err);
+        }
+    }
+
+    fn looks_like_old_placeholder_png(path: &Path, rgb: [u8; 3]) -> bool {
+        let Ok(img) = image::open(path) else {
+            return false;
+        };
+        let rgba = img.to_rgba8();
+        let Some(first) = rgba.pixels().next() else {
+            return false;
+        };
+        // Fully opaque solid fill in the specific placeholder color.
+        if first.0[0..3] != rgb || first.0[3] != 0xff {
+            return false;
+        }
+        rgba.pixels().all(|p| p.0 == first.0)
+    }
+
+    fn ensure_png_from_svg(path: &Path, svg_bytes: &[u8]) {
+        // Preserve user overrides, but automatically replace our old solid-color placeholders.
+        if path.is_file()
+            && !looks_like_old_placeholder_png(
+                path,
+                // Multi/Toggle placeholder colors from earlier versions.
+                if path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_default()
+                    .contains("multi-action")
+                {
+                    [0x2d, 0x9c, 0xdb]
+                } else {
+                    [0xf2, 0xc9, 0x4c]
+                },
+            )
+        {
+            return;
+        }
+
+        let img = match crate::elgato::convert_svg_to_image(svg_bytes) {
+            Ok(img) => img,
+            Err(err) => {
+                warn!(
+                    "Failed to rasterize builtin SVG {}: {}",
+                    path.display(),
+                    err
+                );
+                return;
+            }
+        };
         if let Err(err) = img.save_with_format(path, image::ImageFormat::Png) {
             warn!("Failed to create builtin icon {}: {}", path.display(), err);
         }
     }
 
-    // Minimal placeholders; devices/UI will scale these as needed.
-    ensure_solid_png(&dir.join("multi-action.png"), [0x2d, 0x9c, 0xdb, 0xff]);
-    ensure_solid_png(&dir.join("toggle-action.png"), [0xf2, 0xc9, 0x4c, 0xff]);
+    // Install both SVG (for UI/icon picker) and PNG (for compatibility with older profiles).
+    ensure_file(&dir.join("multi-action.svg"), MULTI_SVG);
+    ensure_file(&dir.join("toggle-action.svg"), TOGGLE_SVG);
+    ensure_png_from_svg(&dir.join("multi-action.png"), MULTI_SVG);
+    ensure_png_from_svg(&dir.join("toggle-action.png"), TOGGLE_SVG);
 }
 
 /// Get whether or not the application is running inside the Flatpak sandbox.

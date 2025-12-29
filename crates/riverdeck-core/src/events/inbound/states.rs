@@ -1,7 +1,7 @@
 use super::ContextAndPayloadEvent;
 
 use crate::shared::DEVICES;
-use crate::store::profiles::{acquire_locks_mut, get_instance_mut, save_profile};
+use crate::store::profiles::{acquire_locks_mut, get_instance_mut, request_save_profile};
 use crate::ui::{self, UiEvent};
 
 use serde::Deserialize;
@@ -99,7 +99,7 @@ pub async fn set_title(
             .await;
         }
     }
-    save_profile(&event.context.device, &mut locks).await?;
+    request_save_profile(&event.context.device, &mut locks)?;
 
     Ok(())
 }
@@ -195,7 +195,7 @@ pub async fn set_image(
             }
         }
     }
-    save_profile(&event.context.device, &mut locks).await?;
+    request_save_profile(&event.context.device, &mut locks)?;
 
     Ok(())
 }
@@ -242,7 +242,7 @@ pub async fn set_state(
             }
         }
     }
-    save_profile(&event.context.device, &mut locks).await?;
+    request_save_profile(&event.context.device, &mut locks)?;
 
     Ok(())
 }

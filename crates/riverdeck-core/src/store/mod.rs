@@ -10,6 +10,78 @@ use std::path::{Path, PathBuf};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
+pub(crate) fn pretty_json_enabled() -> bool {
+    // Debug/dev convenience: opt-in pretty JSON on disk.
+    // Any truthy value enables it: "1", "true", "yes", "on".
+    let v = std::env::var("RIVERDECK_PRETTY_JSON").unwrap_or_default();
+    matches!(
+        v.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+pub(crate) fn json_value_to_bytes(value: &serde_json::Value) -> Result<Vec<u8>, serde_json::Error> {
+    if pretty_json_enabled() {
+        serde_json::to_vec_pretty(value)
+    } else {
+        serde_json::to_vec(value)
+    }
+}
+
+pub(crate) fn write_atomic_bytes(path: &Path, contents: &[u8]) -> Result<(), anyhow::Error> {
+    fs::create_dir_all(path.parent().unwrap())?;
+
+    let temp_path = path.with_extension("json.temp");
+    let backup_path = path.with_extension("json.bak");
+
+    if let Ok(meta) = fs::symlink_metadata(&temp_path)
+        && meta.file_type().is_symlink()
+    {
+        return Err(anyhow::anyhow!("refusing to write to symlinked temp file"));
+    }
+    if let Ok(meta) = fs::symlink_metadata(&backup_path)
+        && meta.file_type().is_symlink()
+    {
+        return Err(anyhow::anyhow!(
+            "refusing to write to symlinked backup file"
+        ));
+    }
+    if let Ok(meta) = fs::symlink_metadata(path)
+        && meta.file_type().is_symlink()
+    {
+        return Err(anyhow::anyhow!(
+            "refusing to overwrite symlinked store file"
+        ));
+    }
+
+    // Write to temporary file
+    let mut temp_file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&temp_path)?;
+    FileExt::lock_exclusive(&temp_file)?;
+    temp_file.write_all(contents)?;
+    temp_file.sync_all()?;
+    FileExt::unlock(&temp_file)?;
+    drop(temp_file);
+
+    // If main file exists, back it up
+    if path.exists() {
+        fs::rename(path, &backup_path)?;
+    }
+
+    // Rename temp file to main file
+    fs::rename(&temp_path, path)?;
+
+    // Remove backup file if everything succeeded
+    if backup_path.exists() {
+        let _ = fs::remove_file(&backup_path);
+    }
+
+    Ok(())
+}
+
 pub trait FromAndIntoDiskValue
 where
     Self: Sized,
@@ -84,59 +156,9 @@ where
 
     /// Save the relevant Store as a file
     pub fn save(&self) -> Result<(), anyhow::Error> {
-        fs::create_dir_all(self.path.parent().unwrap())?;
-
-        let contents = serde_json::to_string_pretty(&T::into_value(&self.value)?)?;
-
-        let temp_path = self.path.with_extension("json.temp");
-        let backup_path = self.path.with_extension("json.bak");
-
-        if let Ok(meta) = fs::symlink_metadata(&temp_path)
-            && meta.file_type().is_symlink()
-        {
-            return Err(anyhow::anyhow!("refusing to write to symlinked temp file"));
-        }
-        if let Ok(meta) = fs::symlink_metadata(&backup_path)
-            && meta.file_type().is_symlink()
-        {
-            return Err(anyhow::anyhow!(
-                "refusing to write to symlinked backup file"
-            ));
-        }
-        if let Ok(meta) = fs::symlink_metadata(&self.path)
-            && meta.file_type().is_symlink()
-        {
-            return Err(anyhow::anyhow!(
-                "refusing to overwrite symlinked store file"
-            ));
-        }
-
-        // Write to temporary file
-        let mut temp_file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&temp_path)?;
-        FileExt::lock_exclusive(&temp_file)?;
-        temp_file.write_all(contents.as_bytes())?;
-        temp_file.sync_all()?;
-        FileExt::unlock(&temp_file)?;
-        drop(temp_file);
-
-        // If main file exists, back it up
-        if self.path.exists() {
-            fs::rename(&self.path, &backup_path)?;
-        }
-
-        // Rename temp file to main file
-        fs::rename(&temp_path, &self.path)?;
-
-        // Remove backup file if everything succeeded
-        if backup_path.exists() {
-            let _ = fs::remove_file(&backup_path);
-        }
-
-        Ok(())
+        let value = T::into_value(&self.value)?;
+        let bytes = json_value_to_bytes(&value)?;
+        write_atomic_bytes(&self.path, &bytes)
     }
 }
 

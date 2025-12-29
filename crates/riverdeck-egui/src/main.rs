@@ -1430,6 +1430,8 @@ struct RiverDeckApp {
 
     start_hidden: bool,
     update_info: Arc<Mutex<Option<UpdateInfo>>>,
+    // Track scale changes so we can re-apply our theme only when needed.
+    last_pixels_per_point: f32,
 
     #[cfg(feature = "tray")]
     tray: Option<TrayState>,
@@ -1438,6 +1440,10 @@ struct RiverDeckApp {
     #[cfg(feature = "tray")]
     hide_to_tray_requested: bool,
     selected_device: Option<String>,
+    // Cached selected profile for the currently-selected device (kept in sync asynchronously).
+    selected_profile_device: Option<String>,
+    selected_profile: String,
+    selected_profile_rx: Option<mpsc::Receiver<String>>,
 
     selected_slot: Option<SelectedSlot>,
     // Per-button label editor (host-side, persisted in ActionState.text + ActionState.text_placement).
@@ -1485,6 +1491,13 @@ struct RiverDeckApp {
     pages_inflight: Option<(String, String)>,
     pages_rx: Option<PagesRx>,
 
+    // Cached profile snapshot for rendering the device grid without blocking the UI thread.
+    profile_snapshot_key: Option<SnapshotKey>,
+    profile_snapshot_cache: Option<Arc<ProfileSnapshot>>,
+    profile_snapshot_rx: Option<mpsc::Receiver<anyhow::Result<ProfileSnapshot>>>,
+    profile_snapshot_needs_refresh: bool,
+    profile_snapshot_error: Option<String>,
+
     action_controller_filter: String,
     drag_payload: Option<DragPayload>,
     drag_hover_slot: Option<SelectedSlot>,
@@ -1508,6 +1521,8 @@ struct RiverDeckApp {
     property_inspector_child: Option<std::process::Child>,
     property_inspector_context: Option<shared::ActionContext>,
     property_inspector_last_error: Option<String>,
+    pending_property_inspector_open:
+        Option<mpsc::Receiver<anyhow::Result<(shared::ActionContext, std::process::Child)>>>,
 
     // Profile management UI.
     show_profile_editor: bool,
@@ -1672,10 +1687,54 @@ struct ProfileSnapshot {
     encoder_screen_background: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SnapshotKey {
+    device_id: String,
+    profile_id: String,
+}
+
 impl RiverDeckApp {
     const DEVICES_PANEL_DEFAULT_WIDTH: f32 = 200.0; // egui::SidePanel default in egui 0.31.x
     const ACTIONS_PANEL_DEFAULT_WIDTH: f32 = 280.0; // allow Actions panel to be half the previous width
     const POPUP_TITLEBAR_HEIGHT: f32 = 28.0;
+
+    fn apply_theme(ctx: &egui::Context) {
+        // Professional dark theme pass: aim closer to the Stream Deck dark UI.
+        ctx.style_mut(|s| {
+            s.spacing.item_spacing = egui::vec2(12.0, 12.0);
+            s.spacing.button_padding = egui::vec2(11.0, 9.0);
+            s.spacing.window_margin = egui::Margin::same(14);
+
+            let mut v = egui::Visuals::dark();
+            // Surfaces
+            v.window_fill = egui::Color32::from_rgb(24, 25, 27);
+            v.panel_fill = egui::Color32::from_rgb(28, 29, 31);
+            v.extreme_bg_color = egui::Color32::from_rgb(20, 21, 23);
+            v.faint_bg_color = egui::Color32::from_rgb(34, 35, 38);
+
+            // Widget cards
+            v.widgets.inactive.bg_fill = egui::Color32::from_rgb(33, 34, 37);
+            v.widgets.hovered.bg_fill = egui::Color32::from_rgb(41, 42, 46);
+            v.widgets.active.bg_fill = egui::Color32::from_rgb(48, 50, 55);
+            v.widgets.inactive.bg_stroke =
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(56, 58, 62));
+            v.widgets.hovered.bg_stroke =
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(82, 85, 90));
+            v.widgets.active.bg_stroke =
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(110, 114, 122));
+
+            // Accents
+            // Outline-only selection (avoid overpowering blue overlays on text-heavy widgets).
+            v.selection.bg_fill = egui::Color32::TRANSPARENT;
+            v.selection.stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(0, 145, 255));
+            v.error_fg_color = egui::Color32::from_rgb(255, 95, 95);
+
+            // Rounding
+            v.window_corner_radius = egui::CornerRadius::same(12);
+            v.menu_corner_radius = egui::CornerRadius::same(10);
+            s.visuals = v;
+        });
+    }
 
     fn draw_popup_titlebar(ui: &mut egui::Ui, title: &str) -> bool {
         let height = Self::POPUP_TITLEBAR_HEIGHT;
@@ -1802,12 +1861,17 @@ impl RiverDeckApp {
             out_rx
         });
 
+        // Apply theme once up-front (instead of rebuilding it every frame).
+        let ppp = cc.egui_ctx.input(|i| i.pixels_per_point);
+        Self::apply_theme(&cc.egui_ctx);
+
         Self {
             runtime,
             ui_events,
             _lock_file: lock_file,
             start_hidden,
             update_info,
+            last_pixels_per_point: ppp,
             #[cfg(feature = "tray")]
             tray,
             #[cfg(feature = "tray")]
@@ -1815,6 +1879,9 @@ impl RiverDeckApp {
             #[cfg(feature = "tray")]
             hide_to_tray_requested: false,
             selected_device: None,
+            selected_profile_device: None,
+            selected_profile: "Default".to_owned(),
+            selected_profile_rx: None,
             selected_slot: None,
             button_label_context: None,
             button_label_input: String::new(),
@@ -1849,6 +1916,13 @@ impl RiverDeckApp {
             pages_cache: HashMap::new(),
             pages_inflight: None,
             pages_rx: None,
+
+            profile_snapshot_key: None,
+            profile_snapshot_cache: None,
+            profile_snapshot_rx: None,
+            profile_snapshot_needs_refresh: false,
+            profile_snapshot_error: None,
+
             action_controller_filter: "Keypad".to_owned(),
             drag_payload: None,
             drag_hover_slot: None,
@@ -1864,6 +1938,7 @@ impl RiverDeckApp {
             property_inspector_child: None,
             property_inspector_context: None,
             property_inspector_last_error: None,
+            pending_property_inspector_open: None,
             show_profile_editor: false,
             profile_name_input: String::new(),
             profile_error: None,
@@ -2489,249 +2564,259 @@ impl RiverDeckApp {
                 .and_then(|v| v.as_ref()),
         };
 
-        egui::Frame::group(ui.style())
-            .corner_radius(egui::CornerRadius::same(12))
-            .show(ui, |ui| {
-                ui.spacing_mut().item_spacing.y = 8.0;
-                // Add a bit of top padding so the first row doesn't sit flush against the frame,
-                // which can make the whole editor feel "too high".
-                ui.add_space(4.0);
+        // Important for 2-column sizing:
+        // `Frame::group` adds inner margins around its contents. If we want the *outer* frame
+        // height to match the available overlay height, we must subtract those margins when
+        // setting a min-height on the inner content area.
+        let frame = egui::Frame::group(ui.style()).corner_radius(egui::CornerRadius::same(12));
+        let frame_margin_y: f32 =
+            (frame.inner_margin.top as f32) + (frame.inner_margin.bottom as f32);
 
-                let Some(instance) = instance else {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(format!("{} {}", slot.controller, slot.position))
-                                .size(14.0)
-                                .strong(),
-                        );
-                        ui.add_space(6.0);
-                        ui.add_enabled(false, egui::Button::new("Clear"));
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new("No action assigned")
-                                .color(ui.visuals().weak_text_color()),
-                        );
-                    });
-                    return;
-                };
+        frame.show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 8.0;
+            // Add a bit of top padding so the first row doesn't sit flush against the frame,
+            // which can make the whole editor feel "too high".
+            ui.add_space(4.0);
 
-                let is_multi_action = shared::is_multi_action_uuid(instance.action.uuid.as_str());
-                let has_native_options =
-                    Self::native_options_kind(instance.action.uuid.as_str()).is_some();
-                let has_schema =
-                    riverdeck_core::options_schema::get_schema(instance.action.uuid.as_str())
-                        .is_some();
-                let show_right = is_multi_action
-                    || shared::is_toggle_action_uuid(instance.action.uuid.as_str())
-                    || has_native_options
-                    || has_schema;
+            let Some(instance) = instance else {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("{} {}", slot.controller, slot.position))
+                            .size(14.0)
+                            .strong(),
+                    );
+                    ui.add_space(6.0);
+                    ui.add_enabled(false, egui::Button::new("Clear"));
+                });
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("No action assigned")
+                            .color(ui.visuals().weak_text_color()),
+                    );
+                });
+                return;
+            };
 
-                // Only force-fill in the layouts where we rely on per-column scrolling.
-                if show_right {
-                    ui.set_min_height(parent_available_h);
-                }
+            let is_multi_action = shared::is_multi_action_uuid(instance.action.uuid.as_str());
+            let has_native_options =
+                Self::native_options_kind(instance.action.uuid.as_str()).is_some();
+            let has_schema =
+                riverdeck_core::options_schema::get_schema(instance.action.uuid.as_str()).is_some();
+            let show_right = is_multi_action
+                || shared::is_toggle_action_uuid(instance.action.uuid.as_str())
+                || has_native_options
+                || has_schema;
 
-                if has_native_options {
-                    self.ensure_options_editor_state(device, instance);
-                }
-                if has_schema {
-                    self.ensure_schema_editor_state(instance);
-                }
+            // Two-column mode: fill the overlay height so the per-column scroll areas can take
+            // the full vertical space. We subtract the frame's vertical inner margin so the
+            // *outer* frame height stays aligned with the overlay (like the 1-column layout).
+            if show_right {
+                ui.set_min_height((parent_available_h - frame_margin_y).max(0.0));
+            }
 
-                // Keep editor state stable while switching slots.
-                let needs_reset = match self.button_label_context.as_ref() {
-                    None => true,
-                    Some(c) => c != &instance.context,
-                };
-                if needs_reset {
-                    self.button_label_context = Some(instance.context.clone());
-                    let st = instance.states.get(instance.current_state as usize);
-                    self.button_label_input = st
-                        .map(|s| s.text.clone())
-                        .unwrap_or_else(|| instance.action.name.clone());
-                    self.button_label_placement = st
-                        .map(|s| s.text_placement)
-                        .unwrap_or(shared::TextPlacement::Bottom);
-                    self.button_show_title = st.map(|s| s.show).unwrap_or(true);
-                    self.button_show_action_name = st.map(|s| s.show_action_name).unwrap_or(true);
-                }
+            if has_native_options {
+                self.ensure_options_editor_state(device, instance);
+            }
+            if has_schema {
+                self.ensure_schema_editor_state(instance);
+            }
 
-                let gap = 6.0;
-                let avail_w = ui.available_width().max(0.0);
+            // Keep editor state stable while switching slots.
+            let needs_reset = match self.button_label_context.as_ref() {
+                None => true,
+                Some(c) => c != &instance.context,
+            };
+            if needs_reset {
+                self.button_label_context = Some(instance.context.clone());
+                let st = instance.states.get(instance.current_state as usize);
+                self.button_label_input = st
+                    .map(|s| s.text.clone())
+                    .unwrap_or_else(|| instance.action.name.clone());
+                self.button_label_placement = st
+                    .map(|s| s.text_placement)
+                    .unwrap_or(shared::TextPlacement::Bottom);
+                self.button_show_title = st.map(|s| s.show).unwrap_or(true);
+                self.button_show_action_name = st.map(|s| s.show_action_name).unwrap_or(true);
+            }
 
-                if show_right {
-                    // Split from the top: both columns start at the same height as the slot header.
-                    let usable = (avail_w - gap).max(0.0);
-                    let col_w = (usable * 0.5).max(0.0);
-                    // Allocate a fixed-height row for the split. `ui.horizontal` can shrink-to-fit,
-                    // which collapses both columns (and their scroll areas) to content height.
-                    let row_h = ui.available_height().max(0.0);
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(avail_w, row_h),
-                        egui::Layout::left_to_right(egui::Align::Min),
-                        |ui| {
-                            ui.allocate_ui_with_layout(
-                                egui::vec2(col_w, row_h),
-                                egui::Layout::top_down(egui::Align::Min),
-                                |ui| {
-                                    // Left column (header + left editor), with its own scrolling.
-                                    ui.horizontal(|ui| {
-                                        ui.label(
-                                            egui::RichText::new(format!(
-                                                "{} {}",
-                                                slot.controller, slot.position
-                                            ))
-                                            .size(14.0)
-                                            .strong(),
-                                        );
-                                        ui.add_space(6.0);
-                                        if ui
-                                            .add_enabled(true, egui::Button::new("Clear"))
-                                            .on_hover_text(
-                                                "Remove the assigned action from this slot",
-                                            )
-                                            .clicked()
-                                        {
-                                            let ctx_to_clear = shared::Context {
-                                                device: device.id.clone(),
-                                                profile: selected_profile.to_owned(),
-                                                page: snapshot.page_id.clone(),
-                                                controller: slot.controller.clone(),
-                                                position: slot.position,
-                                            };
-                                            let _ = self.runtime.block_on(async {
+            let gap = 6.0;
+            let avail_w = ui.available_width().max(0.0);
+
+            if show_right {
+                // Split from the top: both columns start at the same height as the slot header.
+                let usable = (avail_w - gap).max(0.0);
+                let col_w = (usable * 0.5).max(0.0);
+                // Allocate a fixed-height row for the split. `ui.horizontal` can shrink-to-fit,
+                // which collapses both columns (and their scroll areas) to content height.
+                let row_h = ui.available_height().max(0.0);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(avail_w, row_h),
+                    egui::Layout::left_to_right(egui::Align::Min),
+                    |ui| {
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(col_w, row_h),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                // Left column (header + left editor), with its own scrolling.
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{} {}",
+                                            slot.controller, slot.position
+                                        ))
+                                        .size(14.0)
+                                        .strong(),
+                                    );
+                                    ui.add_space(6.0);
+                                    if ui
+                                        .add_enabled(true, egui::Button::new("Clear"))
+                                        .on_hover_text("Remove the assigned action from this slot")
+                                        .clicked()
+                                    {
+                                        let ctx_to_clear = shared::Context {
+                                            device: device.id.clone(),
+                                            profile: selected_profile.to_owned(),
+                                            page: snapshot.page_id.clone(),
+                                            controller: slot.controller.clone(),
+                                            position: slot.position,
+                                        };
+                                        self.profile_snapshot_needs_refresh = true;
+                                        ctx.request_repaint();
+                                        self.runtime.spawn(async move {
+                                            let _ =
                                                 riverdeck_core::api::instances::remove_instance(
                                                     shared::ActionContext::from_context(
                                                         ctx_to_clear,
                                                         0,
                                                     ),
                                                 )
-                                                .await
-                                            });
-                                        }
-                                    });
-
-                                    ui.horizontal(|ui| {
-                                        let icon_size = egui::vec2(28.0, 28.0);
-                                        let img = instance
-                                            .states
-                                            .get(instance.current_state as usize)
-                                            .map(|s| s.image.trim())
-                                            .filter(|s| !s.is_empty() && *s != "actionDefaultImage")
-                                            .map(|s| s.to_owned())
-                                            .unwrap_or_else(|| instance.action.icon.clone());
-                                        if let Some(tex) = self.texture_for_path(ctx, &img) {
-                                            ui.image((tex.id(), icon_size));
-                                        } else {
-                                            ui.allocate_exact_size(icon_size, egui::Sense::hover());
-                                        }
-                                        ui.label(instance.action.name.trim());
-                                    });
-
-                                    // Keep the left column height consistent with the editor and avoid
-                                    // ID collisions with the right column scroll area.
-                                    let scroll_h = ui.available_height().max(0.0);
-                                    egui::ScrollArea::vertical()
-                                        .id_salt("action_editor_left_column_scroll")
-                                        .auto_shrink([false, false])
-                                        .min_scrolled_height(scroll_h)
-                                        .max_height(scroll_h)
-                                        .show(ui, |ui| {
-                                            self.draw_action_editor_left_column(
-                                                ui, ctx, device, instance,
-                                            )
+                                                .await;
                                         });
-                                },
-                            );
+                                    }
+                                });
 
-                            ui.add_space(gap);
+                                ui.horizontal(|ui| {
+                                    let icon_size = egui::vec2(28.0, 28.0);
+                                    let img = instance
+                                        .states
+                                        .get(instance.current_state as usize)
+                                        .map(|s| s.image.trim())
+                                        .filter(|s| !s.is_empty() && *s != "actionDefaultImage")
+                                        .map(|s| s.to_owned())
+                                        .unwrap_or_else(|| instance.action.icon.clone());
+                                    if let Some(tex) = self.texture_for_path(ctx, &img) {
+                                        ui.image((tex.id(), icon_size));
+                                    } else {
+                                        ui.allocate_exact_size(icon_size, egui::Sense::hover());
+                                    }
+                                    ui.label(instance.action.name.trim());
+                                });
 
-                            ui.allocate_ui_with_layout(
-                                egui::vec2(col_w, row_h),
-                                egui::Layout::top_down(egui::Align::Min),
-                                |ui| {
-                                    // Right column: cap height and scroll internally to keep editor size consistent.
-                                    let scroll_h = ui.available_height().max(0.0);
-                                    egui::ScrollArea::vertical()
-                                        .id_salt("action_editor_right_column_scroll")
-                                        .auto_shrink([false, false])
-                                        .min_scrolled_height(scroll_h)
-                                        .max_height(scroll_h)
-                                        .show(ui, |ui| {
-                                            if is_multi_action {
-                                                self.draw_action_editor_multi_action_right_column(
-                                                    ui, ctx, instance,
-                                                );
-                                            } else if has_schema {
-                                                self.draw_action_editor_schema_right_column(
-                                                    ui, instance,
-                                                );
-                                            } else if has_native_options {
-                                                self.draw_action_editor_native_options_right_column(
+                                // Keep the left column height consistent with the editor and avoid
+                                // ID collisions with the right column scroll area.
+                                let scroll_h = ui.available_height().max(0.0);
+                                egui::ScrollArea::vertical()
+                                    .id_salt("action_editor_left_column_scroll")
+                                    .auto_shrink([false, false])
+                                    .min_scrolled_height(scroll_h)
+                                    .max_height(scroll_h)
+                                    .show(ui, |ui| {
+                                        self.draw_action_editor_left_column(
+                                            ui, ctx, device, instance,
+                                        )
+                                    });
+                            },
+                        );
+
+                        ui.add_space(gap);
+
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(col_w, row_h),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                // Right column: cap height and scroll internally to keep editor size consistent.
+                                let scroll_h = ui.available_height().max(0.0);
+                                egui::ScrollArea::vertical()
+                                    .id_salt("action_editor_right_column_scroll")
+                                    .auto_shrink([false, false])
+                                    .min_scrolled_height(scroll_h)
+                                    .max_height(scroll_h)
+                                    .show(ui, |ui| {
+                                        if is_multi_action {
+                                            self.draw_action_editor_multi_action_right_column(
+                                                ui, ctx, instance,
+                                            );
+                                        } else if has_schema {
+                                            self.draw_action_editor_schema_right_column(
+                                                ui, instance,
+                                            );
+                                        } else if has_native_options {
+                                            self.draw_action_editor_native_options_right_column(
                                                 ui, device, instance,
                                             );
-                                            } else {
-                                                ui.label(
-                                                    egui::RichText::new("Toggle Action")
-                                                        .small()
-                                                        .color(ui.visuals().weak_text_color()),
-                                                );
-                                            }
-                                        });
-                                },
-                            );
-                        },
-                    );
-                } else {
-                    // Single column: keep the header visible and only scroll the options portion.
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(format!("{} {}", slot.controller, slot.position))
-                                .size(14.0)
-                                .strong(),
+                                        } else {
+                                            ui.label(
+                                                egui::RichText::new("Toggle Action")
+                                                    .small()
+                                                    .color(ui.visuals().weak_text_color()),
+                                            );
+                                        }
+                                    });
+                            },
                         );
-                        ui.add_space(6.0);
-                        if ui
-                            .add_enabled(true, egui::Button::new("Clear"))
-                            .on_hover_text("Remove the assigned action from this slot")
-                            .clicked()
-                        {
-                            let ctx_to_clear = shared::Context {
-                                device: device.id.clone(),
-                                profile: selected_profile.to_owned(),
-                                page: snapshot.page_id.clone(),
-                                controller: slot.controller.clone(),
-                                position: slot.position,
-                            };
-                            let _ = self.runtime.block_on(async {
-                                riverdeck_core::api::instances::remove_instance(
-                                    shared::ActionContext::from_context(ctx_to_clear, 0),
-                                )
-                                .await
-                            });
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        let icon_size = egui::vec2(28.0, 28.0);
-                        let img = instance
-                            .states
-                            .get(instance.current_state as usize)
-                            .map(|s| s.image.trim())
-                            .filter(|s| !s.is_empty() && *s != "actionDefaultImage")
-                            .map(|s| s.to_owned())
-                            .unwrap_or_else(|| instance.action.icon.clone());
-                        if let Some(tex) = self.texture_for_path(ctx, &img) {
-                            ui.image((tex.id(), icon_size));
-                        } else {
-                            ui.allocate_exact_size(icon_size, egui::Sense::hover());
-                        }
-                        ui.label(instance.action.name.trim());
-                    });
+                    },
+                );
+            } else {
+                // Single column: keep the header visible and only scroll the options portion.
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("{} {}", slot.controller, slot.position))
+                            .size(14.0)
+                            .strong(),
+                    );
+                    ui.add_space(6.0);
+                    if ui
+                        .add_enabled(true, egui::Button::new("Clear"))
+                        .on_hover_text("Remove the assigned action from this slot")
+                        .clicked()
+                    {
+                        let ctx_to_clear = shared::Context {
+                            device: device.id.clone(),
+                            profile: selected_profile.to_owned(),
+                            page: snapshot.page_id.clone(),
+                            controller: slot.controller.clone(),
+                            position: slot.position,
+                        };
+                        self.profile_snapshot_needs_refresh = true;
+                        ctx.request_repaint();
+                        self.runtime.spawn(async move {
+                            let _ = riverdeck_core::api::instances::remove_instance(
+                                shared::ActionContext::from_context(ctx_to_clear, 0),
+                            )
+                            .await;
+                        });
+                    }
+                });
+                ui.horizontal(|ui| {
+                    let icon_size = egui::vec2(28.0, 28.0);
+                    let img = instance
+                        .states
+                        .get(instance.current_state as usize)
+                        .map(|s| s.image.trim())
+                        .filter(|s| !s.is_empty() && *s != "actionDefaultImage")
+                        .map(|s| s.to_owned())
+                        .unwrap_or_else(|| instance.action.icon.clone());
+                    if let Some(tex) = self.texture_for_path(ctx, &img) {
+                        ui.image((tex.id(), icon_size));
+                    } else {
+                        ui.allocate_exact_size(icon_size, egui::Sense::hover());
+                    }
+                    ui.label(instance.action.name.trim());
+                });
 
-                    self.draw_action_editor_left_column(ui, ctx, device, instance);
-                }
-            });
+                self.draw_action_editor_left_column(ui, ctx, device, instance);
+            }
+        });
 
         // PI is intentionally not part of the default action editing flow anymore.
     }
@@ -3630,12 +3715,6 @@ impl RiverDeckApp {
         let encoded = urlencoding::encode(&raw_path);
         let pi_src = format!("http://127.0.0.1:{web_port}/{encoded}?riverdeck_token={token}");
 
-        // Stream Deck-compatible `info` payload for the PI.
-        let info = self.runtime.block_on(async {
-            riverdeck_core::api::property_inspector::make_info(plugin_id.clone()).await
-        })?;
-        let info_json = serde_json::to_string(&info)?;
-
         // Stream Deck-compatible "actionInfo" payload.
         let coords = (|| {
             let device = shared::DEVICES.get(&instance.context.device)?;
@@ -3664,34 +3743,55 @@ impl RiverDeckApp {
 
         let label = format!("Property Inspector — {}", instance.action.name.trim());
         let dock = Self::compute_property_inspector_geometry(ctx);
-        let child = match spawn_pi_process(
-            &label,
-            &pi_src,
-            "*",
-            ws_port,
-            &instance.context.to_string(),
-            &info_json,
-            &connect_json,
-            dock,
-        ) {
-            Ok(child) => child,
-            Err(err) if is_process_not_found(&err) => {
-                return Err(anyhow::anyhow!(
-                    "property inspector helper not found (riverdeck-pi): {err:#}"
-                ));
-            }
-            Err(err) => return Err(err),
-        };
+        let new_ctx = instance.context.clone();
+        let ctx_str = new_ctx.to_string();
 
-        let old = self.property_inspector_context.take();
-        let new = instance.context.clone();
-        self.property_inspector_context = Some(new.clone());
-        self.property_inspector_child = Some(child);
+        let (tx, rx) = mpsc::channel();
+        self.pending_property_inspector_open = Some(rx);
         self.property_inspector_last_error = None;
+
+        let egui_ctx = ctx.clone();
         self.runtime.spawn(async move {
-            riverdeck_core::api::property_inspector::switch_property_inspector(old, Some(new))
-                .await;
+            let res: anyhow::Result<(shared::ActionContext, std::process::Child)> = async {
+                let info =
+                    riverdeck_core::api::property_inspector::make_info(plugin_id.clone()).await?;
+                let info_json = serde_json::to_string(&info)?;
+
+                let child = match tokio::task::spawn_blocking(move || {
+                    match spawn_pi_process(
+                        &label,
+                        &pi_src,
+                        "*",
+                        ws_port,
+                        &ctx_str,
+                        &info_json,
+                        &connect_json,
+                        dock,
+                    ) {
+                        Ok(child) => Ok(child),
+                        Err(err) if is_process_not_found(&err) => Err(anyhow::anyhow!(
+                            "property inspector helper not found (riverdeck-pi): {err:#}"
+                        )),
+                        Err(err) => Err(err),
+                    }
+                })
+                .await
+                {
+                    Ok(Ok(child)) => child,
+                    Ok(Err(err)) => return Err(err),
+                    Err(join_err) => {
+                        return Err(anyhow::anyhow!("PI spawn task failed: {join_err}"));
+                    }
+                };
+
+                Ok((new_ctx, child))
+            }
+            .await;
+
+            let _ = tx.send(res);
+            egui_ctx.request_repaint();
         });
+
         Ok(())
     }
 
@@ -4121,34 +4221,112 @@ impl RiverDeckApp {
         resp
     }
 
+    #[allow(dead_code)]
     fn load_profile_snapshot(
         &self,
-        device: &shared::DeviceInfo,
-        profile_id: &str,
+        _device: &shared::DeviceInfo,
+        _profile_id: &str,
     ) -> anyhow::Result<ProfileSnapshot> {
-        self.runtime.block_on(async {
-            let locks = riverdeck_core::store::profiles::acquire_locks().await;
-            let store = locks.profile_stores.get_profile_store(device, profile_id)?;
-            let page = store
-                .value
-                .pages
-                .iter()
-                .find(|p| p.id == store.value.selected_page)
-                .or_else(|| store.value.pages.first());
-            let page_id = page.map(|p| p.id.clone()).unwrap_or_else(|| "1".to_owned());
-            Ok(ProfileSnapshot {
-                page_id,
-                keys: page.map(|p| p.keys.clone()).unwrap_or_default(),
-                sliders: page.map(|p| p.sliders.clone()).unwrap_or_default(),
-                encoder_screen_background: page.and_then(|p| p.encoder_screen_background.clone()),
-            })
+        // NOTE: This used to do `runtime.block_on(...)` and was a major source of UI stutter.
+        // Keep it as a guardrail so it can't silently re-enter the hot path.
+        Err(anyhow::anyhow!(
+            "load_profile_snapshot is deprecated; use async snapshot caching"
+        ))
+    }
+
+    /// Fully reset snapshot state (used when changing device/profile so we don't render stale data).
+    fn reset_profile_snapshot(&mut self) {
+        self.profile_snapshot_key = None;
+        self.profile_snapshot_cache = None;
+        self.profile_snapshot_rx = None;
+        self.profile_snapshot_error = None;
+    }
+
+    /// Mark the snapshot as stale and trigger a refresh, but keep the previous snapshot rendered
+    /// to avoid flicker ("Loading profile…") during async reloads.
+    fn mark_profile_snapshot_dirty(&mut self) {
+        self.profile_snapshot_key = None;
+        self.profile_snapshot_rx = None;
+        self.profile_snapshot_error = None;
+    }
+
+    fn ensure_selected_profile_fetch(&mut self, ctx: &egui::Context, device_id: String) {
+        if self.selected_profile_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.selected_profile_rx = Some(rx);
+        let egui_ctx = ctx.clone();
+        self.runtime.spawn(async move {
+            let selected = riverdeck_core::api::profiles::get_selected_profile(device_id)
+                .await
+                .map(|p| p.id)
+                .unwrap_or_else(|_| "Default".to_owned());
+            let _ = tx.send(selected);
+            egui_ctx.request_repaint();
+        });
+    }
+
+    fn ensure_profile_snapshot_fetch(
+        &mut self,
+        ctx: &egui::Context,
+        device: shared::DeviceInfo,
+        profile_id: String,
+    ) {
+        let key = SnapshotKey {
+            device_id: device.id.clone(),
+            profile_id: profile_id.clone(),
+        };
+
+        if self.profile_snapshot_rx.is_some() {
+            return;
+        }
+        if self.profile_snapshot_cache.is_some() && self.profile_snapshot_key.as_ref() == Some(&key)
+        {
+            return;
+        }
+
+        let (tx, rx) = mpsc::channel();
+        self.profile_snapshot_rx = Some(rx);
+        self.profile_snapshot_key = Some(key);
+        let egui_ctx = ctx.clone();
+        self.runtime.spawn(async move {
+            let res = Self::fetch_profile_snapshot(device, profile_id).await;
+            let _ = tx.send(res);
+            egui_ctx.request_repaint();
+        });
+    }
+
+    async fn fetch_profile_snapshot(
+        device: shared::DeviceInfo,
+        profile_id: String,
+    ) -> anyhow::Result<ProfileSnapshot> {
+        let locks = riverdeck_core::store::profiles::acquire_locks().await;
+        let store = locks
+            .profile_stores
+            .get_profile_store(&device, &profile_id)?;
+        let page = store
+            .value
+            .pages
+            .iter()
+            .find(|p| p.id == store.value.selected_page)
+            .or_else(|| store.value.pages.first());
+        let page_id = page.map(|p| p.id.clone()).unwrap_or_else(|| "1".to_owned());
+        Ok(ProfileSnapshot {
+            page_id,
+            keys: page.map(|p| p.keys.clone()).unwrap_or_default(),
+            sliders: page.map(|p| p.sliders.clone()).unwrap_or_default(),
+            encoder_screen_background: page.and_then(|p| p.encoder_screen_background.clone()),
         })
     }
 
     fn poll_ui_events(&mut self) {
-        let Some(rx) = self.ui_events.as_mut() else {
+        // Take the receiver out temporarily so we can mutate `self` while draining events
+        // without running into "double mutable borrow" issues.
+        let Some(mut rx) = self.ui_events.take() else {
             return;
         };
+        let mut disconnected = false;
         loop {
             match rx.try_recv() {
                 Ok(event) => match event {
@@ -4160,16 +4338,54 @@ impl RiverDeckApp {
                             self.toasts.finish_install(&id, ok, error);
                         }
                     },
-                    _ => {
-                        // For most events, the UI simply wakes; state is pulled from core singletons.
+                    ui::UiEvent::SwitchProfile { device, profile } => {
+                        // Core auto-switched profiles (e.g. application watcher).
+                        // Keep UI selection in sync so the preview/menu doesn't appear "stuck".
+                        if self.selected_device.as_deref() == Some(device.as_str()) {
+                            if self.selected_profile != profile {
+                                self.selected_profile = profile;
+                                self.selected_profile_device = Some(device);
+                                self.selected_profile_rx = None;
+                                // Device/profile changed; drop snapshot so we don't render stale data.
+                                self.reset_profile_snapshot();
+                            } else {
+                                // Same profile, but still invalidate (page / instances may have changed).
+                                self.profile_snapshot_needs_refresh = true;
+                            }
+                        }
                     }
+                    ui::UiEvent::ActionStateChanged { context } => {
+                        // Only refresh the snapshot if it affects the currently selected device/profile.
+                        // Action state changes can be high-frequency (e.g. setTitle/setImage),
+                        // so avoid thrashing the snapshot loader for unrelated contexts.
+                        if self.selected_device.as_deref() == Some(context.device.as_str())
+                            && self.selected_profile == context.profile
+                        {
+                            self.profile_snapshot_needs_refresh = true;
+                        }
+                    }
+                    ui::UiEvent::RerenderImages { device } => {
+                        // Typically fired after device connect; only relevant to the selected device.
+                        if self.selected_device.as_deref() == Some(device.as_str()) {
+                            self.profile_snapshot_needs_refresh = true;
+                        }
+                    }
+                    ui::UiEvent::DevicesUpdated => {
+                        // Device list / selected device state may have changed.
+                        self.profile_snapshot_needs_refresh = true;
+                    }
+                    _ => {}
                 },
                 Err(tokio_mpsc::error::TryRecvError::Empty) => break,
                 Err(tokio_mpsc::error::TryRecvError::Disconnected) => {
-                    self.ui_events = None;
+                    disconnected = true;
                     break;
                 }
             }
+        }
+
+        if !disconnected {
+            self.ui_events = Some(rx);
         }
     }
 
@@ -4290,41 +4506,12 @@ fn open_url_in_browser(url: &str) {
 
 impl eframe::App for RiverDeckApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Professional dark theme pass: aim closer to the Stream Deck dark UI.
-        ctx.style_mut(|s| {
-            s.spacing.item_spacing = egui::vec2(12.0, 12.0);
-            s.spacing.button_padding = egui::vec2(11.0, 9.0);
-            s.spacing.window_margin = egui::Margin::same(14);
-
-            let mut v = egui::Visuals::dark();
-            // Surfaces
-            v.window_fill = egui::Color32::from_rgb(24, 25, 27);
-            v.panel_fill = egui::Color32::from_rgb(28, 29, 31);
-            v.extreme_bg_color = egui::Color32::from_rgb(20, 21, 23);
-            v.faint_bg_color = egui::Color32::from_rgb(34, 35, 38);
-
-            // Widget cards
-            v.widgets.inactive.bg_fill = egui::Color32::from_rgb(33, 34, 37);
-            v.widgets.hovered.bg_fill = egui::Color32::from_rgb(41, 42, 46);
-            v.widgets.active.bg_fill = egui::Color32::from_rgb(48, 50, 55);
-            v.widgets.inactive.bg_stroke =
-                egui::Stroke::new(1.0, egui::Color32::from_rgb(56, 58, 62));
-            v.widgets.hovered.bg_stroke =
-                egui::Stroke::new(1.0, egui::Color32::from_rgb(82, 85, 90));
-            v.widgets.active.bg_stroke =
-                egui::Stroke::new(1.0, egui::Color32::from_rgb(110, 114, 122));
-
-            // Accents
-            // Outline-only selection (avoid overpowering blue overlays on text-heavy widgets).
-            v.selection.bg_fill = egui::Color32::TRANSPARENT;
-            v.selection.stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(0, 145, 255));
-            v.error_fg_color = egui::Color32::from_rgb(255, 95, 95);
-
-            // Rounding
-            v.window_corner_radius = egui::CornerRadius::same(12);
-            v.menu_corner_radius = egui::CornerRadius::same(10);
-            s.visuals = v;
-        });
+        // Theme is applied once (in `new`) and only re-applied if the UI scale changes.
+        let ppp = ctx.input(|i| i.pixels_per_point);
+        if (ppp - self.last_pixels_per_point).abs() > 0.0001 {
+            self.last_pixels_per_point = ppp;
+            Self::apply_theme(ctx);
+        }
 
         // `tray-icon` on Linux uses GTK/AppIndicator under the hood, which relies on GLib to
         // process DBus registration events. eframe/winit does not run a GTK mainloop, so we
@@ -4448,6 +4635,39 @@ impl eframe::App for RiverDeckApp {
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.pages_inflight = None;
                     self.pages_rx = None;
+                }
+            }
+        }
+
+        // Property inspector open (async): avoid blocking the UI thread while building `info` + spawning the helper.
+        if let Some(rx) = self.pending_property_inspector_open.as_ref() {
+            match rx.try_recv() {
+                Ok(res) => {
+                    self.pending_property_inspector_open = None;
+                    match res {
+                        Ok((new_ctx, child)) => {
+                            let old = self.property_inspector_context.take();
+                            self.property_inspector_context = Some(new_ctx.clone());
+                            self.property_inspector_child = Some(child);
+                            self.property_inspector_last_error = None;
+                            self.runtime.spawn(async move {
+                                riverdeck_core::api::property_inspector::switch_property_inspector(
+                                    old,
+                                    Some(new_ctx),
+                                )
+                                .await;
+                            });
+                            ctx.request_repaint();
+                        }
+                        Err(err) => {
+                            self.property_inspector_last_error = Some(err.to_string());
+                            ctx.request_repaint();
+                        }
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => pending_async = true,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.pending_property_inspector_open = None;
                 }
             }
         }
@@ -4718,26 +4938,87 @@ impl eframe::App for RiverDeckApp {
             .and_then(|id| shared::DEVICES.get(id).map(|d| d.value().clone()));
         if self.selected_device.is_some() && selected_device.is_none() {
             self.selected_device = None;
+            self.selected_profile_device = None;
+            self.selected_profile = "Default".to_owned();
+            self.selected_profile_rx = None;
+            self.reset_profile_snapshot();
             self.selected_slot = None;
             self.action_editor_open = false;
         }
 
-        let selected_profile = selected_device
-            .as_ref()
-            .and_then(|device| {
-                self.runtime
-                    .block_on(async {
-                        riverdeck_core::api::profiles::get_selected_profile(device.id.clone())
-                            .await
-                            .map(|p| p.id)
-                    })
-                    .ok()
-            })
-            .unwrap_or_else(|| "Default".to_owned());
+        // Keep `selected_profile` in sync asynchronously (never block UI thread).
+        if self.selected_profile_device != self.selected_device {
+            self.selected_profile_device = self.selected_device.clone();
+            self.selected_profile = "Default".to_owned();
+            self.selected_profile_rx = None;
+            self.reset_profile_snapshot();
+            if let Some(device_id) = self.selected_device.clone() {
+                self.ensure_selected_profile_fetch(ctx, device_id);
+            }
+        }
 
-        let snapshot = selected_device
-            .as_ref()
-            .and_then(|d| self.load_profile_snapshot(d, &selected_profile).ok());
+        if let Some(rx) = self.selected_profile_rx.as_ref() {
+            match rx.try_recv() {
+                Ok(p) => {
+                    self.selected_profile = if p.trim().is_empty() {
+                        "Default".to_owned()
+                    } else {
+                        p
+                    };
+                    self.selected_profile_rx = None;
+                    self.reset_profile_snapshot();
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.selected_profile_rx = None;
+                }
+            }
+        }
+
+        // If we need a snapshot refresh, only cancel/clear state when no fetch is currently in-flight.
+        // Otherwise, keep the flag set so we refresh again after the current fetch completes.
+        // This avoids "thrashing" where frequent core events continuously drop receivers and the
+        // UI never actually observes a completed snapshot load.
+        if self.profile_snapshot_needs_refresh && self.profile_snapshot_rx.is_none() {
+            self.profile_snapshot_needs_refresh = false;
+            self.mark_profile_snapshot_dirty();
+        }
+
+        // Poll snapshot result (if any).
+        if let Some(rx) = self.profile_snapshot_rx.as_ref() {
+            match rx.try_recv() {
+                Ok(res) => {
+                    self.profile_snapshot_rx = None;
+                    match res {
+                        Ok(s) => {
+                            self.profile_snapshot_cache = Some(Arc::new(s));
+                        }
+                        Err(e) => {
+                            self.profile_snapshot_cache = None;
+                            self.profile_snapshot_error = Some(e.to_string());
+                            self.profile_snapshot_key = None;
+                        }
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.profile_snapshot_rx = None;
+                    self.profile_snapshot_key = None;
+                }
+            }
+        }
+
+        // Ensure we have a snapshot for the currently-selected device/profile.
+        // If `profile_snapshot_key` is None, we intentionally allow a refresh fetch even if we
+        // still have a cached snapshot (to avoid UI flicker while reloading).
+        if self.profile_snapshot_rx.is_none()
+            && (self.profile_snapshot_cache.is_none() || self.profile_snapshot_key.is_none())
+            && let Some(device) = selected_device.clone()
+        {
+            self.ensure_profile_snapshot_fetch(ctx, device, self.selected_profile.clone());
+        }
+
+        let selected_profile = self.selected_profile.clone();
 
         if let (Some(device), Some(slot)) = (&selected_device, &self.selected_slot) {
             let key_count = (device.rows as usize) * (device.columns as usize);
@@ -4842,11 +5123,26 @@ impl eframe::App for RiverDeckApp {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     if cats.is_empty() && (self.categories_inflight || self.categories_rx.is_some())
                     {
-                        ui.label(
-                            egui::RichText::new("Loading actions…")
-                                .small()
-                                .color(ui.visuals().weak_text_color()),
-                        );
+                        ui.horizontal(|ui| {
+                            ui.add(egui::Spinner::new().size(14.0));
+                            ui.label(
+                                egui::RichText::new("Loading actions…")
+                                    .small()
+                                    .color(ui.visuals().weak_text_color()),
+                            );
+                        });
+                    }
+                    if self.plugins_cache.is_none()
+                        && (self.plugins_inflight || self.plugins_rx.is_some())
+                    {
+                        ui.horizontal(|ui| {
+                            ui.add(egui::Spinner::new().size(12.0));
+                            ui.label(
+                                egui::RichText::new("Loading plugins…")
+                                    .small()
+                                    .color(ui.visuals().weak_text_color()),
+                            );
+                        });
                     }
                     for (cat_name, cat) in cats {
                         egui::CollapsingHeader::new(cat_name)
@@ -4894,6 +5190,10 @@ impl eframe::App for RiverDeckApp {
                 });
             });
 
+        // Snapshot handle for the remaining UI.
+        // Use an `Arc` so we can cheaply clone it per-frame without borrowing `self`.
+        let snapshot = self.profile_snapshot_cache.clone();
+
         // Action editor: automatically shown when the selected slot has an action instance.
         // If no slot is selected (or the slot is empty), the editor is hidden.
         let editor_visible =
@@ -4902,7 +5202,7 @@ impl eframe::App for RiverDeckApp {
             self.action_editor_open = false;
         } else if let (Some(device), Some(snapshot), Some(slot)) = (
             &selected_device,
-            snapshot.as_ref(),
+            snapshot.as_deref(),
             self.selected_slot.clone(),
         ) {
             let selected_instance = match &slot.controller[..] {
@@ -5075,6 +5375,12 @@ impl eframe::App for RiverDeckApp {
                                     if ui.selectable_label(p == &selected_profile, p).clicked() {
                                         let device_id = device.id.clone();
                                         let p = p.clone();
+                                        // Update the UI immediately; core will catch up asynchronously.
+                                        self.selected_profile = p.clone();
+                                        self.selected_profile_device = Some(device_id.clone());
+                                        self.selected_profile_rx = None;
+                                        self.reset_profile_snapshot();
+                                        ctx.request_repaint();
                                         self.runtime.spawn(async move {
                                             let _ = riverdeck_core::api::profiles::set_selected_profile(device_id, p).await;
                                         });
@@ -5911,8 +6217,34 @@ impl eframe::App for RiverDeckApp {
 
             ui.add_space(12.0);
 
-            let Some(snapshot) = &snapshot else {
-                ui.label("Loading profile…");
+            let Some(snapshot) = snapshot.as_deref() else {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(24.0);
+                    if let Some(err) = self.profile_snapshot_error.as_ref() {
+                        ui.label(
+                            egui::RichText::new("Failed to load profile")
+                                .strong()
+                                .color(ui.visuals().error_fg_color),
+                        );
+                        ui.label(
+                            egui::RichText::new(err)
+                                .small()
+                                .color(ui.visuals().weak_text_color()),
+                        );
+                        ui.add_space(8.0);
+                        if ui.button("Retry").clicked() {
+                            self.profile_snapshot_error = None;
+                            self.profile_snapshot_needs_refresh = true;
+                        }
+                    } else {
+                        ui.add(egui::Spinner::new());
+                        ui.label(
+                            egui::RichText::new("Loading profile…")
+                                .small()
+                                .color(ui.visuals().weak_text_color()),
+                        );
+                    }
+                });
                 return;
             };
 
@@ -6148,6 +6480,12 @@ impl eframe::App for RiverDeckApp {
                     ui.add_space(left_pad);
                     ui.horizontal(|ui| {
                         ui.label("Pages:");
+                        if !self.pages_cache.contains_key(&pages_key)
+                            && (self.pages_inflight.as_ref() == Some(&pages_key)
+                                || self.pages_rx.is_some())
+                        {
+                            ui.add(egui::Spinner::new().size(12.0));
+                        }
 
                         for page_id in pages.iter() {
                             let label = if let Ok(n) = page_id.parse::<u32>() {
@@ -6276,9 +6614,13 @@ impl eframe::App for RiverDeckApp {
                                 controller: slot.controller.clone(),
                                 position: slot.position,
                             };
-                            let _ = self.runtime.block_on(async {
-                                riverdeck_core::api::instances::create_instance(action, ctx_to_set)
-                                    .await
+                            self.profile_snapshot_needs_refresh = true;
+                            ctx.request_repaint();
+                            self.runtime.spawn(async move {
+                                let _ = riverdeck_core::api::instances::create_instance(
+                                    action, ctx_to_set,
+                                )
+                                .await;
                             });
                         }
                         DragPayload::Slot {
