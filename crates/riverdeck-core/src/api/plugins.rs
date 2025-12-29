@@ -88,9 +88,47 @@ pub async fn install_plugin(
             if !(url.starts_with("https://") || url.starts_with("http://")) {
                 return Err(anyhow::anyhow!("unsupported url scheme"));
             }
-            let resp = reqwest::get(url).await?;
+            let parsed = reqwest::Url::parse(&url).ok();
+            let host = parsed
+                .as_ref()
+                .and_then(|u| u.host_str())
+                .unwrap_or_default();
+
+            // Some marketplace/CDN downloads require browser-like headers; otherwise they can return
+            // HTML/error pages that look like a successful download but aren't a zip archive.
+            let client = reqwest::Client::new();
+            let mut rb = client.get(&url).header("accept", "*/*");
+            if host.ends_with("mp-cdn.elgato.com") || host.ends_with("mp-gateway.elgato.com") {
+                rb = rb
+                    .header(
+                        "user-agent",
+                        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) RiverDeck/1.0",
+                    )
+                    .header("origin", "https://marketplace.elgato.com")
+                    .header("referer", "https://marketplace.elgato.com/");
+            }
+
+            let resp = rb.send().await?;
+            let status = resp.status();
+            if !status.is_success() {
+                let body = resp.bytes().await.unwrap_or_default();
+                let preview = String::from_utf8_lossy(&body[..body.len().min(256)]).into_owned();
+                return Err(anyhow::anyhow!(
+                    "download failed (status={status}) body_preview={preview:?}"
+                ));
+            }
             use std::ops::Deref;
-            resp.bytes().await?.deref().to_owned()
+            let bytes = resp.bytes().await?.deref().to_owned();
+
+            // Quick sanity check: Stream Deck plugin archives are zip files (start with "PK").
+            // If this doesn't look like a zip, surface a clearer error before unzip.
+            if bytes.len() >= 2 && &bytes[0..2] != b"PK" {
+                let preview = String::from_utf8_lossy(&bytes[..bytes.len().min(256)]).into_owned();
+                return Err(anyhow::anyhow!(
+                    "downloaded file does not look like a zip (missing PK header); body_preview={preview:?}"
+                ));
+            }
+            bytes
         }
         Some(path) => std::fs::read(path)?,
     };
@@ -195,7 +233,32 @@ pub async fn install_plugin(
                 actual.display(),
                 error
             );
-            let _ = fs::remove_dir_all(&actual).await;
+            // If the failure looks like a manifest decoding issue, keep a copy for debugging.
+            // This helps us support edge-case encodings found in Marketplace plugins.
+            let err_s = error.to_string();
+            let looks_like_manifest = err_s.contains("manifest")
+                && (err_s.contains("encoding")
+                    || err_s.contains("ELGATO")
+                    || err_s.contains("binary format"));
+            let looks_like_platform = err_s.contains("unsupported on platform");
+            if looks_like_manifest || looks_like_platform {
+                let bad = temp_root.join(format!(
+                    "bad_{}_{}",
+                    id.replace('/', "_"),
+                    std::process::id()
+                ));
+                let _ = fs::remove_dir_all(&bad).await;
+                if fs::rename(&actual, &bad).await.is_ok() {
+                    log::warn!(
+                        "Preserved failed plugin install for inspection at {}",
+                        bad.display()
+                    );
+                } else {
+                    let _ = fs::remove_dir_all(&actual).await;
+                }
+            } else {
+                let _ = fs::remove_dir_all(&actual).await;
+            }
             if backup.exists() {
                 let _ = fs::rename(&backup, &actual).await;
                 let _ = crate::plugins::initialise_plugin(&actual).await;

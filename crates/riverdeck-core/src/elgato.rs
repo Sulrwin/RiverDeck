@@ -361,6 +361,15 @@ async fn load_dynamic_image(image: &str) -> Result<image::DynamicImage, anyhow::
         }
 
         let path = candidate.ok_or_else(|| anyhow::anyhow!("image path not found: {image}"))?;
+
+        // Check if it's an SVG file and convert to PNG
+        if path.extension().and_then(|s| s.to_str()) == Some("svg") {
+            log::debug!("Converting SVG to PNG: {}", path.display());
+            let svg_data = std::fs::read(&path)?;
+            let png_image = convert_svg_to_png(&svg_data)?;
+            return Ok(png_image);
+        }
+
         Ok(image::open(path)?)
     }
 }
@@ -398,12 +407,67 @@ async fn resolve_image_bytes(image: &str) -> Result<Vec<u8>, anyhow::Error> {
             }
         }
         let path = candidate.ok_or_else(|| anyhow::anyhow!("image path not found: {image}"))?;
+
+        // Check if it's an SVG file and convert to PNG
+        if path.extension().and_then(|s| s.to_str()) == Some("svg") {
+            log::debug!("Converting SVG to PNG bytes: {}", path.display());
+            let svg_data = std::fs::read(&path)?;
+            let png_image = convert_svg_to_png(&svg_data)?;
+
+            // Convert DynamicImage to PNG bytes
+            let mut png_bytes = Vec::new();
+            png_image.write_to(
+                &mut std::io::Cursor::new(&mut png_bytes),
+                image::ImageFormat::Png,
+            )?;
+            return Ok(png_bytes);
+        }
+
         Ok(tokio::fs::read(path).await?)
     }
 }
 
 fn is_gif(bytes: &[u8]) -> bool {
     bytes.len() >= 6 && &bytes[0..3] == b"GIF"
+}
+
+/// Convert SVG data to a PNG DynamicImage
+/// This is public so the egui UI can also convert SVG icons for display
+pub fn convert_svg_to_image(svg_data: &[u8]) -> Result<image::DynamicImage, anyhow::Error> {
+    convert_svg_to_png(svg_data)
+}
+
+/// Convert SVG data to a PNG DynamicImage (internal implementation)
+fn convert_svg_to_png(svg_data: &[u8]) -> Result<image::DynamicImage, anyhow::Error> {
+    // Parse SVG
+    let opts = usvg::Options::default();
+    let tree = usvg::Tree::from_data(svg_data, &opts)?;
+
+    // Get SVG dimensions (default to 144x144 if not specified)
+    let size = tree.size();
+    let width = size.width() as u32;
+    let height = size.height() as u32;
+
+    // Ensure minimum size for Stream Deck icons
+    let (width, height) = if width == 0 || height == 0 {
+        (144, 144)
+    } else {
+        (width, height)
+    };
+
+    // Create a pixmap to render into
+    let mut pixmap = tiny_skia::Pixmap::new(width, height)
+        .ok_or_else(|| anyhow::anyhow!("Failed to create pixmap for SVG rendering"))?;
+
+    // Render SVG to pixmap
+    resvg::render(&tree, tiny_skia::Transform::default(), &mut pixmap.as_mut());
+
+    // Convert to image::DynamicImage
+    let rgba_data = pixmap.data().to_vec();
+    let img = image::RgbaImage::from_raw(width, height, rgba_data)
+        .ok_or_else(|| anyhow::anyhow!("Failed to create RGBA image from pixmap"))?;
+
+    Ok(image::DynamicImage::ImageRgba8(img))
 }
 
 fn gif_cache_key(bytes: &[u8]) -> String {

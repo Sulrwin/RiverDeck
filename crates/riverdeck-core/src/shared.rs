@@ -212,12 +212,28 @@ pub fn is_flatpak() -> bool {
 
 /// Convert an icon specified in a plugin manifest to its full path.
 pub fn convert_icon(path: String) -> String {
+    // If the path already has a recognized image extension, use it as-is
+    let lower = path.to_lowercase();
+    if lower.ends_with(".png")
+        || lower.ends_with(".jpg")
+        || lower.ends_with(".jpeg")
+        || lower.ends_with(".gif")
+        || lower.ends_with(".svg")
+        || lower.ends_with(".bmp")
+        || lower.ends_with(".webp")
+    {
+        return path;
+    }
+
+    // Otherwise, try to find a variant with an extension.
     // Prefer raster formats first so physical devices (which need pixels) can render icons reliably.
     // Many plugins ship both `.svg` and `.png` variants; UI/webviews can use SVG, but devices can't.
     if Path::new(&(path.clone() + "@2x.png")).exists() {
         path + "@2x.png"
     } else if Path::new(&(path.clone() + ".png")).exists() {
         path + ".png"
+    } else if Path::new(&(path.clone() + ".jpg")).exists() {
+        path + ".jpg"
     } else if Path::new(&(path.clone() + ".svg")).exists() {
         path + ".svg"
     } else {

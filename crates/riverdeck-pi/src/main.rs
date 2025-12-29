@@ -1,11 +1,20 @@
 use base64::Engine as _;
+use directories::BaseDirs;
 
 use serde::{Deserialize, Serialize};
 use tao::event::{Event, StartCause, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tao::window::WindowBuilder;
+#[cfg(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+))]
+use wry::WebViewBuilderExtUnix;
 use wry::http::Request;
-use wry::{WebView, WebViewBuilder};
+use wry::{WebContext, WebView, WebViewBuilder};
 
 #[derive(Debug, Clone)]
 enum PiEvent {
@@ -13,9 +22,21 @@ enum PiEvent {
 }
 
 fn main() -> anyhow::Result<()> {
-    env_logger::init();
+    // Make helper logs show up even without an explicit `RUST_LOG`.
+    // (The parent process may pass a restrictive filter that hides our logs.)
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let args = Args::parse(std::env::args().skip(1).collect())?;
+    log::info!(
+        "riverdeck-pi starting (pid={}, args={args:?})",
+        std::process::id()
+    );
+
+    let storage_dir = args.storage_dir().or_else(default_storage_dir);
+    if let Some(dir) = &storage_dir {
+        let _ = std::fs::create_dir_all(dir);
+        log::info!("webview storage dir: {}", dir.display());
+    }
 
     let event_loop = EventLoopBuilder::<PiEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
@@ -56,12 +77,50 @@ fn main() -> anyhow::Result<()> {
     }
     let window = wb.build(&event_loop)?;
 
+    let mut web_context = storage_dir.map(|dir| WebContext::new(Some(dir)));
+
     let webview = match &args {
         Args::Pi(a) => {
+            log::info!(
+                "PI mode: label={:?} pi_src={:?} origin={:?} ws_port={} context={:?} ipc_port={:?}",
+                a.label,
+                a.pi_src,
+                a.origin,
+                a.ws_port,
+                a.context,
+                a.ipc_port
+            );
             let html = pi_host_html(a);
-            build_pi_webview(&window, html, proxy, a.ipc_port)?
+            build_pi_webview(&window, html, proxy, a.ipc_port, web_context.as_mut())?
         }
-        Args::Url(a) => build_url_webview(&window, &a.url, a.ipc_port)?,
+        Args::Url(a) => {
+            log::info!(
+                "URL mode: label={:?} url={:?} ipc_port={:?}",
+                a.label,
+                a.url,
+                a.ipc_port
+            );
+            let wv = build_url_webview(
+                &window,
+                &a.url,
+                proxy.clone(),
+                a.ipc_port,
+                web_context.as_mut(),
+            )?;
+
+            // Best-effort: force a ping immediately so we can verify IPC works even if the
+            // page throttles timers or our initialization script doesn't run.
+            if a.ipc_port.is_some() {
+                let proxy = proxy.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(800));
+                    let js = "try{const href=String(location.href||'');if(window.ipc&&window.ipc.postMessage){window.ipc.postMessage(JSON.stringify({type:'marketplacePing',href}));}else{location.href='riverdeck-ipc://marketplacePing?href='+encodeURIComponent(href);}}catch(_){ }";
+                    let _ = proxy.send_event(PiEvent::Eval(js.to_owned()));
+                });
+            }
+
+            wv
+        }
     };
 
     event_loop.run(move |event, _target, control_flow| {
@@ -75,7 +134,9 @@ fn main() -> anyhow::Result<()> {
                 *control_flow = ControlFlow::Exit;
             }
             Event::UserEvent(PiEvent::Eval(js)) => {
-                let _ = webview.evaluate_script(&js);
+                if let Err(err) = webview.evaluate_script(&js) {
+                    log::warn!("evaluate_script failed: {err:?}");
+                }
             }
             _ => {}
         }
@@ -87,11 +148,18 @@ fn build_pi_webview(
     html: String,
     proxy: EventLoopProxy<PiEvent>,
     ipc_port: Option<u16>,
+    web_context: Option<&mut WebContext>,
 ) -> anyhow::Result<WebView> {
     let proxy_for_ipc = proxy.clone();
-    let builder = WebViewBuilder::new()
+    let mut builder = if let Some(ctx) = web_context {
+        WebViewBuilder::new_with_web_context(ctx)
+    } else {
+        WebViewBuilder::new()
+    };
+    builder = builder
         .with_html(html)
         .with_navigation_handler(move |url: String| {
+            log::debug!("navigate: {url}");
             // Allow regular browsing, but hand off deep-links to the OS.
             // This is important for things like Elgato Marketplace "Open in Stream Deck" links.
             if url.starts_with("openaction://")
@@ -107,34 +175,255 @@ fn build_pi_webview(
             }
             true
         })
-        .with_ipc_handler(move |req: Request<String>| handle_ipc(req, proxy_for_ipc.clone()));
+        .with_ipc_handler(move |req: Request<String>| {
+            handle_ipc(req, proxy_for_ipc.clone(), ipc_port)
+        });
 
-    Ok(builder.build(window)?)
+    // On Unix/GTK (including Wayland), prefer `build_gtk` for better compatibility.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+    ))]
+    {
+        use tao::platform::unix::WindowExtUnix;
+        let vbox = window
+            .default_vbox()
+            .ok_or_else(|| anyhow::anyhow!("tao default_vbox unavailable for build_gtk"))?;
+        Ok(builder.build_gtk(vbox)?)
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+    )))]
+    {
+        Ok(builder.build(window)?)
+    }
 }
 
 fn build_url_webview(
     window: &tao::window::Window,
     url: &str,
+    proxy: EventLoopProxy<PiEvent>,
     ipc_port: Option<u16>,
+    web_context: Option<&mut WebContext>,
 ) -> anyhow::Result<WebView> {
-    let builder =
+    let mut builder = if let Some(ctx) = web_context {
+        WebViewBuilder::new_with_web_context(ctx)
+    } else {
         WebViewBuilder::new()
-            .with_url(url)
-            .with_navigation_handler(move |url: String| {
-                if url.starts_with("openaction://")
-                    || url.starts_with("streamdeck://")
-                    || url.starts_with("riverdeck://")
-                {
-                    if let Some(port) = ipc_port {
-                        let _ = send_deep_link_ipc(port, &url);
-                    } else {
-                        let _ = open::that_detached(url);
-                    }
-                    return false;
+    };
+    let ipc_port_for_nav = ipc_port;
+    builder = builder
+        .with_url(url)
+        .with_ipc_handler({
+            let proxy = proxy.clone();
+            move |req: Request<String>| handle_ipc(req, proxy.clone(), ipc_port)
+        })
+        .with_initialization_script(marketplace_token_capture_script())
+        .with_navigation_handler(move |url: String| {
+            log::debug!("navigate: {url}");
+            if url.starts_with("riverdeck-ipc://") {
+                if let Some(port) = ipc_port_for_nav {
+                    let _ = handle_riverdeck_ipc_url(port, &url);
                 }
-                true
-            });
-    Ok(builder.build(window)?)
+                return false;
+            }
+            if url.starts_with("openaction://")
+                || url.starts_with("streamdeck://")
+                || url.starts_with("riverdeck://")
+            {
+                if let Some(port) = ipc_port {
+                    let _ = send_deep_link_ipc(port, &url);
+                } else {
+                    let _ = open::that_detached(url);
+                }
+                return false;
+            }
+            true
+        });
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+    ))]
+    {
+        use tao::platform::unix::WindowExtUnix;
+        let vbox = window
+            .default_vbox()
+            .ok_or_else(|| anyhow::anyhow!("tao default_vbox unavailable for build_gtk"))?;
+        Ok(builder.build_gtk(vbox)?)
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+    )))]
+    {
+        Ok(builder.build(window)?)
+    }
+}
+
+fn handle_riverdeck_ipc_url(ipc_port: u16, url: &str) -> std::io::Result<()> {
+    let Ok(u) = reqwest::Url::parse(url) else {
+        return Ok(());
+    };
+    let host = u.host_str().unwrap_or_default();
+    match host {
+        "marketplacePing" => {
+            let href = u
+                .query_pairs()
+                .find(|(k, _)| k == "href")
+                .map(|(_, v)| v.into_owned())
+                .unwrap_or_default();
+            if !href.trim().is_empty() {
+                log::info!("marketplace ping received via nav fallback (href={href})");
+                let _ = send_marketplace_ping_ipc(ipc_port, &href);
+            }
+        }
+        "marketplaceToken" => {
+            let token = u
+                .query_pairs()
+                .find(|(k, _)| k == "token")
+                .map(|(_, v)| v.into_owned())
+                .unwrap_or_default();
+            if !token.trim().is_empty() {
+                log::info!(
+                    "marketplace token received via nav fallback (len={})",
+                    token.trim().len()
+                );
+                let _ = send_marketplace_token_ipc(ipc_port, &token);
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn marketplace_token_capture_script() -> &'static str {
+    r#"
+(() => {
+  // Best-effort: capture Marketplace access token when running on marketplace.elgato.com.
+  // The token is used by the host to resolve `.../install/<variant_id>` deep links into signed
+  // download URLs. We intentionally keep this minimal and defensive.
+  let last = null;
+
+  function send(tok) {
+    try {
+      if (!tok || typeof tok !== "string") return;
+      if (tok.length <= 10 || tok.length >= 16000) return;
+      if (tok === last) return;
+      last = tok;
+      if (window.ipc && window.ipc.postMessage) {
+        window.ipc.postMessage(JSON.stringify({ type: "marketplaceToken", token: tok }));
+      } else {
+        // Fallback: trigger a navigation to a custom scheme that the host intercepts.
+        location.href = "riverdeck-ipc://marketplaceToken?token=" + encodeURIComponent(tok);
+      }
+    } catch (_) {}
+  }
+
+  // Strategy A: sniff bearer tokens from Marketplace's own fetch/XHR calls (most reliable).
+  try {
+    const _fetch = window.fetch;
+    window.fetch = async (...args) => {
+      try {
+        // Only accept tokens used against mp-gateway, otherwise we may capture unrelated OAuth tokens.
+        let urlStr = "";
+        try {
+          const u = args[0];
+          if (typeof u === "string") urlStr = u;
+          else if (u && typeof u.url === "string") urlStr = u.url;
+        } catch (_) {}
+        const isMpGateway = urlStr.includes("mp-gateway.elgato.com");
+
+        const init = args[1] || {};
+        const h = init.headers;
+        const getAuth = (headers) => {
+          try {
+            if (!headers) return null;
+            if (headers instanceof Headers) return headers.get("authorization") || headers.get("Authorization");
+            if (Array.isArray(headers)) {
+              for (const [k, v] of headers) if (String(k).toLowerCase() === "authorization") return v;
+              return null;
+            }
+            if (typeof headers === "object") {
+              for (const k of Object.keys(headers)) if (k.toLowerCase() === "authorization") return headers[k];
+            }
+          } catch (_) {}
+          return null;
+        };
+        const auth = getAuth(h);
+        if (isMpGateway && auth && typeof auth === "string" && auth.toLowerCase().startsWith("bearer ")) {
+          send(auth.slice(7).trim());
+        }
+      } catch (_) {}
+      return _fetch(...args);
+    };
+
+    const _open = XMLHttpRequest.prototype.open;
+    const _set = XMLHttpRequest.prototype.setRequestHeader;
+    XMLHttpRequest.prototype.open = function(...args) {
+      // args: method, url, ...
+      try { this.__riverdeck_url = String(args[1] || ""); } catch (_) {}
+      return _open.apply(this, args);
+    };
+    XMLHttpRequest.prototype.setRequestHeader = function(k, v) {
+      try {
+        const isMpGateway = (this && this.__riverdeck_url && String(this.__riverdeck_url).includes("mp-gateway.elgato.com"));
+        if (isMpGateway && String(k).toLowerCase() === "authorization" && typeof v === "string" && v.toLowerCase().startsWith("bearer ")) {
+          send(v.slice(7).trim());
+        }
+      } catch (_) {}
+      return _set.apply(this, arguments);
+    };
+  } catch (_) {}
+
+  // Strategy B: poll the NextAuth session endpoint (works on some deployments).
+  async function poll() {
+    try {
+      const host = (location && location.host) ? String(location.host) : "";
+      if (!host.endsWith("marketplace.elgato.com")) {
+        setTimeout(poll, 5000);
+        return;
+      }
+
+      // Debug: prove IPC works even before we have a token.
+      try {
+        const href = String(location.href || "");
+        if (window.ipc && window.ipc.postMessage) {
+          window.ipc.postMessage(JSON.stringify({ type: "marketplacePing", href }));
+        } else {
+          location.href = "riverdeck-ipc://marketplacePing?href=" + encodeURIComponent(href);
+        }
+      } catch (_) {}
+
+      // NextAuth session endpoint (used by the Marketplace frontend).
+      const resp = await fetch("/api/auth/session", { credentials: "include" });
+      if (resp && resp.ok) {
+        const j = await resp.json();
+        const tok =
+          (j && (j.accessToken || j.access_token)) ||
+          (j && j.user && (j.user.accessToken || j.user.access_token)) ||
+          (j && j.token) ||
+          null;
+        send(tok);
+      }
+    } catch (_) {}
+    setTimeout(poll, 5000);
+  }
+  poll();
+})();
+"#
 }
 
 fn send_deep_link_ipc(port: u16, url: &str) -> std::io::Result<()> {
@@ -174,6 +463,7 @@ struct PiArgs {
     info_json: String,
     connect_json: String,
     ipc_port: Option<u16>,
+    storage_dir: Option<std::path::PathBuf>,
     x: Option<i32>,
     y: Option<i32>,
     w: Option<i32>,
@@ -212,6 +502,7 @@ impl Args {
         let w = take_opt(&mut argv, "--w").and_then(|v| v.parse::<i32>().ok());
         let h = take_opt(&mut argv, "--h").and_then(|v| v.parse::<i32>().ok());
         let ipc_port = take_opt(&mut argv, "--ipc-port").and_then(|v| v.parse::<u16>().ok());
+        let storage_dir = take_opt(&mut argv, "--storage-dir").map(std::path::PathBuf::from);
         let decorations = take_opt(&mut argv, "--decorations").and_then(|v| match v.as_str() {
             "1" | "true" | "True" | "TRUE" => Some(true),
             "0" | "false" | "False" | "FALSE" => Some(false),
@@ -231,6 +522,7 @@ impl Args {
                 label,
                 url,
                 ipc_port,
+                storage_dir,
                 x,
                 y,
                 w,
@@ -258,6 +550,7 @@ impl Args {
             info_json,
             connect_json,
             ipc_port,
+            storage_dir,
             x,
             y,
             w,
@@ -273,12 +566,29 @@ struct UrlArgs {
     label: String,
     url: String,
     ipc_port: Option<u16>,
+    storage_dir: Option<std::path::PathBuf>,
     x: Option<i32>,
     y: Option<i32>,
     w: Option<i32>,
     h: Option<i32>,
     decorations: Option<bool>,
     always_on_top: Option<bool>,
+}
+
+impl Args {
+    fn storage_dir(&self) -> Option<std::path::PathBuf> {
+        match self {
+            Args::Pi(a) => a.storage_dir.clone(),
+            Args::Url(a) => a.storage_dir.clone(),
+        }
+    }
+}
+
+fn default_storage_dir() -> Option<std::path::PathBuf> {
+    // Stable on-disk location so cookies/session state survive restarts.
+    let base = BaseDirs::new()?;
+    let app_id = "io.github.sulrwin.riverdeck";
+    Some(base.data_dir().join(app_id).join("webview").join("default"))
 }
 
 #[derive(Debug, Deserialize)]
@@ -295,6 +605,10 @@ enum IpcRequest {
         headers: Option<Vec<(String, String)>>,
         body_base64: Option<String>,
     },
+    #[serde(rename = "marketplaceToken")]
+    MarketplaceToken { token: String },
+    #[serde(rename = "marketplacePing")]
+    MarketplacePing { href: String },
 }
 
 #[derive(Debug, Serialize)]
@@ -308,7 +622,7 @@ struct FetchResponsePayload<'a> {
     body_base64: String,
 }
 
-fn handle_ipc(req: Request<String>, proxy: EventLoopProxy<PiEvent>) {
+fn handle_ipc(req: Request<String>, proxy: EventLoopProxy<PiEvent>, ipc_port: Option<u16>) {
     let msg = req.body().clone();
     let Ok(req) = serde_json::from_str::<IpcRequest>(&msg) else {
         return;
@@ -417,7 +731,73 @@ fn handle_ipc(req: Request<String>, proxy: EventLoopProxy<PiEvent>) {
                 let _ = proxy.send_event(PiEvent::Eval(js));
             });
         }
+        IpcRequest::MarketplaceToken { token } => {
+            log::info!(
+                "marketplace token received in webview helper (len={}, ipc_port={:?})",
+                token.trim().len(),
+                ipc_port
+            );
+            if let Some(port) = ipc_port {
+                let _ = send_marketplace_token_ipc(port, &token);
+            }
+        }
+        IpcRequest::MarketplacePing { href } => {
+            log::info!(
+                "marketplace ping received in webview helper (href={}, ipc_port={:?})",
+                href,
+                ipc_port
+            );
+            if let Some(port) = ipc_port {
+                let _ = send_marketplace_ping_ipc(port, &href);
+            }
+        }
     }
+}
+
+fn send_marketplace_token_ipc(port: u16, token: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::net::{SocketAddr, TcpStream};
+    use std::time::Duration;
+
+    let tok = token.trim();
+    if tok.is_empty() || tok.len() > 16 * 1024 {
+        return Ok(());
+    }
+
+    let addr: SocketAddr = format!("127.0.0.1:{port}")
+        .parse()
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid ipc port"))?;
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(250))?;
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(250)));
+    writeln!(
+        stream,
+        "{}",
+        serde_json::json!({ "type": "marketplace_token", "token": tok })
+    )?;
+    Ok(())
+}
+
+fn send_marketplace_ping_ipc(port: u16, href: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::net::{SocketAddr, TcpStream};
+    use std::time::Duration;
+
+    let href = href.trim();
+    if href.is_empty() || href.len() > 4096 {
+        return Ok(());
+    }
+
+    let addr: SocketAddr = format!("127.0.0.1:{port}")
+        .parse()
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid ipc port"))?;
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(250))?;
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(250)));
+    writeln!(
+        stream,
+        "{}",
+        serde_json::json!({ "type": "marketplace_ping", "href": href })
+    )?;
+    Ok(())
 }
 
 fn pi_host_html(args: &PiArgs) -> String {

@@ -126,9 +126,11 @@ pub static PORT_BASE: Lazy<u16> = Lazy::new(|| {
 /// Initialise a plugin from a given directory.
 pub async fn initialise_plugin(path: &path::Path) -> anyhow::Result<()> {
     let plugin_uuid = path.file_name().unwrap().to_str().unwrap();
+    log::info!("Attempting to initialise plugin: {}", plugin_uuid);
     let target = std::env::var("TARGET").unwrap_or_default();
 
     let mut manifest = manifest::read_manifest(path)?;
+    log::info!("Manifest read successfully for {}", plugin_uuid);
 
     // RiverDeck branding: treat legacy OpenDeck categories as our built-in category.
     // This covers plugins installed under the user's config dir that still declare `"Category": "OpenDeck"`.
@@ -274,8 +276,22 @@ pub async fn initialise_plugin(path: &path::Path) -> anyhow::Result<()> {
     }
 
     if !supported || code_path.is_none() {
+        log::warn!(
+            "Plugin {} is unsupported on platform {} (supported={}, code_path={:?})",
+            plugin_uuid,
+            platform,
+            supported,
+            code_path
+        );
         return Err(anyhow!("unsupported on platform {}", platform));
     }
+
+    log::info!(
+        "Plugin {} will launch with code_path: {:?}, use_wine: {}",
+        plugin_uuid,
+        code_path,
+        use_wine
+    );
 
     let code_path = code_path.unwrap();
     if !is_safe_relative_path(&code_path) {
@@ -341,6 +357,7 @@ pub async fn initialise_plugin(path: &path::Path) -> anyhow::Result<()> {
         || code_path.to_lowercase().ends_with(".mjs")
         || code_path.to_lowercase().ends_with(".cjs")
     {
+        log::info!("Plugin {} is a Node.js plugin", plugin_uuid);
         // Check for Node.js installation and version in one go.
         let command = if is_flatpak() {
             "flatpak-spawn"
@@ -363,12 +380,22 @@ pub async fn initialise_plugin(path: &path::Path) -> anyhow::Result<()> {
             .and_then(|s| semver::Version::parse(&s).ok())
             .is_some_and(|v| v >= semver::Version::new(20, 0, 0));
         if !version_ok {
+            log::error!(
+                "Node.js version 20.0.0 or higher is required for plugin {}",
+                plugin_uuid
+            );
             return Err(anyhow!("Node.js version 20.0.0 or higher is required"));
         }
+        log::info!("Node.js version check passed for {}", plugin_uuid);
 
         let info = info_param::make_info(plugin_uuid.to_owned(), manifest.version, true).await;
         let log_file =
             fs::File::create(log_dir().join("plugins").join(format!("{plugin_uuid}.log")))?;
+        log::info!(
+            "Created log file for {} at {:?}",
+            plugin_uuid,
+            log_dir().join("plugins").join(format!("{plugin_uuid}.log"))
+        );
 
         #[cfg(target_os = "windows")]
         {
@@ -395,9 +422,46 @@ pub async fn initialise_plugin(path: &path::Path) -> anyhow::Result<()> {
         #[cfg(not(target_os = "windows"))]
         {
             let mut cmd = Command::new(command);
-            cmd.current_dir(path)
-                .args(extra_args)
-                .arg(code_path)
+            cmd.current_dir(path).args(extra_args);
+
+            // Detect if this is a plugin that needs audio compatibility layer
+            let needs_audio_shim = plugin_uuid == "com.elgato.volume-controller"
+                || plugin_uuid.contains("volume")
+                || plugin_uuid.contains("audio");
+
+            #[cfg(target_os = "linux")]
+            if needs_audio_shim {
+                // Install audio shim to plugin directory if not already present
+                let shim_loader = path.join("audio-shim-loader.js");
+                let shim_impl = path.join("linux-audio-shim.js");
+
+                if !shim_loader.exists() || !shim_impl.exists() {
+                    // Embedded shim files
+                    const SHIM_LOADER: &str = include_str!("../../resources/audio-shim-loader.js");
+                    const SHIM_IMPL: &str = include_str!("../../resources/linux-audio-shim.js");
+
+                    if let Err(e) = fs::write(&shim_loader, SHIM_LOADER) {
+                        log::warn!("Failed to write audio shim loader: {}", e);
+                    } else if let Err(e) = fs::write(&shim_impl, SHIM_IMPL) {
+                        log::warn!("Failed to write audio shim implementation: {}", e);
+                    } else {
+                        log::info!(
+                            "Installed audio compatibility shim for plugin {}",
+                            plugin_uuid
+                        );
+                    }
+                }
+
+                if shim_loader.exists() {
+                    log::info!(
+                        "Injecting audio compatibility shim for plugin {}",
+                        plugin_uuid
+                    );
+                    cmd.arg("--require").arg(&shim_loader);
+                }
+            }
+
+            cmd.arg(code_path)
                 .args(args)
                 .arg(serde_json::to_string(&info)?)
                 .stdin(Stdio::null())
@@ -406,6 +470,11 @@ pub async fn initialise_plugin(path: &path::Path) -> anyhow::Result<()> {
             #[cfg(unix)]
             unix_set_new_process_group(&mut cmd);
             let child = cmd.spawn()?;
+            log::info!(
+                "Spawned Node.js plugin {} with PID {}",
+                plugin_uuid,
+                child.id()
+            );
             record_child_process(child.id(), "plugin_node", plugin_uuid);
 
             INSTANCES
@@ -414,6 +483,7 @@ pub async fn initialise_plugin(path: &path::Path) -> anyhow::Result<()> {
                 .insert(plugin_uuid.to_owned(), PluginInstance::Node(child));
         }
     } else if use_wine {
+        log::info!("Plugin {} will run via Wine", plugin_uuid);
         let command = if is_flatpak() {
             "flatpak-spawn"
         } else {
@@ -619,10 +689,20 @@ pub async fn deactivate_all_plugins() -> Result<(), anyhow::Error> {
 
 /// Initialise plugins from the plugins directory.
 pub fn initialise_plugins() {
+    log::info!("initialise_plugins() called");
     // Servers should be started only once; reloading plugins should not rebind ports.
     if !PLUGIN_SERVERS_STARTED.swap(true, Ordering::SeqCst) {
+        log::info!("Starting plugin servers for the first time");
         tokio::spawn(init_websocket_server());
         tokio::spawn(webserver::init_webserver(config_dir()));
+
+        // Start the audio router server for any audio plugins (Volume Controller, etc)
+        tokio::spawn(async {
+            let backend = riverdeck_audio_router::PulseAudioBackend::new();
+            if let Err(e) = riverdeck_audio_router::start_audio_router_server(backend).await {
+                log::error!("Audio Router server failed: {:#}", e);
+            }
+        });
     } else {
         log::debug!("Plugin servers already running; skipping server init");
     }
@@ -710,6 +790,7 @@ pub fn initialise_plugins() {
     };
 
     // Iterate through all directory entries in the plugins folder and initialise them as plugins if appropriate
+    log::info!("Scanning plugins directory: {}", plugin_dir.display());
     for entry in entries {
         if let Ok(entry) = entry {
             let entry_path = entry.path();

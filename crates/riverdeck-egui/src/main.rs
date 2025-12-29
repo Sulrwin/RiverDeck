@@ -18,6 +18,7 @@ use log::LevelFilter;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::runtime::Runtime;
 use tokio::sync::broadcast;
+use tokio::sync::mpsc as tokio_mpsc;
 
 #[cfg(feature = "tray")]
 use std::sync::atomic::AtomicBool;
@@ -43,6 +44,8 @@ static IPC_PORT: OnceLock<u16> = OnceLock::new();
 enum IpcRequest {
     Show,
     DeepLink { url: String },
+    MarketplaceToken { token: String },
+    MarketplacePing { href: String },
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -210,6 +213,9 @@ fn main() -> anyhow::Result<()> {
 
     // Initialize logging after paths so we can write to the persistent log directory.
     init_logging();
+    if riverdeck_core::marketplace::load_marketplace_access_token_from_disk() {
+        log::info!("Loaded marketplace token from disk (best-effort)");
+    }
     log::info!(
         "RiverDeck starting (pid={}, args={:?})",
         std::process::id(),
@@ -386,9 +392,10 @@ fn main() -> anyhow::Result<()> {
     eframe::run_native(
         "RiverDeck",
         native_options,
-        Box::new(move |_cc| {
+        Box::new(move |cc| {
             log::info!("eframe callback invoked: constructing RiverDeckApp");
             Ok(Box::new(RiverDeckApp::new(
+                cc,
                 runtime,
                 lock_file,
                 start_hidden,
@@ -624,6 +631,18 @@ async fn start_ipc_server() -> anyhow::Result<u16> {
                             Ok(())
                         }
                         IpcRequest::DeepLink { url } => handle_deep_link_arg(&url).await,
+                        IpcRequest::MarketplaceToken { token } => {
+                            log::info!(
+                                "Marketplace token received via IPC (len={})",
+                                token.trim().len()
+                            );
+                            riverdeck_core::marketplace::set_marketplace_access_token(token);
+                            Ok(())
+                        }
+                        IpcRequest::MarketplacePing { href } => {
+                            log::info!("Marketplace IPC ping received (href={href})");
+                            Ok(())
+                        }
                     };
 
                     let _ = match res {
@@ -816,27 +835,171 @@ async fn handle_deep_link_arg(arg: &str) -> anyhow::Result<()> {
     let raw_id = segments.get(1).copied().unwrap_or_default();
 
     // Plugin deep-link handling (existing behavior).
-    if host == "plugins" && kind == "message" && !raw_id.is_empty() {
+    //
+    // Note: The Elgato marketplace has used multiple path forms over time, e.g.
+    // `streamdeck://plugins/message/<id>` and `streamdeck://plugins/install/<id>`.
+    // Treat both as "install/route to plugin" requests.
+    if host == "plugins" && (kind == "message" || kind == "install") {
+        // Newer marketplace deep links (`.../install/<uuid>`) often only include a marketplace
+        // *variant id* and require a Marketplace session token to resolve into a signed download
+        // URL. We capture this token from the Marketplace webview (best-effort) and use it here.
+        if kind == "install" && !raw_id.is_empty() {
+            if let Some(tok) = riverdeck_core::marketplace::marketplace_access_token()
+                && let Some(links) = riverdeck_core::marketplace::purchase_link(&tok, raw_id).await
+            {
+                // Prefer the direct download link. If only a deep link exists, try to extract
+                // a download URL from it.
+                let candidate = links
+                    .direct_link
+                    .as_ref()
+                    .and_then(|s| reqwest::Url::parse(s).ok())
+                    .and_then(|u| riverdeck_core::marketplace::extract_download_url(&u))
+                    .or_else(|| {
+                        links
+                            .deep_link
+                            .as_ref()
+                            .and_then(|s| reqwest::Url::parse(s).ok())
+                            .and_then(|u| riverdeck_core::marketplace::extract_download_url(&u))
+                    });
+                if let Some(download_url) = candidate {
+                    log::info!(
+                        "Installing plugin via marketplace token: id={raw_id}, url={download_url}"
+                    );
+                    let res = riverdeck_core::api::plugins::install_plugin(
+                        Some(download_url),
+                        None,
+                        Some(raw_id.to_owned()),
+                    )
+                    .await;
+                    if let Err(err) = res {
+                        log::warn!("Marketplace install failed (variant_id={raw_id}): {err:#}");
+                        riverdeck_core::ui::emit(riverdeck_core::ui::UiEvent::PluginInstall {
+                            id: raw_id.to_owned(),
+                            phase: riverdeck_core::ui::PluginInstallPhase::Finished {
+                                ok: false,
+                                error: Some(marketplace_user_error(&err)),
+                            },
+                        });
+                        return Ok(());
+                    }
+                    riverdeck_core::plugins::initialise_plugins();
+                    return Ok(());
+                }
+
+                // Heuristic extraction failed; many marketplaces serve a signed download endpoint
+                // without a helpful file extension in the URL. Fall back to trying the direct link.
+                let redact = |s: &str| {
+                    // Keep just scheme+host+path (drop query tokens).
+                    reqwest::Url::parse(s)
+                        .ok()
+                        .map(|u| {
+                            format!(
+                                "{}://{}{}",
+                                u.scheme(),
+                                u.host_str().unwrap_or(""),
+                                u.path()
+                            )
+                        })
+                        .unwrap_or_else(|| "<unparseable>".to_owned())
+                };
+                log::warn!(
+                    "Marketplace token available, but no archive URL extracted (variant_id={raw_id}, direct_link={}, deep_link={})",
+                    links
+                        .direct_link
+                        .as_deref()
+                        .map(redact)
+                        .unwrap_or_else(|| "<none>".to_owned()),
+                    links
+                        .deep_link
+                        .as_deref()
+                        .map(redact)
+                        .unwrap_or_else(|| "<none>".to_owned()),
+                );
+
+                if let Some(direct) = links.direct_link.as_ref()
+                    && direct.trim().starts_with("https://")
+                {
+                    log::info!(
+                        "Trying marketplace direct_link as install URL (variant_id={raw_id})"
+                    );
+                    let res = riverdeck_core::api::plugins::install_plugin(
+                        Some(direct.trim().to_owned()),
+                        None,
+                        Some(raw_id.to_owned()),
+                    )
+                    .await;
+                    if let Err(err) = res {
+                        log::warn!(
+                            "Marketplace direct_link install failed (variant_id={raw_id}): {err:#}"
+                        );
+                        riverdeck_core::ui::emit(riverdeck_core::ui::UiEvent::PluginInstall {
+                            id: raw_id.to_owned(),
+                            phase: riverdeck_core::ui::PluginInstallPhase::Finished {
+                                ok: false,
+                                error: Some(marketplace_user_error(&err)),
+                            },
+                        });
+                        return Ok(());
+                    }
+                    riverdeck_core::plugins::initialise_plugins();
+                    return Ok(());
+                }
+            }
+
+            let item = riverdeck_core::marketplace::lookup_item_lite(raw_id).await;
+            if let Some(item) = item.as_ref()
+                && let Some(slug) = item.slug.as_ref()
+                && !slug.trim().is_empty()
+            {
+                let product_url = format!("https://marketplace.elgato.com/product/{slug}");
+                open_url_in_browser(&product_url);
+            }
+
+            let label = item
+                .as_ref()
+                .and_then(|i| i.product_name.as_deref())
+                .or_else(|| item.as_ref().and_then(|i| i.name.as_deref()))
+                .unwrap_or(raw_id)
+                .to_owned();
+
+            // UX: surface a toast so this doesn't feel like a no-op.
+            riverdeck_core::ui::emit(riverdeck_core::ui::UiEvent::PluginInstall {
+                id: label,
+                phase: riverdeck_core::ui::PluginInstallPhase::Finished {
+                    ok: false,
+                    error: Some(
+                        "Marketplace install links require a Marketplace session token to resolve into a download URL. Open the Marketplace window in RiverDeck (so it can capture your session), then try again — or download the .streamDeckPlugin and install via Settings → Plugins → Install…"
+                            .to_owned(),
+                    ),
+                },
+            });
+            return Ok(());
+        }
+
         // The Elgato marketplace uses `streamdeck://plugins/message/<id>`.
         // In RiverDeck we represent plugin IDs as `<id>.sdPlugin`.
-        let plugin_id = if url.scheme() == "streamdeck" && !raw_id.ends_with(".sdPlugin") {
+        let plugin_id = if raw_id.is_empty() {
+            String::new()
+        } else if url.scheme() == "streamdeck" && !raw_id.ends_with(".sdPlugin") {
             format!("{raw_id}.sdPlugin")
         } else {
             raw_id.to_owned()
         };
 
         // If plugin is already installed, forward deep link to it (Stream Deck SDK behavior).
-        let installed = shared::config_dir()
-            .join("plugins")
-            .join(&plugin_id)
-            .is_dir();
-        if installed {
-            let _ = riverdeck_core::events::outbound::deep_link::did_receive_deep_link(
-                &plugin_id,
-                arg.to_owned(),
-            )
-            .await;
-            return Ok(());
+        if !plugin_id.is_empty() {
+            let installed = shared::config_dir()
+                .join("plugins")
+                .join(&plugin_id)
+                .is_dir();
+            if installed {
+                let _ = riverdeck_core::events::outbound::deep_link::did_receive_deep_link(
+                    &plugin_id,
+                    arg.to_owned(),
+                )
+                .await;
+                return Ok(());
+            }
         }
 
         // Not installed: treat as marketplace "install" request.
@@ -856,11 +1019,39 @@ async fn handle_deep_link_arg(arg: &str) -> anyhow::Result<()> {
                 return Ok(());
             }
 
-            log::info!("Installing plugin via deep link: id={plugin_id}, url={download_url}");
-            let fallback_id = plugin_id
-                .strip_suffix(".sdPlugin")
-                .unwrap_or(plugin_id.as_str())
+            // Some deep links omit the plugin id in the path. Try to infer a stable-ish fallback id
+            // from the download URL, otherwise fall back to an empty id (the installer still works).
+            let inferred_fallback_id = reqwest::Url::parse(&download_url)
+                .ok()
+                .and_then(|u| {
+                    u.path_segments()
+                        .and_then(|mut s| s.next_back().map(|x| x.to_owned()))
+                })
+                .unwrap_or_default()
+                .trim()
+                .trim_end_matches(".streamDeckPlugin")
+                .trim_end_matches(".streamdeckplugin")
+                .trim_end_matches(".zip")
                 .to_owned();
+            let fallback_id = if !plugin_id.is_empty() {
+                plugin_id
+                    .strip_suffix(".sdPlugin")
+                    .unwrap_or(plugin_id.as_str())
+                    .to_owned()
+            } else if !raw_id.is_empty() {
+                raw_id.to_owned()
+            } else if !inferred_fallback_id.is_empty() {
+                inferred_fallback_id
+            } else {
+                "plugin".to_owned()
+            };
+
+            let log_id = if plugin_id.is_empty() {
+                fallback_id.as_str()
+            } else {
+                plugin_id.as_str()
+            };
+            log::info!("Installing plugin via deep link: id={log_id}, url={download_url}");
             riverdeck_core::api::plugins::install_plugin(
                 Some(download_url),
                 None,
@@ -872,14 +1063,36 @@ async fn handle_deep_link_arg(arg: &str) -> anyhow::Result<()> {
             return Ok(());
         }
 
-        log::warn!(
-            "Received marketplace deep link for {plugin_id}, but couldn't extract a download URL; falling back to didReceiveDeepLink (if/when plugin is installed)"
-        );
-        let _ = riverdeck_core::events::outbound::deep_link::did_receive_deep_link(
-            &plugin_id,
-            arg.to_owned(),
-        )
-        .await;
+        if !plugin_id.is_empty() {
+            log::warn!(
+                "Received marketplace deep link for {plugin_id}, but couldn't extract a download URL (url={arg}); falling back to didReceiveDeepLink (if/when plugin is installed)"
+            );
+
+            // UX: surface a toast so this doesn't feel like a no-op.
+            riverdeck_core::ui::emit(riverdeck_core::ui::UiEvent::PluginInstall {
+                id: plugin_id
+                    .strip_suffix(".sdPlugin")
+                    .unwrap_or(plugin_id.as_str())
+                    .to_owned(),
+                phase: riverdeck_core::ui::PluginInstallPhase::Finished {
+                    ok: false,
+                    error: Some(
+                        "Marketplace install link didn't include a direct download URL. Try downloading the plugin file and install it via Settings → Plugins → Install…"
+                            .to_owned(),
+                    ),
+                },
+            });
+
+            let _ = riverdeck_core::events::outbound::deep_link::did_receive_deep_link(
+                &plugin_id,
+                arg.to_owned(),
+            )
+            .await;
+        } else {
+            log::warn!(
+                "Received marketplace deep link, but couldn't extract a download URL or plugin id (url={arg}); ignoring"
+            );
+        }
         return Ok(());
     }
 
@@ -912,6 +1125,18 @@ async fn handle_deep_link_arg(arg: &str) -> anyhow::Result<()> {
 
 fn extract_plugin_download_url(url: &reqwest::Url) -> Option<String> {
     riverdeck_core::marketplace::extract_download_url(url)
+}
+
+fn marketplace_user_error(err: &anyhow::Error) -> String {
+    let s = format!("{err:#}");
+    if s.contains("Elgato-protected binary format")
+        || s.contains("ELGATO header")
+        || s.contains("manifest is in Elgato-protected")
+    {
+        return "This Marketplace plugin uses Elgato's protected manifest format (\"ELGATO\" manifest container), which RiverDeck can't import yet."
+            .to_owned();
+    }
+    s
 }
 
 fn start_core_background(runtime: Arc<Runtime>) {
@@ -1109,7 +1334,7 @@ async fn maybe_build_repo_builtin_plugins() {
 
 struct RiverDeckApp {
     runtime: Arc<Runtime>,
-    ui_events: Option<broadcast::Receiver<ui::UiEvent>>,
+    ui_events: Option<tokio_mpsc::UnboundedReceiver<ui::UiEvent>>,
 
     // Keep the lock file alive for the lifetime of the app.
     #[allow(dead_code)]
@@ -1389,6 +1614,7 @@ impl RiverDeckApp {
     }
 
     fn new(
+        cc: &eframe::CreationContext<'_>,
         runtime: Arc<Runtime>,
         lock_file: std::fs::File,
         start_hidden: bool,
@@ -1419,9 +1645,38 @@ impl RiverDeckApp {
             log_tray_status_to_file("tray init ok, but hide-to-tray disabled by desktop heuristic");
         }
 
+        let ui_events = ui::subscribe().map(|mut rx| {
+            let (tx, out_rx) = tokio_mpsc::unbounded_channel::<ui::UiEvent>();
+            let egui_ctx = cc.egui_ctx.clone();
+            runtime.spawn(async move {
+                let mut last_repaint = std::time::Instant::now()
+                    .checked_sub(std::time::Duration::from_secs(1))
+                    .unwrap_or_else(std::time::Instant::now);
+                loop {
+                    match rx.recv().await {
+                        Ok(ev) => {
+                            let _ = tx.send(ev);
+                            // Throttle wakeups: UI events can be frequent; we only need to ensure
+                            // we get *a* frame soon after background state changes (e.g. toasts).
+                            let now = std::time::Instant::now();
+                            if now.duration_since(last_repaint)
+                                >= std::time::Duration::from_millis(50)
+                            {
+                                egui_ctx.request_repaint();
+                                last_repaint = now;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
+            out_rx
+        });
+
         Self {
             runtime,
-            ui_events: ui::subscribe(),
+            ui_events,
             _lock_file: lock_file,
             start_hidden,
             update_info,
@@ -2072,7 +2327,10 @@ impl RiverDeckApp {
         }
 
         for cand in candidates {
-            if !(cand.ends_with(".png")
+            // Now support SVG files by converting them on the fly
+            let is_svg = cand.ends_with(".svg");
+            if !(is_svg
+                || cand.ends_with(".png")
                 || cand.ends_with(".jpg")
                 || cand.ends_with(".jpeg")
                 || cand.ends_with(".gif"))
@@ -2096,7 +2354,16 @@ impl RiverDeckApp {
                 return Some(cached.texture.clone());
             }
 
-            let img = image::open(&resolved).ok()?.into_rgba8();
+            let img = if is_svg {
+                // Convert SVG to PNG using the same logic as elgato.rs
+                let svg_data = std::fs::read(&resolved).ok()?;
+                riverdeck_core::convert_svg_to_image(&svg_data)
+                    .ok()?
+                    .into_rgba8()
+            } else {
+                image::open(&resolved).ok()?.into_rgba8()
+            };
+
             let size = [img.width() as usize, img.height() as usize];
             let color_image = egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw());
 
@@ -2155,7 +2422,10 @@ impl RiverDeckApp {
         }
 
         for cand in candidates {
-            if !(cand.ends_with(".png")
+            // Now support SVG files by converting them on the fly
+            let is_svg = cand.ends_with(".svg");
+            if !(is_svg
+                || cand.ends_with(".png")
                 || cand.ends_with(".jpg")
                 || cand.ends_with(".jpeg")
                 || cand.ends_with(".gif"))
@@ -2164,7 +2434,13 @@ impl RiverDeckApp {
             }
             let resolved = self.resolve_icon_path(cand)?;
             if resolved.is_file() {
-                return image::open(resolved).ok();
+                if is_svg {
+                    // Convert SVG to PNG
+                    let svg_data = std::fs::read(&resolved).ok()?;
+                    return riverdeck_core::convert_svg_to_image(&svg_data).ok();
+                } else {
+                    return image::open(resolved).ok();
+                }
             }
         }
         None
@@ -2589,6 +2865,10 @@ impl RiverDeckApp {
             instance.action.property_inspector
         );
         let label = format!("pi_{}", instance.context.to_string().replace('.', "_"));
+        let storage_dir = riverdeck_core::shared::data_dir()
+            .join("webview")
+            .join("pi")
+            .join(sanitize_webview_profile(&instance.action.plugin));
 
         let info_json = serde_json::to_string(&info)?;
         let connect_json = serde_json::to_string(&connect_payload)?;
@@ -2602,6 +2882,7 @@ impl RiverDeckApp {
             &info_json,
             &connect_json,
             dock,
+            &storage_dir,
         )?;
 
         self.pi_child = Some(child);
@@ -2627,6 +2908,7 @@ impl RiverDeckApp {
         action: &shared::Action,
         row_size: egui::Vec2,
         dragging: bool,
+        plugin_name: Option<&str>,
     ) -> egui::Response {
         let (rect, resp) = ui.allocate_exact_size(row_size, egui::Sense::click_and_drag());
         let painter = ui.painter_at(rect);
@@ -2685,13 +2967,37 @@ impl RiverDeckApp {
             egui::pos2(text_left, rect.min.y),
             egui::pos2(rect.max.x - 10.0, rect.max.y),
         );
-        painter.text(
-            egui::pos2(text_rect.min.x, text_rect.center().y),
-            egui::Align2::LEFT_CENTER,
-            action.name.trim(),
-            egui::FontId::proportional(13.0),
-            visuals.text_color(),
-        );
+
+        // If we have a plugin name, show action name on top and plugin name below
+        if let Some(plugin) = plugin_name {
+            let action_name_y = text_rect.center().y - 7.0;
+            let plugin_name_y = text_rect.center().y + 7.0;
+
+            painter.text(
+                egui::pos2(text_rect.min.x, action_name_y),
+                egui::Align2::LEFT_CENTER,
+                action.name.trim(),
+                egui::FontId::proportional(13.0),
+                visuals.text_color(),
+            );
+
+            painter.text(
+                egui::pos2(text_rect.min.x, plugin_name_y),
+                egui::Align2::LEFT_CENTER,
+                plugin,
+                egui::FontId::proportional(10.0),
+                visuals.weak_text_color(),
+            );
+        } else {
+            // Single line centered if no plugin name
+            painter.text(
+                egui::pos2(text_rect.min.x, text_rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                action.name.trim(),
+                egui::FontId::proportional(13.0),
+                visuals.text_color(),
+            );
+        }
 
         if !action.tooltip.trim().is_empty() {
             resp.on_hover_text(action.tooltip.trim())
@@ -3016,9 +3322,8 @@ impl RiverDeckApp {
                         // For most events, the UI simply wakes; state is pulled from core singletons.
                     }
                 },
-                Err(broadcast::error::TryRecvError::Empty) => break,
-                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
-                Err(broadcast::error::TryRecvError::Closed) => {
+                Err(tokio_mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio_mpsc::error::TryRecvError::Disconnected) => {
                     self.ui_events = None;
                     break;
                 }
@@ -3665,9 +3970,38 @@ impl eframe::App for RiverDeckApp {
                         let _ = tx.send(riverdeck_core::api::get_categories().await);
                     });
                 }
+
+                // Fetch plugins list if not already cached (needed for plugin names in action list)
+                if self.plugins_cache.is_none()
+                    && !self.plugins_inflight
+                    && self.plugins_rx.is_none()
+                {
+                    self.plugins_inflight = true;
+                    let (tx, rx) = mpsc::channel();
+                    self.plugins_rx = Some(rx);
+                    self.runtime.spawn(async move {
+                        let list = riverdeck_core::api::plugins::list_plugins()
+                            .await
+                            .unwrap_or_default();
+                        let _ = tx.send(list);
+                    });
+                }
+
                 // Clone for this frame to avoid borrowing `self` across the ScrollArea closure
                 // (we need `&mut self` inside for `draw_action_row`).
                 let cats = self.categories_cache.clone().unwrap_or_default();
+
+                // Build a map of plugin UUID -> plugin name for display
+                let plugin_names: std::collections::HashMap<String, String> = self
+                    .plugins_cache
+                    .as_ref()
+                    .map(|plugins| {
+                        plugins
+                            .iter()
+                            .map(|p| (p.id.clone(), p.name.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
 
                 let search = self.action_search.to_lowercase();
                 let filter_controller = self.action_controller_filter.clone();
@@ -3707,6 +4041,8 @@ impl eframe::App for RiverDeckApp {
                                             }
                                             _ => false,
                                         });
+                                    let plugin_name =
+                                        plugin_names.get(&action.plugin).map(|s| s.as_str());
                                     let row_size = egui::vec2(ui.available_width(), row_height);
                                     let resp = self.draw_action_row(
                                         ui,
@@ -3714,6 +4050,7 @@ impl eframe::App for RiverDeckApp {
                                         action,
                                         row_size,
                                         dragging_this,
+                                        plugin_name,
                                     );
                                     if resp.drag_started() {
                                         self.drag_payload =
@@ -5172,6 +5509,7 @@ fn spawn_pi_process(
     info_json: &str,
     connect_json: &str,
     dock: Option<(i32, i32, i32, i32)>,
+    storage_dir: &std::path::Path,
 ) -> anyhow::Result<std::process::Child> {
     let mut cmd = std::process::Command::new(resolve_pi_exe()?);
     configure_pi_webview_env(&mut cmd);
@@ -5188,7 +5526,9 @@ fn spawn_pi_process(
         .arg("--info-json")
         .arg(info_json)
         .arg("--connect-json")
-        .arg(connect_json);
+        .arg(connect_json)
+        .arg("--storage-dir")
+        .arg(storage_dir);
 
     if let Some((x, y, w, h)) = dock {
         cmd.arg("--x")
@@ -5203,7 +5543,16 @@ fn spawn_pi_process(
             .arg("1");
     }
 
-    let child = cmd.spawn()?;
+    // Capture helper output to the normal RiverDeck log dir so "white window" failures
+    // are diagnosable from support bundles / Settings → Open log directory.
+    let pi_log_dir = riverdeck_core::shared::log_dir().join("pi");
+    let _ = std::fs::create_dir_all(&pi_log_dir);
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let log_file_path = pi_log_dir.join(format!("riverdeck-pi-{ts}.log"));
+    let child = spawn_child_with_captured_pi_logs(cmd, &log_file_path)?;
     riverdeck_core::runtime_processes::record_process(
         child.id(),
         "riverdeck_pi",
@@ -5225,6 +5574,11 @@ fn spawn_web_process(
     let mut cmd = std::process::Command::new(resolve_pi_exe()?);
     configure_pi_webview_env(&mut cmd);
     cmd.arg("--label").arg(label).arg("--url").arg(url);
+    cmd.arg("--storage-dir").arg(
+        riverdeck_core::shared::data_dir()
+            .join("webview")
+            .join("web"),
+    );
     if let Some(port) = IPC_PORT.get() {
         cmd.arg("--ipc-port").arg(port.to_string());
     }
@@ -5242,7 +5596,14 @@ fn spawn_web_process(
             .arg("1");
     }
 
-    let child = cmd.spawn()?;
+    let pi_log_dir = riverdeck_core::shared::log_dir().join("pi");
+    let _ = std::fs::create_dir_all(&pi_log_dir);
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let log_file_path = pi_log_dir.join(format!("riverdeck-pi-web-{ts}.log"));
+    let child = spawn_child_with_captured_pi_logs(cmd, &log_file_path)?;
     riverdeck_core::runtime_processes::record_process(
         child.id(),
         "riverdeck_pi_web",
@@ -5251,25 +5612,120 @@ fn spawn_web_process(
     Ok(child)
 }
 
+fn spawn_child_with_captured_pi_logs(
+    mut cmd: std::process::Command,
+    log_file_path: &std::path::Path,
+) -> anyhow::Result<std::process::Child> {
+    // If we can't create the log file, fall back to inheriting the parent's stdio.
+    let log_file = match std::fs::File::create(log_file_path) {
+        Ok(f) => f,
+        Err(_) => return Ok(cmd.spawn()?),
+    };
+
+    // We want to keep PI helper logs, but `tao`'s GTK backend emits a debug-only `eprintln!`
+    // spam line for unmapped keycodes:
+    //   "Couldn't get key from code: Unidentified(Gtk(248))"
+    // That line is not actionable for most users and drowns out real issues.
+    //
+    // Opt back in via `RIVERDECK_PI_LOG_UNKNOWN_KEYS=1` (or `RIVERDECK_WEBVIEW_LOG_UNKNOWN_KEYS=1`).
+    let log_unknown_keys = env_truthy_any("RIVERDECK_PI_LOG_UNKNOWN_KEYS")
+        || env_truthy_any("RIVERDECK_WEBVIEW_LOG_UNKNOWN_KEYS");
+
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    let mut child = cmd.spawn()?;
+    let file = std::sync::Arc::new(std::sync::Mutex::new(log_file));
+
+    // Pump stdout/stderr into the same file (best-effort). Use a mutex to avoid interleaving writes.
+    if let Some(stdout) = child.stdout.take() {
+        spawn_pipe_pump_thread(stdout, std::sync::Arc::clone(&file), log_unknown_keys);
+    }
+    if let Some(stderr) = child.stderr.take() {
+        spawn_pipe_pump_thread(stderr, std::sync::Arc::clone(&file), log_unknown_keys);
+    }
+
+    Ok(child)
+}
+
+fn spawn_pipe_pump_thread<R>(
+    reader: R,
+    file: std::sync::Arc<std::sync::Mutex<std::fs::File>>,
+    log_unknown_keys: bool,
+) where
+    R: std::io::Read + Send + 'static,
+{
+    std::thread::spawn(move || {
+        use std::io::{BufRead as _, Write as _};
+
+        const TAO_UNKNOWN_KEY_PREFIX: &[u8] = b"Couldn't get key from code:";
+
+        let mut r = std::io::BufReader::new(reader);
+        let mut buf = Vec::<u8>::with_capacity(4096);
+        loop {
+            buf.clear();
+            match r.read_until(b'\n', &mut buf) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if !log_unknown_keys && buf.starts_with(TAO_UNKNOWN_KEY_PREFIX) {
+                        continue;
+                    }
+                    if let Ok(mut f) = file.lock() {
+                        let _ = f.write_all(&buf);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+}
+
 fn configure_pi_webview_env(cmd: &mut std::process::Command) {
     // On some Wayland setups, wry/webkit can fail at runtime with:
     // "Error: the window handle kind is not supported".
     // Work around by forcing the webview helper onto X11 (XWayland) for now.
     #[cfg(target_os = "linux")]
     {
+        // Make helper logs visible even when RiverDeck itself is running with a restricted
+        // `RUST_LOG` filter. We append our module filter instead of replacing.
+        let mut rust_log = std::env::var("RUST_LOG").unwrap_or_default();
+        if !rust_log.contains("riverdeck_pi=") {
+            if !rust_log.trim().is_empty() && !rust_log.ends_with(',') {
+                rust_log.push(',');
+            }
+            rust_log.push_str("riverdeck_pi=debug");
+        }
+        cmd.env("RUST_LOG", rust_log);
+        cmd.env("RUST_BACKTRACE", "1");
+
         let session = std::env::var("XDG_SESSION_TYPE")
             .unwrap_or_default()
             .to_lowercase();
         if session == "wayland" && std::env::var("DISPLAY").ok().is_some() {
-            cmd.env("GDK_BACKEND", "x11");
-            cmd.env("WINIT_UNIX_BACKEND", "x11");
+            // Default: force X11 (XWayland). This is the most reliable mode for `wry`/WebKitGTK
+            // across distros/compositors today.
+            let prefer_wayland = env_truthy_any("RIVERDECK_PI_PREFER_WAYLAND")
+                || env_truthy_any("RIVERDECK_WEBVIEW_PREFER_WAYLAND");
+            let force_x11 = env_truthy_any("RIVERDECK_PI_FORCE_X11")
+                || env_truthy_any("RIVERDECK_WEBVIEW_FORCE_X11");
 
-            // Further hardening: WebKitGTK can show a white window under XWayland when it tries
-            // to allocate GBM/DMABuf-backed buffers (common on some drivers/setups). For our use
-            // case (simple marketplace / property inspector UIs), prefer reliability over GPU
-            // acceleration.
+            if force_x11 || !prefer_wayland {
+                cmd.env("GDK_BACKEND", "x11");
+                cmd.env("WINIT_UNIX_BACKEND", "x11");
+            }
+        }
+
+        // Further hardening: WebKitGTK can show a white window when GPU-backed compositing/DMABuf
+        // paths misbehave (seen on both X11 and XWayland depending on driver/compositor).
+        // Prefer reliability for our small helper webviews.
+        //
+        // Opt out by setting `RIVERDECK_PI_ALLOW_GPU=1` (or `RIVERDECK_WEBVIEW_ALLOW_GPU=1`).
+        let allow_gpu = env_truthy_any("RIVERDECK_PI_ALLOW_GPU")
+            || env_truthy_any("RIVERDECK_WEBVIEW_ALLOW_GPU");
+        if !allow_gpu {
             cmd.env("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
             cmd.env("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+            cmd.env("WEBKIT_DISABLE_GPU_PROCESS", "1");
             cmd.env("LIBGL_ALWAYS_SOFTWARE", "1");
 
             // NVIDIA (and some compositor setups) can glitch with explicit sync enabled.
@@ -5277,6 +5733,19 @@ fn configure_pi_webview_env(cmd: &mut std::process::Command) {
             cmd.env("__NV_DISABLE_EXPLICIT_SYNC", "1");
         }
     }
+}
+
+fn sanitize_webview_profile(s: &str) -> String {
+    // Avoid path traversal / separators; keep it stable for cookie storage.
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn pi_exe_basename() -> &'static str {
@@ -5288,12 +5757,50 @@ fn pi_exe_basename() -> &'static str {
 }
 
 fn resolve_pi_exe() -> anyhow::Result<std::ffi::OsString> {
+    #[cfg(debug_assertions)]
+    fn dev_pi_needs_build(repo_root: &std::path::Path, candidate: &std::path::Path) -> bool {
+        if !candidate.exists() {
+            return true;
+        }
+        let Ok(bin_meta) = std::fs::metadata(candidate) else {
+            return true;
+        };
+        let Ok(bin_m) = bin_meta.modified() else {
+            return true;
+        };
+        let src = repo_root
+            .join("crates")
+            .join("riverdeck-pi")
+            .join("src")
+            .join("main.rs");
+        let Ok(src_meta) = std::fs::metadata(src) else {
+            return false;
+        };
+        let Ok(src_m) = src_meta.modified() else {
+            return false;
+        };
+        src_m > bin_m
+    }
+
     // 1) Prefer a sibling binary next to the current executable (packaged installs).
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
     {
         let candidate = dir.join(pi_exe_basename());
         if candidate.exists() {
+            #[cfg(debug_assertions)]
+            {
+                // In dev, the "sibling binary" is usually `target/debug/riverdeck-pi`. Keep it fresh.
+                if let Ok(cwd) = std::env::current_dir()
+                    && cwd.join("Cargo.toml").is_file()
+                    && dev_pi_needs_build(&cwd, &candidate)
+                {
+                    let _ = std::process::Command::new("cargo")
+                        .args(["build", "-p", "riverdeck-pi"])
+                        .status();
+                }
+            }
+            log::debug!("Using webview helper: {}", candidate.to_string_lossy());
             return Ok(candidate.into_os_string());
         }
     }
@@ -5306,7 +5813,33 @@ fn resolve_pi_exe() -> anyhow::Result<std::ffi::OsString> {
         let cwd = std::env::current_dir().ok();
         if let Some(cwd) = cwd {
             let debug_candidate = cwd.join("target").join("debug").join(pi_exe_basename());
-            if debug_candidate.exists() {
+            let needs_build = (|| {
+                if !debug_candidate.exists() {
+                    return true;
+                }
+                // Rebuild if sources look newer than the binary (common when iterating on `riverdeck-pi`
+                // while running `cargo run -p riverdeck-egui`).
+                let Ok(bin_meta) = std::fs::metadata(&debug_candidate) else {
+                    return true;
+                };
+                let Ok(bin_m) = bin_meta.modified() else {
+                    return true;
+                };
+                let src_root = cwd.join("crates").join("riverdeck-pi").join("src");
+                let src = src_root.join("main.rs");
+                let Ok(src_meta) = std::fs::metadata(src) else {
+                    return false;
+                };
+                let Ok(src_m) = src_meta.modified() else {
+                    return false;
+                };
+                src_m > bin_m
+            })();
+            if !needs_build && debug_candidate.exists() {
+                log::debug!(
+                    "Using webview helper: {}",
+                    debug_candidate.to_string_lossy()
+                );
                 return Ok(debug_candidate.into_os_string());
             }
             // If this looks like the repo root, try to build `riverdeck-pi` once.
@@ -5315,6 +5848,10 @@ fn resolve_pi_exe() -> anyhow::Result<std::ffi::OsString> {
                     .args(["build", "-p", "riverdeck-pi"])
                     .status();
                 if status.map(|s| s.success()).unwrap_or(false) && debug_candidate.exists() {
+                    log::debug!(
+                        "Using webview helper: {}",
+                        debug_candidate.to_string_lossy()
+                    );
                     return Ok(debug_candidate.into_os_string());
                 }
             }
@@ -5322,6 +5859,7 @@ fn resolve_pi_exe() -> anyhow::Result<std::ffi::OsString> {
     }
 
     // 3) Fall back to PATH.
+    log::debug!("Using webview helper from PATH: {}", pi_exe_basename());
     Ok(std::ffi::OsString::from(pi_exe_basename()))
 }
 

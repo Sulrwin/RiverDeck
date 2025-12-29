@@ -6,6 +6,9 @@
 pub mod animation;
 pub mod application_watcher;
 pub mod elgato;
+
+// Re-export SVG conversion function for use in UI
+pub use elgato::convert_svg_to_image;
 pub mod events;
 pub mod icon_packs;
 pub mod lifecycle;
