@@ -10,3 +10,4 @@ This is a minimal template for creating **RiverDeck-native** plugins.
 - Use **Manage Plugins** in RiverDeck to install from the workspace `plugins/` directory
 
 
+

@@ -1448,6 +1448,10 @@ struct RiverDeckApp {
     button_show_action_name: bool,
     // Native action options editor (replaces PI for supported actions).
     options_editor_context: Option<shared::ActionContext>,
+    // Schema-driven action options editor (host registry; covers PI-based actions).
+    schema_editor_context: Option<shared::ActionContext>,
+    schema_editor_draft: serde_json::Value,
+    schema_editor_error: Option<String>,
     // Starterpack: Run Command
     sp_run_command_down: String,
     sp_run_command_up: String,
@@ -1500,6 +1504,11 @@ struct RiverDeckApp {
     marketplace_child: Option<std::process::Child>,
     marketplace_last_error: Option<String>,
 
+    // Property Inspector window state (a simple webview window via `riverdeck-pi`).
+    property_inspector_child: Option<std::process::Child>,
+    property_inspector_context: Option<shared::ActionContext>,
+    property_inspector_last_error: Option<String>,
+
     // Profile management UI.
     show_profile_editor: bool,
     profile_name_input: String,
@@ -1508,9 +1517,12 @@ struct RiverDeckApp {
     // Plugin management UI.
     show_manage_plugins: bool,
     plugin_manage_error: Option<String>,
+    manage_plugins_show_action_uuids: bool,
     #[allow(dead_code)]
     pending_plugin_install_pick: Option<mpsc::Receiver<Option<PathBuf>>>,
     pending_plugin_install_result: Option<mpsc::Receiver<Result<(), String>>>,
+    pending_plugin_remove_confirm: Option<(String, String)>, // (id, name)
+    pending_plugin_remove_result: Option<mpsc::Receiver<Result<(), String>>>,
 
     // Toast notifications (bottom-right).
     toasts: ToastManager,
@@ -1810,6 +1822,9 @@ impl RiverDeckApp {
             button_show_title: true,
             button_show_action_name: true,
             options_editor_context: None,
+            schema_editor_context: None,
+            schema_editor_draft: serde_json::Value::Object(serde_json::Map::new()),
+            schema_editor_error: None,
             sp_run_command_down: String::new(),
             sp_run_command_up: String::new(),
             sp_run_command_rotate: String::new(),
@@ -1846,13 +1861,19 @@ impl RiverDeckApp {
             settings_error: None,
             marketplace_child: None,
             marketplace_last_error: None,
+            property_inspector_child: None,
+            property_inspector_context: None,
+            property_inspector_last_error: None,
             show_profile_editor: false,
             profile_name_input: String::new(),
             profile_error: None,
             show_manage_plugins: false,
             plugin_manage_error: None,
+            manage_plugins_show_action_uuids: false,
             pending_plugin_install_pick: None,
             pending_plugin_install_result: None,
+            pending_plugin_remove_confirm: None,
+            pending_plugin_remove_result: None,
             toasts: ToastManager::default(),
             pending_icon_pick: None,
             pending_screen_bg_pick: None,
@@ -1958,6 +1979,205 @@ impl RiverDeckApp {
     fn spawn_set_instance_settings(&self, ctx: shared::ActionContext, settings: serde_json::Value) {
         self.runtime.spawn(async move {
             let _ = riverdeck_core::api::instances::set_instance_settings(ctx, settings).await;
+        });
+    }
+
+    fn ensure_schema_editor_state(&mut self, instance: &shared::ActionInstance) {
+        let needs_reset = match self.schema_editor_context.as_ref() {
+            None => true,
+            Some(c) => c != &instance.context,
+        };
+        if !needs_reset {
+            return;
+        }
+        self.schema_editor_context = Some(instance.context.clone());
+        self.schema_editor_draft = instance.settings.clone();
+        self.schema_editor_error = None;
+    }
+
+    fn draw_action_editor_schema_right_column(
+        &mut self,
+        ui: &mut egui::Ui,
+        instance: &shared::ActionInstance,
+    ) {
+        use riverdeck_core::options_schema as os;
+
+        let Some(schema) = os::get_schema(instance.action.uuid.as_str()) else {
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new("No schema for this action.")
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+            );
+            return;
+        };
+
+        self.ensure_schema_editor_state(instance);
+
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new("Options").strong());
+        ui.label(
+            egui::RichText::new(schema.title)
+                .small()
+                .color(ui.visuals().weak_text_color()),
+        );
+
+        if let Some(err) = self.schema_editor_error.as_ref() {
+            ui.colored_label(ui.visuals().error_fg_color, err);
+        }
+
+        ui.add_space(6.0);
+
+        let mut changed_any = false;
+        for field in schema.fields {
+            ui.push_id(field.key_path, |ui| {
+                ui.label(field.label);
+                if let Some(help) = field.help {
+                    ui.label(
+                        egui::RichText::new(help)
+                            .small()
+                            .color(ui.visuals().weak_text_color()),
+                    );
+                }
+
+                let current = os::get_by_path(&self.schema_editor_draft, field.key_path)
+                    .cloned()
+                    .unwrap_or_else(|| field.default.to_json());
+
+                match &field.kind {
+                    os::FieldKind::Bool => {
+                        let mut v = current.as_bool().unwrap_or(false);
+                        let r = ui.checkbox(&mut v, "");
+                        if r.changed() {
+                            changed_any = true;
+                            if let Err(e) = os::set_by_path(
+                                &mut self.schema_editor_draft,
+                                field.key_path,
+                                serde_json::Value::Bool(v),
+                            ) {
+                                self.schema_editor_error = Some(e.to_owned());
+                            } else {
+                                self.schema_editor_error = None;
+                            }
+                        }
+                    }
+                    os::FieldKind::Int => {
+                        let mut v: i64 = current.as_i64().unwrap_or(match field.default {
+                            os::DefaultValue::Int(i) => i,
+                            _ => 0,
+                        });
+                        let min_v = field.min.map(|m| m as i64).unwrap_or(i64::MIN);
+                        let max_v = field.max.map(|m| m as i64).unwrap_or(i64::MAX);
+                        let dv = egui::DragValue::new(&mut v).range(min_v..=max_v);
+                        let r = ui.add(dv);
+                        if r.changed() {
+                            changed_any = true;
+                            if let Err(e) = os::set_by_path(
+                                &mut self.schema_editor_draft,
+                                field.key_path,
+                                serde_json::Value::Number(v.into()),
+                            ) {
+                                self.schema_editor_error = Some(e.to_owned());
+                            } else {
+                                self.schema_editor_error = None;
+                            }
+                        }
+                    }
+                    os::FieldKind::Float => {
+                        let mut v: f64 = current.as_f64().unwrap_or(match field.default {
+                            os::DefaultValue::Float(f) => f,
+                            _ => 0.0,
+                        });
+                        let min_v = field.min.unwrap_or(f64::MIN);
+                        let max_v = field.max.unwrap_or(f64::MAX);
+                        let dv = egui::DragValue::new(&mut v).range(min_v..=max_v);
+                        let r = ui.add(dv);
+                        if r.changed() {
+                            changed_any = true;
+                            let num = serde_json::Number::from_f64(v)
+                                .map(serde_json::Value::Number)
+                                .unwrap_or(serde_json::Value::Null);
+                            if let Err(e) =
+                                os::set_by_path(&mut self.schema_editor_draft, field.key_path, num)
+                            {
+                                self.schema_editor_error = Some(e.to_owned());
+                            } else {
+                                self.schema_editor_error = None;
+                            }
+                        }
+                    }
+                    os::FieldKind::Text | os::FieldKind::PathFile | os::FieldKind::PathDir => {
+                        let mut v = current.as_str().unwrap_or("").to_owned();
+                        let r = ui.add_sized(
+                            [ui.available_width(), 0.0],
+                            egui::TextEdit::singleline(&mut v).font(egui::TextStyle::Monospace),
+                        );
+                        if r.changed() {
+                            changed_any = true;
+                            if let Err(e) = os::set_by_path(
+                                &mut self.schema_editor_draft,
+                                field.key_path,
+                                serde_json::Value::String(v),
+                            ) {
+                                self.schema_editor_error = Some(e.to_owned());
+                            } else {
+                                self.schema_editor_error = None;
+                            }
+                        }
+                    }
+                    os::FieldKind::Enum(opts) => {
+                        let mut selected = current.as_str().unwrap_or("").to_owned();
+                        let before = selected.clone();
+                        let mut displayed = selected.clone();
+                        if displayed.is_empty() {
+                            displayed = match field.default {
+                                os::DefaultValue::Text(t) => t.to_owned(),
+                                _ => "<none>".to_owned(),
+                            };
+                        }
+                        egui::ComboBox::from_id_salt("enum")
+                            .width(ui.available_width().min(240.0))
+                            .selected_text(displayed)
+                            .show_ui(ui, |ui| {
+                                for o in opts.iter() {
+                                    ui.selectable_value(&mut selected, o.value.to_owned(), o.label);
+                                }
+                            });
+                        if selected != before {
+                            changed_any = true;
+                            if let Err(e) = os::set_by_path(
+                                &mut self.schema_editor_draft,
+                                field.key_path,
+                                serde_json::Value::String(selected),
+                            ) {
+                                self.schema_editor_error = Some(e.to_owned());
+                            } else {
+                                self.schema_editor_error = None;
+                            }
+                        }
+                    }
+                }
+                ui.add_space(6.0);
+            });
+        }
+
+        ui.separator();
+        ui.horizontal(|ui| {
+            let reset_clicked = ui.button("Reset").clicked();
+            if reset_clicked {
+                self.schema_editor_draft = instance.settings.clone();
+                self.schema_editor_error = None;
+            }
+
+            let is_dirty = self.schema_editor_draft != instance.settings;
+            let apply = ui.add_enabled(is_dirty, egui::Button::new("Apply"));
+            if apply.clicked() {
+                let ctx_to_set = instance.context.clone();
+                let settings = self.schema_editor_draft.clone();
+                self.spawn_set_instance_settings(ctx_to_set, settings);
+            } else if changed_any {
+                // no-op: kept for clarity; we want `changed_any` to influence `is_dirty` only.
+            }
         });
     }
 
@@ -2327,8 +2547,15 @@ impl RiverDeckApp {
                             shared::is_multi_action_uuid(instance.action.uuid.as_str());
                         let has_native_options =
                             Self::native_options_kind(instance.action.uuid.as_str()).is_some();
+                        let has_schema = riverdeck_core::options_schema::get_schema(
+                            instance.action.uuid.as_str(),
+                        )
+                        .is_some();
                         if has_native_options {
                             self.ensure_options_editor_state(device, instance);
+                        }
+                        if has_schema {
+                            self.ensure_schema_editor_state(instance);
                         }
 
                         // Keep editor state stable while switching slots.
@@ -2357,7 +2584,8 @@ impl RiverDeckApp {
                         let avail_w = ui.available_width().max(0.0);
                         let show_right = is_multi_action
                             || shared::is_toggle_action_uuid(instance.action.uuid.as_str())
-                            || has_native_options;
+                            || has_native_options
+                            || has_schema;
 
                         if show_right {
                             // True split down the middle (matches the mental model in the UI).
@@ -2383,6 +2611,10 @@ impl RiverDeckApp {
                                         if is_multi_action {
                                             self.draw_action_editor_multi_action_right_column(
                                                 ui, ctx, instance,
+                                            );
+                                        } else if has_schema {
+                                            self.draw_action_editor_schema_right_column(
+                                                ui, instance,
                                             );
                                         } else if has_native_options {
                                             self.draw_action_editor_native_options_right_column(
@@ -2583,11 +2815,29 @@ impl RiverDeckApp {
                         .color(ui.visuals().weak_text_color()),
                 );
             } else if !instance.action.property_inspector.trim().is_empty() {
-                ui.label(
-                    egui::RichText::new("This action uses a legacy Property Inspector (disabled).")
+                if ui
+                    .button("Open Property Inspector…")
+                    .on_hover_text("Open this action's Property Inspector in a separate window")
+                    .clicked()
+                    && let Err(err) = self.open_property_inspector(ctx, instance)
+                {
+                    self.property_inspector_last_error = Some(err.to_string());
+                }
+                if let Some(err) = self.property_inspector_last_error.as_ref() {
+                    ui.label(
+                        egui::RichText::new(err)
+                            .small()
+                            .color(ui.visuals().error_fg_color),
+                    );
+                } else {
+                    ui.label(
+                        egui::RichText::new(
+                            "This action uses a Property Inspector (opens in a separate window).",
+                        )
                         .small()
                         .color(ui.visuals().weak_text_color()),
-                );
+                    );
+                }
             }
         });
     }
@@ -3218,6 +3468,140 @@ impl RiverDeckApp {
                 let _ = child.wait();
             });
         }
+    }
+
+    fn close_property_inspector(&mut self) {
+        if let Some(old_ctx) = self.property_inspector_context.take() {
+            self.runtime.spawn(async move {
+                riverdeck_core::api::property_inspector::switch_property_inspector(
+                    Some(old_ctx),
+                    None,
+                )
+                .await;
+            });
+        }
+        if let Some(mut child) = self.property_inspector_child.take() {
+            riverdeck_core::runtime_processes::unrecord_process(child.id());
+            let _ = child.kill();
+            // Don't block the UI thread on `wait()` (can hang); reap on a background thread.
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+    }
+
+    fn compute_property_inspector_geometry(ctx: &egui::Context) -> Option<(i32, i32, i32, i32)> {
+        let outer = ctx.input(|i| i.viewport().outer_rect)?;
+        let desired_w: f32 = 520.0;
+        let desired_h: f32 = 720.0;
+        let w = desired_w.min(outer.width().max(300.0)).round() as i32;
+        let h = desired_h.min(outer.height().max(240.0)).round() as i32;
+        // Prefer docking near the right side of the main window.
+        let x = (outer.right() - (w as f32) - 12.0).round() as i32;
+        let y = (outer.center().y - (h as f32 / 2.0)).round() as i32;
+        Some((x.max(0), y.max(0), w.max(300), h.max(240)))
+    }
+
+    fn open_property_inspector(
+        &mut self,
+        ctx: &egui::Context,
+        instance: &shared::ActionInstance,
+    ) -> anyhow::Result<()> {
+        let pi_rel = instance.action.property_inspector.trim();
+        if pi_rel.is_empty() {
+            return Err(anyhow::anyhow!("action has no property inspector"));
+        }
+
+        // Close any existing PI window so we don't orphan multiple windows.
+        // This keeps the UX closer to the built-in Action Editor (one active editor at a time).
+        self.close_property_inspector();
+
+        let plugin_id = instance.action.plugin.trim().to_owned();
+        if plugin_id.is_empty() {
+            return Err(anyhow::anyhow!("missing plugin id for action"));
+        }
+        let plugin_dir = riverdeck_core::shared::config_dir()
+            .join("plugins")
+            .join(&plugin_id);
+        let pi_path = plugin_dir.join(pi_rel);
+        if !pi_path.exists() {
+            return Err(anyhow::anyhow!(
+                "property inspector not found at {}",
+                pi_path.display()
+            ));
+        }
+
+        // Load PI HTML via the local plugin webserver, with RiverDeck's injection suffix.
+        let token = riverdeck_core::plugins::property_inspector_token();
+        let ws_port = *riverdeck_core::plugins::PORT_BASE;
+        let web_port = ws_port + 2;
+        let raw_path = format!("{}|riverdeck_property_inspector", pi_path.to_string_lossy());
+        let encoded = urlencoding::encode(&raw_path);
+        let pi_src = format!("http://127.0.0.1:{web_port}/{encoded}?riverdeck_token={token}");
+
+        // Stream Deck-compatible `info` payload for the PI.
+        let info = self.runtime.block_on(async {
+            riverdeck_core::api::property_inspector::make_info(plugin_id.clone()).await
+        })?;
+        let info_json = serde_json::to_string(&info)?;
+
+        // Stream Deck-compatible "actionInfo" payload.
+        let coords = (|| {
+            let device = shared::DEVICES.get(&instance.context.device)?;
+            if instance.context.controller != "Keypad" || device.columns == 0 {
+                return None;
+            }
+            let pos = instance.context.position as u32;
+            let cols = device.columns as u32;
+            Some(serde_json::json!({
+                "column": (pos % cols) as u8,
+                "row": (pos / cols) as u8
+            }))
+        })();
+        let connect_payload = serde_json::json!({
+            "action": instance.action.uuid,
+            "context": instance.context.to_string(),
+            "device": instance.context.device,
+            "payload": {
+                "settings": instance.settings,
+                "state": instance.current_state,
+                "coordinates": coords,
+                "isInMultiAction": false
+            }
+        });
+        let connect_json = serde_json::to_string(&connect_payload)?;
+
+        let label = format!("Property Inspector — {}", instance.action.name.trim());
+        let dock = Self::compute_property_inspector_geometry(ctx);
+        let child = match spawn_pi_process(
+            &label,
+            &pi_src,
+            "*",
+            ws_port,
+            &instance.context.to_string(),
+            &info_json,
+            &connect_json,
+            dock,
+        ) {
+            Ok(child) => child,
+            Err(err) if is_process_not_found(&err) => {
+                return Err(anyhow::anyhow!(
+                    "property inspector helper not found (riverdeck-pi): {err:#}"
+                ));
+            }
+            Err(err) => return Err(err),
+        };
+
+        let old = self.property_inspector_context.take();
+        let new = instance.context.clone();
+        self.property_inspector_context = Some(new.clone());
+        self.property_inspector_child = Some(child);
+        self.property_inspector_last_error = None;
+        self.runtime.spawn(async move {
+            riverdeck_core::api::property_inspector::switch_property_inspector(old, Some(new))
+                .await;
+        });
+        Ok(())
     }
 
     fn compute_marketplace_geometry(ctx: &egui::Context) -> Option<(i32, i32, i32, i32)> {
@@ -4018,6 +4402,7 @@ impl eframe::App for RiverDeckApp {
         // If we're waiting on async results, poll at a low frequency.
         if pending_async
             || self.pending_plugin_install_result.is_some()
+            || self.pending_plugin_remove_result.is_some()
             || self.pending_icon_pick.is_some()
             || self.pending_screen_bg_pick.is_some()
             || self.toasts.is_active()
@@ -4030,6 +4415,30 @@ impl eframe::App for RiverDeckApp {
             && let Ok(res) = rx.try_recv()
         {
             self.pending_plugin_install_result = None;
+            match res {
+                Ok(()) => {
+                    self.plugin_manage_error = None;
+                    // Invalidate caches that depend on plugin discovery and refresh plugins.
+                    self.plugins_cache = None;
+                    self.plugins_inflight = false;
+                    self.plugins_rx = None;
+                    self.categories_cache = None;
+                    self.categories_inflight = false;
+                    self.categories_rx = None;
+                    self.runtime.spawn(async {
+                        plugins::initialise_plugins();
+                    });
+                }
+                Err(err) => {
+                    self.plugin_manage_error = Some(err);
+                }
+            }
+        }
+
+        if let Some(rx) = self.pending_plugin_remove_result.as_ref()
+            && let Ok(res) = rx.try_recv()
+        {
+            self.pending_plugin_remove_result = None;
             match res {
                 Ok(()) => {
                     self.plugin_manage_error = None;
@@ -4199,7 +4608,7 @@ impl eframe::App for RiverDeckApp {
                 // off-screen by large spacers).
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                     ui.add_space(4.0);
-                    if ui.button("Elgato Marketplace").clicked()
+                    if ui.button("OpenAction Marketplace").clicked()
                         && let Err(err) = self.open_marketplace(ctx)
                     {
                         self.marketplace_last_error = Some(err.to_string());
@@ -4803,9 +5212,34 @@ impl eframe::App for RiverDeckApp {
                         if let Some(err) = self.plugin_manage_error.as_ref() {
                             ui.colored_label(ui.visuals().error_fg_color, err);
                         }
+                        ui.checkbox(
+                            &mut self.manage_plugins_show_action_uuids,
+                            "Show action UUIDs (schema coverage)",
+                        );
+                        if self.manage_plugins_show_action_uuids {
+                            // Ensure action/category cache is populated (normally driven by the Actions side panel).
+                            if self.categories_cache.is_none()
+                                && !self.categories_inflight
+                                && self.categories_rx.is_none()
+                            {
+                                self.categories_inflight = true;
+                                let (tx, rx) = mpsc::channel();
+                                self.categories_rx = Some(rx);
+                                self.runtime.spawn(async move {
+                                    let _ = tx.send(riverdeck_core::api::get_categories().await);
+                                });
+                            }
+                        }
                         if self.pending_plugin_install_result.is_some() {
                             ui.label(
                                 egui::RichText::new("Installing…")
+                                    .small()
+                                    .color(ui.visuals().weak_text_color()),
+                            );
+                        }
+                        if self.pending_plugin_remove_result.is_some() {
+                            ui.label(
+                                egui::RichText::new("Removing…")
                                     .small()
                                     .color(ui.visuals().weak_text_color()),
                             );
@@ -4938,6 +5372,18 @@ impl eframe::App for RiverDeckApp {
                                                                 .spawn();
                                                         }
                                                     }
+                                                    if ui
+                                                        .add_enabled(
+                                                            self.pending_plugin_install_result.is_none()
+                                                                && self.pending_plugin_remove_result.is_none(),
+                                                            egui::Button::new("Remove"),
+                                                        )
+                                                        .on_hover_text("Remove the installed plugin and delete its files")
+                                                        .clicked()
+                                                    {
+                                                        self.pending_plugin_remove_confirm =
+                                                            Some((id.clone(), name.clone()));
+                                                    }
                                                 } else if matches!(
                                                     source,
                                                     riverdeck_core::plugins::marketplace::PluginSource::Workspace
@@ -4946,6 +5392,7 @@ impl eframe::App for RiverDeckApp {
                                                     riverdeck_core::plugins::marketplace::PluginSupport::Supported
                                                 ) && ui.button("Install").clicked()
                                                     && self.pending_plugin_install_result.is_none()
+                                                    && self.pending_plugin_remove_result.is_none()
                                                 {
                                                         let (tx, rx_done) = mpsc::channel();
                                                         self.pending_plugin_install_result = Some(rx_done);
@@ -4962,7 +5409,11 @@ impl eframe::App for RiverDeckApp {
                                                 }
 
                                                 let mut enabled_local = enabled;
-                                                let toggle = ui.checkbox(&mut enabled_local, "Enabled");
+                                                let toggle = ui.add_enabled(
+                                                    self.pending_plugin_install_result.is_none()
+                                                        && self.pending_plugin_remove_result.is_none(),
+                                                    egui::Checkbox::new(&mut enabled_local, "Enabled"),
+                                                );
                                                 if toggle.changed() {
                                                     if let Err(err) = riverdeck_core::plugins::marketplace::set_plugin_enabled(&id, enabled_local) {
                                                         self.plugin_manage_error = Some(err.to_string());
@@ -4986,6 +5437,146 @@ impl eframe::App for RiverDeckApp {
                                 ui.add_space(6.0);
                             }
                         });
+
+                        if self.manage_plugins_show_action_uuids {
+                            ui.add_space(8.0);
+                            ui.separator();
+                            ui.label(
+                                egui::RichText::new("Action UUIDs (schema coverage)")
+                                    .strong(),
+                            );
+
+                            // Build a map plugin -> actions from the category cache.
+                            let mut per_plugin: std::collections::BTreeMap<
+                                String,
+                                Vec<shared::Action>,
+                            > = std::collections::BTreeMap::new();
+                            for (_cat, cat) in self.categories_cache.clone().unwrap_or_default() {
+                                for action in cat.actions {
+                                    per_plugin
+                                        .entry(action.plugin.clone())
+                                        .or_default()
+                                        .push(action);
+                                }
+                            }
+
+                            // Plugin id -> plugin name for nicer headers.
+                            let plugin_names: std::collections::HashMap<String, String> = self
+                                .plugins_cache
+                                .as_ref()
+                                .map(|plugins| {
+                                    plugins
+                                        .iter()
+                                        .map(|p| (p.id.clone(), p.name.clone()))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+
+                            egui::ScrollArea::vertical()
+                                .max_height(260.0)
+                                .show(ui, |ui| {
+                                    if per_plugin.is_empty()
+                                        && (self.categories_inflight
+                                            || self.categories_rx.is_some())
+                                    {
+                                        ui.label(
+                                            egui::RichText::new("Loading actions…")
+                                                .small()
+                                                .color(ui.visuals().weak_text_color()),
+                                        );
+                                    }
+                                    for (plugin_id, mut actions) in per_plugin {
+                                        actions.sort_by(|a, b| a.name.cmp(&b.name));
+                                        let header = plugin_names
+                                            .get(&plugin_id)
+                                            .map(|n| format!("{n} ({plugin_id})"))
+                                            .unwrap_or(plugin_id.clone());
+                                        egui::CollapsingHeader::new(header)
+                                            .default_open(false)
+                                            .show(ui, |ui| {
+                                                ui.spacing_mut().item_spacing.y = 6.0;
+                                                for action in actions {
+                                                    let has_pi = !action.property_inspector.trim().is_empty();
+                                                    let has_schema = riverdeck_core::options_schema::get_schema(&action.uuid).is_some();
+                                                    ui.horizontal(|ui| {
+                                                        ui.label(egui::RichText::new(action.name).strong());
+                                                        ui.label(
+                                                            egui::RichText::new(action.uuid)
+                                                                .small()
+                                                                .color(ui.visuals().weak_text_color()),
+                                                        );
+                                                    });
+                                                    ui.horizontal(|ui| {
+                                                        ui.label(
+                                                            egui::RichText::new(if has_pi { "PI" } else { "no PI" })
+                                                                .small()
+                                                                .color(if has_pi { ui.visuals().warn_fg_color } else { ui.visuals().weak_text_color() }),
+                                                        );
+                                                        ui.label(
+                                                            egui::RichText::new(if has_schema { "schema" } else { "no schema" })
+                                                                .small()
+                                                                .color(if has_schema { ui.visuals().widgets.active.fg_stroke.color } else { ui.visuals().weak_text_color() }),
+                                                        );
+                                                    });
+                                                    ui.separator();
+                                                }
+                                            });
+                                    }
+                                });
+                        }
+
+                        // Confirmation prompt for removal.
+                        if let Some((remove_id, remove_name)) =
+                            self.pending_plugin_remove_confirm.clone()
+                        {
+                            let mut open_confirm = true;
+                            egui::Window::new("Remove plugin?")
+                                .open(&mut open_confirm)
+                                .collapsible(false)
+                                .resizable(false)
+                                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                                .show(ctx, |ui| {
+                                    ui.label(egui::RichText::new(&remove_name).strong());
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{remove_id}\n\nThis will remove the plugin and delete its installed files.\nAll action instances from this plugin will be removed from your profiles."
+                                        ))
+                                        .small()
+                                        .color(ui.visuals().weak_text_color()),
+                                    );
+                                    ui.add_space(8.0);
+                                    ui.horizontal(|ui| {
+                                        if ui.button("Cancel").clicked() {
+                                            self.pending_plugin_remove_confirm = None;
+                                        }
+                                        if ui
+                                            .add(
+                                                egui::Button::new("Remove")
+                                                    .fill(ui.visuals().error_fg_color),
+                                            )
+                                            .clicked()
+                                            && self.pending_plugin_remove_result.is_none()
+                                            && self.pending_plugin_install_result.is_none()
+                                        {
+                                            self.pending_plugin_remove_confirm = None;
+                                            self.plugin_manage_error = None;
+                                            let (tx, rx_done) = mpsc::channel();
+                                            self.pending_plugin_remove_result = Some(rx_done);
+                                            let id = remove_id.clone();
+                                            self.runtime.spawn(async move {
+                                                let res =
+                                                    riverdeck_core::api::plugins::remove_plugin(id)
+                                                        .await
+                                                        .map_err(|e| e.to_string());
+                                                let _ = tx.send(res);
+                                            });
+                                        }
+                                    });
+                                });
+                            if !open_confirm {
+                                self.pending_plugin_remove_confirm = None;
+                            }
+                        }
                             });
                     });
                 if close_requested {
@@ -5628,6 +6219,7 @@ impl eframe::App for RiverDeckApp {
 impl Drop for RiverDeckApp {
     fn drop(&mut self) {
         self.close_marketplace();
+        self.close_property_inspector();
         // Ensure we don't orphan plugin subprocesses (native/node/wine) on window close or tray quit.
         // This is synchronous so it runs even if the UI is exiting.
         self.runtime
@@ -5950,6 +6542,76 @@ fn spawn_web_process(
         child.id(),
         "riverdeck_pi_web",
         vec!["--label".to_owned(), label.to_owned(), "--url".to_owned()],
+    );
+    Ok(child)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_pi_process(
+    label: &str,
+    pi_src: &str,
+    origin: &str,
+    ws_port: u16,
+    context: &str,
+    info_json: &str,
+    connect_json: &str,
+    dock: Option<(i32, i32, i32, i32)>,
+) -> anyhow::Result<std::process::Child> {
+    let mut cmd = std::process::Command::new(resolve_pi_exe()?);
+    configure_pi_webview_env(&mut cmd);
+    cmd.arg("--label")
+        .arg(label)
+        .arg("--pi-src")
+        .arg(pi_src)
+        .arg("--origin")
+        .arg(origin)
+        .arg("--ws-port")
+        .arg(ws_port.to_string())
+        .arg("--context")
+        .arg(context)
+        .arg("--info-json")
+        .arg(info_json)
+        .arg("--connect-json")
+        .arg(connect_json);
+    cmd.arg("--storage-dir").arg(
+        riverdeck_core::shared::data_dir()
+            .join("webview")
+            .join("pi"),
+    );
+    if let Some(port) = IPC_PORT.get() {
+        cmd.arg("--ipc-port").arg(port.to_string());
+    }
+
+    if let Some((x, y, w, h)) = dock {
+        cmd.arg("--x")
+            .arg(x.to_string())
+            .arg("--y")
+            .arg(y.to_string())
+            .arg("--w")
+            .arg(w.to_string())
+            .arg("--h")
+            .arg(h.to_string())
+            .arg("--decorations")
+            .arg("1");
+    }
+
+    let pi_log_dir = riverdeck_core::shared::log_dir().join("pi");
+    let _ = std::fs::create_dir_all(&pi_log_dir);
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let log_file_path = pi_log_dir.join(format!("riverdeck-pi-pi-{ts}.log"));
+    let child = spawn_child_with_captured_pi_logs(cmd, &log_file_path)?;
+    riverdeck_core::runtime_processes::record_process(
+        child.id(),
+        "riverdeck_pi_pi",
+        vec![
+            "--label".to_owned(),
+            label.to_owned(),
+            "--pi-src".to_owned(),
+            pi_src.to_owned(),
+        ],
     );
     Ok(child)
 }

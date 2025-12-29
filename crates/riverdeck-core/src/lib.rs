@@ -14,6 +14,7 @@ pub mod icon_packs;
 pub mod lifecycle;
 pub mod marketplace;
 pub mod openaction_marketplace;
+pub mod options_schema;
 pub mod plugins;
 pub mod render;
 pub mod runtime_processes;

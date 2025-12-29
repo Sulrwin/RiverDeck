@@ -5085,6 +5085,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tray-icon",
+ "urlencoding",
 ]
 
 [[package]]

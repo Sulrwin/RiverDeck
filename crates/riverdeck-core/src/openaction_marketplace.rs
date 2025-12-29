@@ -87,12 +87,11 @@ pub async fn fetch_catalogue() -> anyhow::Result<HashMap<String, CatalogueEntry>
     const TTL_SECS: u64 = 10 * 60;
 
     let now = now_secs();
-    if let Ok(guard) = cache_lock().read() {
-        if let Some(c) = guard.as_ref()
-            && now.saturating_sub(c.fetched_at_secs) <= TTL_SECS
-        {
-            return Ok(c.entries.clone());
-        }
+    if let Ok(guard) = cache_lock().read()
+        && let Some(c) = guard.as_ref()
+        && now.saturating_sub(c.fetched_at_secs) <= TTL_SECS
+    {
+        return Ok(c.entries.clone());
     }
 
     let resp = reqwest::get(CATALOGUE_URL).await?;
@@ -193,15 +192,14 @@ async fn github_latest_release_download(repo_url: &str, plugin_id: &str) -> Opti
         }
         let name = a.name.unwrap_or_default().to_lowercase();
         let url_l = url.to_lowercase();
-        if name.ends_with(".streamdeckplugin")
+        if (name.ends_with(".streamdeckplugin")
             || url_l.contains(".streamdeckplugin")
             || name.ends_with(".streamdeckiconpack")
             || url_l.contains(".streamdeckiconpack")
-            || name.ends_with(".zip")
+            || name.ends_with(".zip"))
+            && (url.starts_with("https://") || url.starts_with("http://"))
         {
-            if url.starts_with("https://") || url.starts_with("http://") {
-                return Some(url);
-            }
+            return Some(url);
         }
     }
     None

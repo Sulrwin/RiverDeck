@@ -49,3 +49,4 @@ async fn main() -> anyhow::Result<()> {
     run_plugin(GlobalHandler, ActionHandler).await?;
     Ok(())
 }
+
