@@ -2014,7 +2014,7 @@ impl RiverDeckApp {
 
         self.ensure_schema_editor_state(instance);
 
-        ui.add_space(6.0);
+        // Keep the schema panel aligned with the left column; avoid extra top padding here.
         ui.label(egui::RichText::new("Options").strong());
         ui.label(
             egui::RichText::new(schema.title)
@@ -2026,7 +2026,7 @@ impl RiverDeckApp {
             ui.colored_label(ui.visuals().error_fg_color, err);
         }
 
-        ui.add_space(6.0);
+        ui.add_space(4.0);
 
         let mut changed_any = false;
         for field in schema.fields {
@@ -2487,9 +2487,191 @@ impl RiverDeckApp {
         egui::Frame::group(ui.style())
             .corner_radius(egui::CornerRadius::same(12))
             .show(ui, |ui| {
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 8.0;
+                // Make the editor content fill the available height of the Action Editor overlay.
+                // Without this, the inner layout can shrink to its content, which makes two-column
+                // editors feel "half height" even when the overlay is taller.
+                let fill_h = ui.available_height();
+                ui.set_min_height(fill_h);
 
+                ui.spacing_mut().item_spacing.y = 8.0;
+                // Add a bit of top padding so the first row doesn't sit flush against the frame,
+                // which can make the whole editor feel "too high".
+                ui.add_space(4.0);
+
+                let Some(instance) = instance else {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!("{} {}", slot.controller, slot.position))
+                                .size(14.0)
+                                .strong(),
+                        );
+                        ui.add_space(6.0);
+                        ui.add_enabled(false, egui::Button::new("Clear"));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("No action assigned")
+                                .color(ui.visuals().weak_text_color()),
+                        );
+                    });
+                    return;
+                };
+
+                let is_multi_action = shared::is_multi_action_uuid(instance.action.uuid.as_str());
+                let has_native_options =
+                    Self::native_options_kind(instance.action.uuid.as_str()).is_some();
+                let has_schema =
+                    riverdeck_core::options_schema::get_schema(instance.action.uuid.as_str())
+                        .is_some();
+                let show_right = is_multi_action
+                    || shared::is_toggle_action_uuid(instance.action.uuid.as_str())
+                    || has_native_options
+                    || has_schema;
+
+                if has_native_options {
+                    self.ensure_options_editor_state(device, instance);
+                }
+                if has_schema {
+                    self.ensure_schema_editor_state(instance);
+                }
+
+                // Keep editor state stable while switching slots.
+                let needs_reset = match self.button_label_context.as_ref() {
+                    None => true,
+                    Some(c) => c != &instance.context,
+                };
+                if needs_reset {
+                    self.button_label_context = Some(instance.context.clone());
+                    let st = instance.states.get(instance.current_state as usize);
+                    self.button_label_input = st
+                        .map(|s| s.text.clone())
+                        .unwrap_or_else(|| instance.action.name.clone());
+                    self.button_label_placement = st
+                        .map(|s| s.text_placement)
+                        .unwrap_or(shared::TextPlacement::Bottom);
+                    self.button_show_title = st.map(|s| s.show).unwrap_or(true);
+                    self.button_show_action_name = st.map(|s| s.show_action_name).unwrap_or(true);
+                }
+
+                let gap = 6.0;
+                let avail_w = ui.available_width().max(0.0);
+
+                if show_right {
+                    // Split from the top: both columns start at the same height as the slot header.
+                    let usable = (avail_w - gap).max(0.0);
+                    let col_w = (usable * 0.5).max(0.0);
+                    ui.horizontal(|ui| {
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(col_w, ui.available_height()),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                // Left column (header + left editor), with its own scrolling.
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{} {}",
+                                            slot.controller, slot.position
+                                        ))
+                                        .size(14.0)
+                                        .strong(),
+                                    );
+                                    ui.add_space(6.0);
+                                    if ui
+                                        .add_enabled(true, egui::Button::new("Clear"))
+                                        .on_hover_text("Remove the assigned action from this slot")
+                                        .clicked()
+                                    {
+                                        let ctx_to_clear = shared::Context {
+                                            device: device.id.clone(),
+                                            profile: selected_profile.to_owned(),
+                                            page: snapshot.page_id.clone(),
+                                            controller: slot.controller.clone(),
+                                            position: slot.position,
+                                        };
+                                        let _ = self.runtime.block_on(async {
+                                            riverdeck_core::api::instances::remove_instance(
+                                                shared::ActionContext::from_context(
+                                                    ctx_to_clear,
+                                                    0,
+                                                ),
+                                            )
+                                            .await
+                                        });
+                                    }
+                                });
+
+                                ui.horizontal(|ui| {
+                                    let icon_size = egui::vec2(28.0, 28.0);
+                                    let img = instance
+                                        .states
+                                        .get(instance.current_state as usize)
+                                        .map(|s| s.image.trim())
+                                        .filter(|s| !s.is_empty() && *s != "actionDefaultImage")
+                                        .map(|s| s.to_owned())
+                                        .unwrap_or_else(|| instance.action.icon.clone());
+                                    if let Some(tex) = self.texture_for_path(ctx, &img) {
+                                        ui.image((tex.id(), icon_size));
+                                    } else {
+                                        ui.allocate_exact_size(icon_size, egui::Sense::hover());
+                                    }
+                                    ui.label(instance.action.name.trim());
+                                });
+
+                                // Keep the left column height consistent with the editor and avoid
+                                // ID collisions with the right column scroll area.
+                                let scroll_h = ui.available_height().max(0.0);
+                                egui::ScrollArea::vertical()
+                                    .id_salt("action_editor_left_column_scroll")
+                                    .auto_shrink([false, false])
+                                    .min_scrolled_height(scroll_h)
+                                    .max_height(scroll_h)
+                                    .show(ui, |ui| {
+                                        self.draw_action_editor_left_column(
+                                            ui, ctx, device, instance,
+                                        )
+                                    });
+                            },
+                        );
+
+                        ui.add_space(gap);
+
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(col_w, ui.available_height()),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                // Right column: cap height and scroll internally to keep editor size consistent.
+                                let scroll_h = ui.available_height().max(0.0);
+                                egui::ScrollArea::vertical()
+                                    .id_salt("action_editor_right_column_scroll")
+                                    .auto_shrink([false, false])
+                                    .min_scrolled_height(scroll_h)
+                                    .max_height(scroll_h)
+                                    .show(ui, |ui| {
+                                        if is_multi_action {
+                                            self.draw_action_editor_multi_action_right_column(
+                                                ui, ctx, instance,
+                                            );
+                                        } else if has_schema {
+                                            self.draw_action_editor_schema_right_column(
+                                                ui, instance,
+                                            );
+                                        } else if has_native_options {
+                                            self.draw_action_editor_native_options_right_column(
+                                                ui, device, instance,
+                                            );
+                                        } else {
+                                            ui.label(
+                                                egui::RichText::new("Toggle Action")
+                                                    .small()
+                                                    .color(ui.visuals().weak_text_color()),
+                                            );
+                                        }
+                                    });
+                            },
+                        );
+                    });
+                } else {
+                    // Single column: keep the header visible and only scroll the options portion.
                     ui.horizontal(|ui| {
                         ui.label(
                             egui::RichText::new(format!("{} {}", slot.controller, slot.position))
@@ -2498,7 +2680,7 @@ impl RiverDeckApp {
                         );
                         ui.add_space(6.0);
                         if ui
-                            .add_enabled(instance.is_some(), egui::Button::new("Clear"))
+                            .add_enabled(true, egui::Button::new("Clear"))
                             .on_hover_text("Remove the assigned action from this slot")
                             .clicked()
                         {
@@ -2517,129 +2699,25 @@ impl RiverDeckApp {
                             });
                         }
                     });
-
                     ui.horizontal(|ui| {
-                        if let Some(instance) = instance {
-                            let icon_size = egui::vec2(28.0, 28.0);
-                            let img = instance
-                                .states
-                                .get(instance.current_state as usize)
-                                .map(|s| s.image.trim())
-                                .filter(|s| !s.is_empty() && *s != "actionDefaultImage")
-                                .map(|s| s.to_owned())
-                                .unwrap_or_else(|| instance.action.icon.clone());
-                            if let Some(tex) = self.texture_for_path(ctx, &img) {
-                                ui.image((tex.id(), icon_size));
-                            } else {
-                                ui.allocate_exact_size(icon_size, egui::Sense::hover());
-                            }
-                            ui.label(instance.action.name.trim());
+                        let icon_size = egui::vec2(28.0, 28.0);
+                        let img = instance
+                            .states
+                            .get(instance.current_state as usize)
+                            .map(|s| s.image.trim())
+                            .filter(|s| !s.is_empty() && *s != "actionDefaultImage")
+                            .map(|s| s.to_owned())
+                            .unwrap_or_else(|| instance.action.icon.clone());
+                        if let Some(tex) = self.texture_for_path(ctx, &img) {
+                            ui.image((tex.id(), icon_size));
                         } else {
-                            ui.label(
-                                egui::RichText::new("No action assigned")
-                                    .color(ui.visuals().weak_text_color()),
-                            );
+                            ui.allocate_exact_size(icon_size, egui::Sense::hover());
                         }
+                        ui.label(instance.action.name.trim());
                     });
 
-                    if let Some(instance) = instance {
-                        let is_multi_action =
-                            shared::is_multi_action_uuid(instance.action.uuid.as_str());
-                        let has_native_options =
-                            Self::native_options_kind(instance.action.uuid.as_str()).is_some();
-                        let has_schema = riverdeck_core::options_schema::get_schema(
-                            instance.action.uuid.as_str(),
-                        )
-                        .is_some();
-                        if has_native_options {
-                            self.ensure_options_editor_state(device, instance);
-                        }
-                        if has_schema {
-                            self.ensure_schema_editor_state(instance);
-                        }
-
-                        // Keep editor state stable while switching slots.
-                        let needs_reset = match self.button_label_context.as_ref() {
-                            None => true,
-                            Some(c) => c != &instance.context,
-                        };
-                        if needs_reset {
-                            self.button_label_context = Some(instance.context.clone());
-                            let st = instance.states.get(instance.current_state as usize);
-                            self.button_label_input = st
-                                .map(|s| s.text.clone())
-                                .unwrap_or_else(|| instance.action.name.clone());
-                            self.button_label_placement = st
-                                .map(|s| s.text_placement)
-                                .unwrap_or(shared::TextPlacement::Bottom);
-                            self.button_show_title = st.map(|s| s.show).unwrap_or(true);
-                            self.button_show_action_name =
-                                st.map(|s| s.show_action_name).unwrap_or(true);
-                        }
-
-                        // Layout:
-                        // - Normal actions: single full-width column
-                        // - Multi/Toggle actions: two columns
-                        let gap = 6.0;
-                        let avail_w = ui.available_width().max(0.0);
-                        let show_right = is_multi_action
-                            || shared::is_toggle_action_uuid(instance.action.uuid.as_str())
-                            || has_native_options
-                            || has_schema;
-
-                        if show_right {
-                            // True split down the middle (matches the mental model in the UI).
-                            let usable = (avail_w - gap).max(0.0);
-                            let col_w = (usable * 0.5).max(0.0);
-                            let left_w = col_w;
-                            let right_w = col_w;
-                            ui.horizontal(|ui| {
-                                ui.allocate_ui_with_layout(
-                                    egui::vec2(left_w, ui.available_height()),
-                                    egui::Layout::top_down(egui::Align::Min),
-                                    |ui| {
-                                        self.draw_action_editor_left_column(
-                                            ui, ctx, device, instance,
-                                        )
-                                    },
-                                );
-                                ui.add_space(gap);
-                                ui.allocate_ui_with_layout(
-                                    egui::vec2(right_w, ui.available_height()),
-                                    egui::Layout::top_down(egui::Align::Min),
-                                    |ui| {
-                                        if is_multi_action {
-                                            self.draw_action_editor_multi_action_right_column(
-                                                ui, ctx, instance,
-                                            );
-                                        } else if has_schema {
-                                            self.draw_action_editor_schema_right_column(
-                                                ui, instance,
-                                            );
-                                        } else if has_native_options {
-                                            self.draw_action_editor_native_options_right_column(
-                                                ui, device, instance,
-                                            );
-                                        } else {
-                                            // Toggle Action doesn't have a custom right panel (yet).
-                                            ui.label(
-                                                egui::RichText::new("Toggle Action")
-                                                    .small()
-                                                    .color(ui.visuals().weak_text_color()),
-                                            );
-                                        }
-                                    },
-                                );
-                            });
-                        } else {
-                            ui.allocate_ui_with_layout(
-                                egui::vec2(avail_w, ui.available_height()),
-                                egui::Layout::top_down(egui::Align::Min),
-                                |ui| self.draw_action_editor_left_column(ui, ctx, device, instance),
-                            );
-                        }
-                    }
-                });
+                    self.draw_action_editor_left_column(ui, ctx, device, instance);
+                }
             });
 
         // PI is intentionally not part of the default action editing flow anymore.
@@ -4828,6 +4906,7 @@ impl eframe::App for RiverDeckApp {
                 shared::is_multi_action_uuid(i.action.uuid.as_str())
                     || shared::is_toggle_action_uuid(i.action.uuid.as_str())
                     || Self::native_options_kind(i.action.uuid.as_str()).is_some()
+                    || riverdeck_core::options_schema::get_schema(i.action.uuid.as_str()).is_some()
             });
 
             let instance_present = match &slot.controller[..] {
@@ -4872,11 +4951,14 @@ impl eframe::App for RiverDeckApp {
 
                 // Keep height consistent across action types by basing it on the full window,
                 // not on `available_rect()` (which varies as side panels/content change).
-                let target_h = (screen.height() * 0.45).clamp(260.0, 460.0);
+                // Size the editor as a bottom sheet. Keep it large enough for option-heavy actions,
+                // but avoid pushing the top up into the center on common window sizes.
+                // Keep the bottom-sheet feel without pushing the top too far up.
+                let target_h = (screen.height() * 0.55).clamp(320.0, 600.0);
                 let current_h = target_h * anim_t;
 
-                // Flush to the bottom edge (no lift).
-                let margin = 0.0;
+                // Keep a small gap above the bottom edge for visual separation.
+                let margin = 20.0;
                 let center_x = self.preview_center_x.unwrap_or_else(|| avail.center().x);
                 let x = center_x - (target_w * 0.5);
                 let y = (screen.bottom() - margin - current_h).max(screen.top());
@@ -4910,7 +4992,11 @@ impl eframe::App for RiverDeckApp {
                                     ui.heading("Action Editor");
                                     ui.add_space(6.0);
 
-                                    egui::ScrollArea::vertical().show(ui, |ui| {
+                                    // Two-column editors manage their own scrolling per-column to
+                                    // keep left/right content aligned. Single-column editors use
+                                    // the traditional outer scroll behavior (feels nicer and avoids
+                                    // an always-present inner scroll region).
+                                    if selected_uses_two_cols {
                                         self.draw_action_editor_contents(
                                             ui,
                                             ctx,
@@ -4919,7 +5005,20 @@ impl eframe::App for RiverDeckApp {
                                             &selected_profile,
                                             &slot,
                                         );
-                                    });
+                                    } else {
+                                        egui::ScrollArea::vertical()
+                                            .id_salt("action_editor_outer_scroll")
+                                            .show(ui, |ui| {
+                                                self.draw_action_editor_contents(
+                                                    ui,
+                                                    ctx,
+                                                    device,
+                                                    snapshot,
+                                                    &selected_profile,
+                                                    &slot,
+                                                );
+                                            });
+                                    }
                                 });
                             });
                     });
