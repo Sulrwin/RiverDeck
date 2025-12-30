@@ -881,8 +881,31 @@ pub async fn update_image(
                     .await?;
             }
         } else {
-            crate::animation::stop(&anim_key).await;
-            device.clear_button_image(context.position).await?;
+            // Keypad slot: if there's no icon but we still have overlays, render a blank key with text.
+            let has_overlays = overlays
+                .as_ref()
+                .is_some_and(|ov| ov.iter().any(|o| !o.text.trim().is_empty()));
+            if has_overlays {
+                crate::animation::stop(&anim_key).await;
+                let (kw, kh) = device.kind().key_image_format().size;
+                let mut img = image::DynamicImage::ImageRgba8(RgbaImage::from_pixel(
+                    kw as u32,
+                    kh as u32,
+                    Rgba([0, 0, 0, 255]),
+                ));
+                if let Some(ov) = overlays {
+                    for o in ov {
+                        if !o.text.trim().is_empty() {
+                            img = overlay_label(img, &o);
+                        }
+                    }
+                }
+                img = round_corners_subtle(img);
+                device.set_button_image(context.position, img).await?;
+            } else {
+                crate::animation::stop(&anim_key).await;
+                device.clear_button_image(context.position).await?;
+            }
         }
         device.flush().await?;
     }

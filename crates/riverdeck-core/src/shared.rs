@@ -348,6 +348,11 @@ pub struct ActionState {
     pub text: String,
     #[serde(alias = "ShowTitle")]
     pub show: bool,
+    /// Whether the action icon/image should be rendered on the button.
+    ///
+    /// This is a RiverDeck extension (not part of the Stream Deck manifest schema).
+    #[serde(default = "default_true")]
+    pub show_icon: bool,
     /// Whether the action's display name should be rendered as an additional label on the button.
     ///
     /// This is a RiverDeck extension (not part of the Stream Deck manifest schema).
@@ -374,6 +379,10 @@ fn default_false() -> bool {
     false
 }
 
+fn default_true() -> bool {
+    true
+}
+
 impl Default for ActionState {
     fn default() -> Self {
         Self {
@@ -381,6 +390,7 @@ impl Default for ActionState {
             name: String::new(),
             text: String::new(),
             show: true,
+            show_icon: true,
             show_action_name: false,
             colour: "#FFFFFF".to_owned(),
             alignment: "middle".to_owned(),

@@ -33,6 +33,62 @@ fn parse_multi_action_run_on(settings: &serde_json::Value) -> MultiActionRunOn {
     }
 }
 
+fn toggle_child_icon_for_state(child: &ActionInstance) -> String {
+    let st = child
+        .states
+        .get(child.current_state as usize)
+        .or_else(|| child.states.first());
+    if let Some(st) = st {
+        let img = st.image.trim();
+        if !img.is_empty() && img != "actionDefaultImage" {
+            return img.to_owned();
+        }
+    }
+    child.action.icon.clone()
+}
+
+fn sync_toggle_state_images_from_children(parent: &mut ActionInstance) {
+    if !crate::shared::is_toggle_action_uuid(parent.action.uuid.as_str()) {
+        return;
+    }
+    let Some(children) = parent.children.as_ref() else {
+        return;
+    };
+    let n = children.len();
+    if n == 0 {
+        parent.current_state = 0;
+        // Keep the first state only (matches legacy behavior).
+        if parent.states.len() > 1 {
+            parent.states.truncate(1);
+        }
+        return;
+    }
+
+    if parent.current_state as usize >= n {
+        parent.current_state = (n - 1) as u16;
+    }
+
+    // Ensure state count matches child count.
+    while parent.states.len() < n {
+        parent.states.push(ActionState::default());
+    }
+    if parent.states.len() > n {
+        parent.states.truncate(n);
+    }
+
+    for (i, child) in children.iter().enumerate() {
+        parent.states[i].image = toggle_child_icon_for_state(child);
+    }
+}
+
+fn apply_context_for_visuals(ctx: &ActionContext) -> ActionContext {
+    if ctx.index == 0 {
+        return ctx.clone();
+    }
+    let base: Context = ctx.into();
+    ActionContext::from_context(base, 0)
+}
+
 pub async fn create_instance(
     action: Action,
     context: Context,
@@ -86,13 +142,12 @@ pub async fn create_instance(
         };
         children.push(instance.clone());
 
-        if crate::shared::is_toggle_action_uuid(parent.action.uuid.as_str())
-            && parent.states.len() < children.len()
-        {
-            parent.states.push(crate::shared::ActionState {
-                image: "riverdeck/toggle-action.png".to_owned(),
-                ..Default::default()
-            });
+        if crate::shared::is_toggle_action_uuid(parent.action.uuid.as_str()) {
+            // Maintain state count (legacy), then sync state images from children.
+            if parent.states.len() < children.len() {
+                parent.states.push(crate::shared::ActionState::default());
+            }
+            sync_toggle_state_images_from_children(parent);
             ui::emit(UiEvent::ActionStateChanged {
                 context: parent.context.clone(),
             });
@@ -236,6 +291,67 @@ pub async fn reorder_multi_action_child(
     Ok(())
 }
 
+pub async fn reorder_toggle_action_child(
+    parent_ctx: ActionContext,
+    from: usize,
+    to: usize,
+) -> Result<(), anyhow::Error> {
+    if from == to {
+        return Ok(());
+    }
+    let mut locks = acquire_locks_mut().await;
+    let device_id = {
+        let Some(instance) =
+            crate::store::profiles::get_instance_mut(&parent_ctx, &mut locks).await?
+        else {
+            return Ok(());
+        };
+        if instance.context.index != 0
+            || !crate::shared::is_toggle_action_uuid(instance.action.uuid.as_str())
+        {
+            return Ok(());
+        }
+        let Some(children) = instance.children.as_mut() else {
+            return Ok(());
+        };
+        if from >= children.len() || to >= children.len() {
+            return Ok(());
+        }
+
+        // Keep the same logical current child selected across reorder.
+        let current_ctx = children
+            .get(instance.current_state as usize)
+            .map(|c| c.context.clone());
+
+        // Preserve child contexts; ordering is what matters for execution.
+        let child = children.remove(from);
+        children.insert(to, child);
+
+        // Keep parent states aligned with children ordering.
+        if instance.states.len() == children.len() {
+            let st = instance.states.remove(from);
+            instance.states.insert(to, st);
+        }
+
+        if let Some(cur) = current_ctx
+            && let Some(new_idx) = children.iter().position(|c| c.context == cur)
+        {
+            instance.current_state = new_idx as u16;
+        }
+
+        // Now that we are done borrowing `children`, update the parent state images.
+        sync_toggle_state_images_from_children(instance);
+
+        ui::emit(UiEvent::ActionStateChanged {
+            context: instance.context.clone(),
+        });
+        instance.context.device.clone()
+    };
+
+    save_profile(&device_id, &mut locks).await?;
+    Ok(())
+}
+
 pub async fn set_button_label(context: ActionContext, label: String) -> Result<(), anyhow::Error> {
     let mut locks = acquire_locks_mut().await;
     let active_profile = locks
@@ -254,24 +370,30 @@ pub async fn set_button_label(context: ActionContext, label: String) -> Result<(
     } else {
         String::new()
     };
-    let Some(instance) = crate::store::profiles::get_instance_mut(&context, &mut locks).await?
-    else {
-        return Ok(());
-    };
-    let (apply_ctx, apply_img, apply_overlays, apply_active) = {
+    {
+        let Some(instance) = crate::store::profiles::get_instance_mut(&context, &mut locks).await?
+        else {
+            return Ok(());
+        };
         for st in instance.states.iter_mut() {
             st.text = label.clone();
         }
         ui::emit(UiEvent::ActionStateChanged {
             context: instance.context.clone(),
         });
-        let img = instance
-            .states
-            .get(instance.current_state as usize)
-            .map(|s| s.image.trim())
-            .filter(|s| !s.is_empty() && *s != "actionDefaultImage")
-            .map(|s| s.to_owned())
-            .unwrap_or_else(|| instance.action.icon.clone());
+    }
+
+    let apply_ctx = apply_context_for_visuals(&context);
+    let (apply_ctx, apply_img, apply_overlays, apply_active) = {
+        let Some(instance) =
+            crate::store::profiles::get_instance_mut(&apply_ctx, &mut locks).await?
+        else {
+            return Ok(());
+        };
+        ui::emit(UiEvent::ActionStateChanged {
+            context: instance.context.clone(),
+        });
+        let img = crate::events::outbound::devices::effective_image_for_instance(instance);
         (
             instance.context.clone(),
             img,
@@ -283,11 +405,7 @@ pub async fn set_button_label(context: ActionContext, label: String) -> Result<(
     if apply_active {
         let _ = crate::events::outbound::devices::update_image_with_overlays(
             (&apply_ctx).into(),
-            if apply_img.trim().is_empty() {
-                None
-            } else {
-                Some(apply_img)
-            },
+            apply_img,
             apply_overlays,
         )
         .await;
@@ -316,24 +434,30 @@ pub async fn set_button_label_placement(
     } else {
         String::new()
     };
-    let Some(instance) = crate::store::profiles::get_instance_mut(&context, &mut locks).await?
-    else {
-        return Ok(());
-    };
-    let (apply_ctx, apply_img, apply_overlays, apply_active) = {
+    {
+        let Some(instance) = crate::store::profiles::get_instance_mut(&context, &mut locks).await?
+        else {
+            return Ok(());
+        };
         for st in instance.states.iter_mut() {
             st.text_placement = placement;
         }
         ui::emit(UiEvent::ActionStateChanged {
             context: instance.context.clone(),
         });
-        let img = instance
-            .states
-            .get(instance.current_state as usize)
-            .map(|s| s.image.trim())
-            .filter(|s| !s.is_empty() && *s != "actionDefaultImage")
-            .map(|s| s.to_owned())
-            .unwrap_or_else(|| instance.action.icon.clone());
+    }
+
+    let apply_ctx = apply_context_for_visuals(&context);
+    let (apply_ctx, apply_img, apply_overlays, apply_active) = {
+        let Some(instance) =
+            crate::store::profiles::get_instance_mut(&apply_ctx, &mut locks).await?
+        else {
+            return Ok(());
+        };
+        ui::emit(UiEvent::ActionStateChanged {
+            context: instance.context.clone(),
+        });
+        let img = crate::events::outbound::devices::effective_image_for_instance(instance);
         (
             instance.context.clone(),
             img,
@@ -345,11 +469,7 @@ pub async fn set_button_label_placement(
     if apply_active {
         let _ = crate::events::outbound::devices::update_image_with_overlays(
             (&apply_ctx).into(),
-            if apply_img.trim().is_empty() {
-                None
-            } else {
-                Some(apply_img)
-            },
+            apply_img,
             apply_overlays,
         )
         .await;
@@ -378,24 +498,30 @@ pub async fn set_button_label_font_size(
     } else {
         String::new()
     };
-    let Some(instance) = crate::store::profiles::get_instance_mut(&context, &mut locks).await?
-    else {
-        return Ok(());
-    };
-    let (apply_ctx, apply_img, apply_overlays, apply_active) = {
+    {
+        let Some(instance) = crate::store::profiles::get_instance_mut(&context, &mut locks).await?
+        else {
+            return Ok(());
+        };
         for st in instance.states.iter_mut() {
             st.size = FontSize(size);
         }
         ui::emit(UiEvent::ActionStateChanged {
             context: instance.context.clone(),
         });
-        let img = instance
-            .states
-            .get(instance.current_state as usize)
-            .map(|s| s.image.trim())
-            .filter(|s| !s.is_empty() && *s != "actionDefaultImage")
-            .map(|s| s.to_owned())
-            .unwrap_or_else(|| instance.action.icon.clone());
+    }
+
+    let apply_ctx = apply_context_for_visuals(&context);
+    let (apply_ctx, apply_img, apply_overlays, apply_active) = {
+        let Some(instance) =
+            crate::store::profiles::get_instance_mut(&apply_ctx, &mut locks).await?
+        else {
+            return Ok(());
+        };
+        ui::emit(UiEvent::ActionStateChanged {
+            context: instance.context.clone(),
+        });
+        let img = crate::events::outbound::devices::effective_image_for_instance(instance);
         (
             instance.context.clone(),
             img,
@@ -407,11 +533,7 @@ pub async fn set_button_label_font_size(
     if apply_active {
         let _ = crate::events::outbound::devices::update_image_with_overlays(
             (&apply_ctx).into(),
-            if apply_img.trim().is_empty() {
-                None
-            } else {
-                Some(apply_img)
-            },
+            apply_img,
             apply_overlays,
         )
         .await;
@@ -440,24 +562,30 @@ pub async fn set_button_label_colour(
     } else {
         String::new()
     };
-    let Some(instance) = crate::store::profiles::get_instance_mut(&context, &mut locks).await?
-    else {
-        return Ok(());
-    };
-    let (apply_ctx, apply_img, apply_overlays, apply_active) = {
+    {
+        let Some(instance) = crate::store::profiles::get_instance_mut(&context, &mut locks).await?
+        else {
+            return Ok(());
+        };
         for st in instance.states.iter_mut() {
             st.colour = colour.clone();
         }
         ui::emit(UiEvent::ActionStateChanged {
             context: instance.context.clone(),
         });
-        let img = instance
-            .states
-            .get(instance.current_state as usize)
-            .map(|s| s.image.trim())
-            .filter(|s| !s.is_empty() && *s != "actionDefaultImage")
-            .map(|s| s.to_owned())
-            .unwrap_or_else(|| instance.action.icon.clone());
+    }
+
+    let apply_ctx = apply_context_for_visuals(&context);
+    let (apply_ctx, apply_img, apply_overlays, apply_active) = {
+        let Some(instance) =
+            crate::store::profiles::get_instance_mut(&apply_ctx, &mut locks).await?
+        else {
+            return Ok(());
+        };
+        ui::emit(UiEvent::ActionStateChanged {
+            context: instance.context.clone(),
+        });
+        let img = crate::events::outbound::devices::effective_image_for_instance(instance);
         (
             instance.context.clone(),
             img,
@@ -469,11 +597,7 @@ pub async fn set_button_label_colour(
     if apply_active {
         let _ = crate::events::outbound::devices::update_image_with_overlays(
             (&apply_ctx).into(),
-            if apply_img.trim().is_empty() {
-                None
-            } else {
-                Some(apply_img)
-            },
+            apply_img,
             apply_overlays,
         )
         .await;
@@ -502,24 +626,30 @@ pub async fn set_button_show_title(
     } else {
         String::new()
     };
-    let Some(instance) = crate::store::profiles::get_instance_mut(&context, &mut locks).await?
-    else {
-        return Ok(());
-    };
-    let (apply_ctx, apply_img, apply_overlays, apply_active) = {
+    {
+        let Some(instance) = crate::store::profiles::get_instance_mut(&context, &mut locks).await?
+        else {
+            return Ok(());
+        };
         for st in instance.states.iter_mut() {
             st.show = show_title;
         }
         ui::emit(UiEvent::ActionStateChanged {
             context: instance.context.clone(),
         });
-        let img = instance
-            .states
-            .get(instance.current_state as usize)
-            .map(|s| s.image.trim())
-            .filter(|s| !s.is_empty() && *s != "actionDefaultImage")
-            .map(|s| s.to_owned())
-            .unwrap_or_else(|| instance.action.icon.clone());
+    }
+
+    let apply_ctx = apply_context_for_visuals(&context);
+    let (apply_ctx, apply_img, apply_overlays, apply_active) = {
+        let Some(instance) =
+            crate::store::profiles::get_instance_mut(&apply_ctx, &mut locks).await?
+        else {
+            return Ok(());
+        };
+        ui::emit(UiEvent::ActionStateChanged {
+            context: instance.context.clone(),
+        });
+        let img = crate::events::outbound::devices::effective_image_for_instance(instance);
         (
             instance.context.clone(),
             img,
@@ -531,11 +661,7 @@ pub async fn set_button_show_title(
     if apply_active {
         let _ = crate::events::outbound::devices::update_image_with_overlays(
             (&apply_ctx).into(),
-            if apply_img.trim().is_empty() {
-                None
-            } else {
-                Some(apply_img)
-            },
+            apply_img,
             apply_overlays,
         )
         .await;
@@ -564,24 +690,30 @@ pub async fn set_button_show_action_name(
     } else {
         String::new()
     };
-    let Some(instance) = crate::store::profiles::get_instance_mut(&context, &mut locks).await?
-    else {
-        return Ok(());
-    };
-    let (apply_ctx, apply_img, apply_overlays, apply_active) = {
+    {
+        let Some(instance) = crate::store::profiles::get_instance_mut(&context, &mut locks).await?
+        else {
+            return Ok(());
+        };
         for st in instance.states.iter_mut() {
             st.show_action_name = show_action_name;
         }
         ui::emit(UiEvent::ActionStateChanged {
             context: instance.context.clone(),
         });
-        let img = instance
-            .states
-            .get(instance.current_state as usize)
-            .map(|s| s.image.trim())
-            .filter(|s| !s.is_empty() && *s != "actionDefaultImage")
-            .map(|s| s.to_owned())
-            .unwrap_or_else(|| instance.action.icon.clone());
+    }
+
+    let apply_ctx = apply_context_for_visuals(&context);
+    let (apply_ctx, apply_img, apply_overlays, apply_active) = {
+        let Some(instance) =
+            crate::store::profiles::get_instance_mut(&apply_ctx, &mut locks).await?
+        else {
+            return Ok(());
+        };
+        ui::emit(UiEvent::ActionStateChanged {
+            context: instance.context.clone(),
+        });
+        let img = crate::events::outbound::devices::effective_image_for_instance(instance);
         (
             instance.context.clone(),
             img,
@@ -593,11 +725,71 @@ pub async fn set_button_show_action_name(
     if apply_active {
         let _ = crate::events::outbound::devices::update_image_with_overlays(
             (&apply_ctx).into(),
-            if apply_img.trim().is_empty() {
-                None
-            } else {
-                Some(apply_img)
-            },
+            apply_img,
+            apply_overlays,
+        )
+        .await;
+    }
+    Ok(())
+}
+
+pub async fn set_button_show_icon(
+    context: ActionContext,
+    show_icon: bool,
+) -> Result<(), anyhow::Error> {
+    let mut locks = acquire_locks_mut().await;
+    let active_profile = locks
+        .device_stores
+        .get_selected_profile(&context.device)
+        .ok()
+        .is_some_and(|p| p == context.profile);
+    let active_page = if active_profile {
+        locks
+            .profile_stores
+            .get_profile_store_mut(&DEVICES.get(&context.device).unwrap(), &context.profile)
+            .await?
+            .value
+            .selected_page
+            .clone()
+    } else {
+        String::new()
+    };
+    {
+        let Some(instance) = crate::store::profiles::get_instance_mut(&context, &mut locks).await?
+        else {
+            return Ok(());
+        };
+        for st in instance.states.iter_mut() {
+            st.show_icon = show_icon;
+        }
+        ui::emit(UiEvent::ActionStateChanged {
+            context: instance.context.clone(),
+        });
+    }
+
+    let apply_ctx = apply_context_for_visuals(&context);
+    let (apply_ctx, apply_img, apply_overlays, apply_active) = {
+        let Some(instance) =
+            crate::store::profiles::get_instance_mut(&apply_ctx, &mut locks).await?
+        else {
+            return Ok(());
+        };
+        ui::emit(UiEvent::ActionStateChanged {
+            context: instance.context.clone(),
+        });
+        let img = crate::events::outbound::devices::effective_image_for_instance(instance);
+        (
+            instance.context.clone(),
+            img,
+            crate::events::outbound::devices::overlays_for_instance(instance),
+            active_profile && active_page == instance.context.page,
+        )
+    };
+    save_profile(&context.device, &mut locks).await?;
+    if apply_active {
+        let _ = crate::events::outbound::devices::update_image_with_overlays(
+            (&apply_ctx).into(),
+            apply_img,
             apply_overlays,
         )
         .await;
@@ -650,37 +842,57 @@ pub async fn set_custom_icon_from_path(
         .is_some_and(|p| p == context.profile);
 
     let (apply_ctx, apply_img, apply_overlays, apply_active) = {
-        let Some(instance) = crate::store::profiles::get_instance_mut(&context, &mut locks).await?
+        // Two-phase update so we can update parent visuals correctly for Multi/Toggle children.
+        // Phase 1: write the custom icon into the target (child or parent) instance state.
+        {
+            let Some(instance) =
+                crate::store::profiles::get_instance_mut(&context, &mut locks).await?
+            else {
+                return Ok(());
+            };
+
+            let dst_dir = instance_images_dir(&context);
+            tokio::fs::create_dir_all(&dst_dir).await?;
+            let dst = dst_dir.join(format!("custom_icon.{ext}"));
+            tokio::fs::copy(src, &dst).await?;
+            let dst_str = dst.to_string_lossy().into_owned();
+
+            let target_state = state.unwrap_or(instance.current_state);
+            if (target_state as usize) < instance.states.len() {
+                instance.states[target_state as usize].image = dst_str.clone();
+            }
+
+            ui::emit(UiEvent::ActionStateChanged {
+                context: context.clone(),
+            });
+        }
+
+        // Phase 2: compute the correct button visual to apply.
+        // If this was a child of a Multi/Toggle action, apply the parent (index 0) visual.
+        let apply_ctx = if context.index != 0 {
+            ActionContext::from_context((&context).into(), 0)
+        } else {
+            context.clone()
+        };
+
+        let Some(apply_instance) =
+            crate::store::profiles::get_instance_mut(&apply_ctx, &mut locks).await?
         else {
             return Ok(());
         };
 
-        let dst_dir = instance_images_dir(&context);
-        tokio::fs::create_dir_all(&dst_dir).await?;
-        let dst = dst_dir.join(format!("custom_icon.{ext}"));
-        tokio::fs::copy(src, &dst).await?;
-        let dst_str = dst.to_string_lossy().into_owned();
-
-        let target_state = state.unwrap_or(instance.current_state);
-        if (target_state as usize) < instance.states.len() {
-            instance.states[target_state as usize].image = dst_str.clone();
+        if crate::shared::is_toggle_action_uuid(apply_instance.action.uuid.as_str()) {
+            sync_toggle_state_images_from_children(apply_instance);
         }
 
         ui::emit(UiEvent::ActionStateChanged {
-            context: context.clone(),
+            context: apply_instance.context.clone(),
         });
 
-        // Prepare device update after we drop the mutable borrow.
-        let apply_active = active && target_state == instance.current_state;
-        let img = instance
-            .states
-            .get(instance.current_state as usize)
-            .map(|s| s.image.trim())
-            .filter(|s| !s.is_empty() && *s != "actionDefaultImage")
-            .map(|s| s.to_owned())
-            .unwrap_or_else(|| instance.action.icon.clone());
-        let overlays = crate::events::outbound::devices::overlays_for_instance(instance);
-        (instance.context.clone(), img, overlays, apply_active)
+        let apply_active = active && apply_instance.context.page == context.page;
+        let img = crate::events::outbound::devices::effective_image_for_instance(apply_instance);
+        let overlays = crate::events::outbound::devices::overlays_for_instance(apply_instance);
+        (apply_instance.context.clone(), img, overlays, apply_active)
     };
 
     save_profile(&context.device, &mut locks).await?;
@@ -688,11 +900,7 @@ pub async fn set_custom_icon_from_path(
     if apply_active {
         let _ = crate::events::outbound::devices::update_image_with_overlays(
             (&apply_ctx).into(),
-            if apply_img.trim().is_empty() {
-                None
-            } else {
-                Some(apply_img)
-            },
+            apply_img,
             apply_overlays,
         )
         .await;
@@ -713,33 +921,50 @@ pub async fn clear_custom_icon(
         .is_some_and(|p| p == context.profile);
 
     let (apply_ctx, apply_img, apply_overlays, apply_active) = {
-        let Some(instance) = crate::store::profiles::get_instance_mut(&context, &mut locks).await?
+        {
+            let Some(instance) =
+                crate::store::profiles::get_instance_mut(&context, &mut locks).await?
+            else {
+                return Ok(());
+            };
+
+            let target_state = state.unwrap_or(instance.current_state);
+            if let (Some(s), Some(def)) = (
+                instance.states.get_mut(target_state as usize),
+                instance.action.states.get(target_state as usize),
+            ) {
+                s.image = def.image.clone();
+            }
+
+            ui::emit(UiEvent::ActionStateChanged {
+                context: context.clone(),
+            });
+        }
+
+        let apply_ctx = if context.index != 0 {
+            ActionContext::from_context((&context).into(), 0)
+        } else {
+            context.clone()
+        };
+
+        let Some(apply_instance) =
+            crate::store::profiles::get_instance_mut(&apply_ctx, &mut locks).await?
         else {
             return Ok(());
         };
 
-        let target_state = state.unwrap_or(instance.current_state);
-        if let (Some(s), Some(def)) = (
-            instance.states.get_mut(target_state as usize),
-            instance.action.states.get(target_state as usize),
-        ) {
-            s.image = def.image.clone();
+        if crate::shared::is_toggle_action_uuid(apply_instance.action.uuid.as_str()) {
+            sync_toggle_state_images_from_children(apply_instance);
         }
 
         ui::emit(UiEvent::ActionStateChanged {
-            context: context.clone(),
+            context: apply_instance.context.clone(),
         });
 
-        let apply_active = active && target_state == instance.current_state;
-        let img = instance
-            .states
-            .get(instance.current_state as usize)
-            .map(|s| s.image.trim())
-            .filter(|s| !s.is_empty() && *s != "actionDefaultImage")
-            .map(|s| s.to_owned())
-            .unwrap_or_else(|| instance.action.icon.clone());
-        let overlays = crate::events::outbound::devices::overlays_for_instance(instance);
-        (instance.context.clone(), img, overlays, apply_active)
+        let apply_active = active && apply_instance.context.page == context.page;
+        let img = crate::events::outbound::devices::effective_image_for_instance(apply_instance);
+        let overlays = crate::events::outbound::devices::overlays_for_instance(apply_instance);
+        (apply_instance.context.clone(), img, overlays, apply_active)
     };
 
     save_profile(&context.device, &mut locks).await?;
@@ -747,11 +972,7 @@ pub async fn clear_custom_icon(
     if apply_active {
         let _ = crate::events::outbound::devices::update_image_with_overlays(
             (&apply_ctx).into(),
-            if apply_img.trim().is_empty() {
-                None
-            } else {
-                Some(apply_img)
-            },
+            apply_img,
             apply_overlays,
         )
         .await;
@@ -1040,10 +1261,11 @@ pub async fn remove_instance(context: ActionContext) -> Result<(), anyhow::Error
             }
             if !children.is_empty() {
                 instance.states.pop();
-                ui::emit(UiEvent::ActionStateChanged {
-                    context: instance.context.clone(),
-                });
             }
+            sync_toggle_state_images_from_children(instance);
+            ui::emit(UiEvent::ActionStateChanged {
+                context: instance.context.clone(),
+            });
         }
     }
 

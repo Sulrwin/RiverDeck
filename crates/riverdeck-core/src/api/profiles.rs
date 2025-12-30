@@ -209,16 +209,9 @@ pub async fn set_encoder_screen_background(
         .await;
         // Re-apply encoder images on top of the background (Plus LCD).
         for instance in selected_page(&store.value).sliders.iter().flatten() {
-            let img = instance
-                .states
-                .get(instance.current_state as usize)
-                .map(|s| s.image.trim())
-                .filter(|s| !s.is_empty() && *s != "actionDefaultImage")
-                .map(|s| s.to_owned())
-                .unwrap_or_else(|| instance.action.icon.clone());
             let _ = crate::events::outbound::devices::update_image(
                 (&instance.context).into(),
-                Some(img),
+                crate::events::outbound::devices::effective_image_for_instance(instance),
             )
             .await;
         }
@@ -285,16 +278,9 @@ pub async fn set_encoder_screen_background_crop(
         .await;
         // Re-apply encoder images on top of the background (Plus LCD).
         for instance in selected_page(&store.value).sliders.iter().flatten() {
-            let img = instance
-                .states
-                .get(instance.current_state as usize)
-                .map(|s| s.image.trim())
-                .filter(|s| !s.is_empty() && *s != "actionDefaultImage")
-                .map(|s| s.to_owned())
-                .unwrap_or_else(|| instance.action.icon.clone());
             let _ = crate::events::outbound::devices::update_image(
                 (&instance.context).into(),
-                Some(img),
+                crate::events::outbound::devices::effective_image_for_instance(instance),
             )
             .await;
         }
@@ -369,16 +355,11 @@ pub async fn set_selected_profile(device: String, id: String) -> Result<(), anyh
         } else {
             // Multi/Toggle parent instances are built-in and don't have a real plugin process.
             // Avoid queuing `willAppear`, but do ensure a visible icon is pushed after `clear_screen()`.
-            let img = instance
-                .states
-                .get(instance.current_state as usize)
-                .map(|s| s.image.trim())
-                .filter(|s| !s.is_empty() && *s != "actionDefaultImage")
-                .map(|s| s.to_owned())
-                .unwrap_or_else(|| instance.action.icon.clone());
-            let _ =
-                crate::events::outbound::devices::update_image_for_instance(instance, Some(img))
-                    .await;
+            let _ = crate::events::outbound::devices::update_image_for_instance(
+                instance,
+                crate::events::outbound::devices::effective_image_for_instance(instance),
+            )
+            .await;
 
             for child in instance.children.as_ref().unwrap() {
                 let _ = crate::events::outbound::will_appear::will_appear(child).await;

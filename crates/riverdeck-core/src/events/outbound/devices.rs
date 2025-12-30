@@ -53,6 +53,29 @@ pub async fn update_image(
     update_image_with_overlays(context, image, None).await
 }
 
+pub fn effective_image_for_instance(instance: &ActionInstance) -> Option<String> {
+    let st = instance
+        .states
+        .get(instance.current_state as usize)
+        .or_else(|| instance.states.first())?;
+
+    if !st.show_icon {
+        return None;
+    }
+
+    let img = st.image.trim();
+    if !img.is_empty() && img != "actionDefaultImage" {
+        return Some(img.to_owned());
+    }
+
+    let icon = instance.action.icon.trim();
+    if icon.is_empty() {
+        None
+    } else {
+        Some(icon.to_owned())
+    }
+}
+
 pub fn overlays_for_instance(instance: &ActionInstance) -> Option<Vec<LabelOverlay>> {
     let st = instance.states.get(instance.current_state as usize)?;
 

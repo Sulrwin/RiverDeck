@@ -1,6 +1,6 @@
 use riverdeck_core::{application_watcher, elgato, plugins, shared, ui};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -1485,9 +1485,23 @@ struct RiverDeckApp {
     button_label_input: String,
     button_label_placement: shared::TextPlacement,
     button_show_title: bool,
+    button_show_icon: bool,
     button_show_action_name: bool,
     button_label_size: u16,
     button_label_color: egui::Color32,
+
+    // Multi Action / Toggle Action: step editor window state.
+    step_editor_open: Option<shared::ActionContext>,
+    step_editor_parent: Option<shared::ActionContext>,
+    // Separate per-step label editor draft (so the main editor doesn't jump around).
+    step_button_label_context: Option<shared::ActionContext>,
+    step_button_label_input: String,
+    step_button_label_placement: shared::TextPlacement,
+    step_button_show_title: bool,
+    step_button_show_icon: bool,
+    step_button_show_action_name: bool,
+    step_button_label_size: u16,
+    step_button_label_color: egui::Color32,
     // Native action options editor (replaces PI for supported actions).
     options_editor_context: Option<shared::ActionContext>,
     // Schema-driven action options editor (host registry; covers PI-based actions).
@@ -1513,6 +1527,10 @@ struct RiverDeckApp {
     sp_device_brightness_value: i32,     // 0..=100
     action_search: String,
     texture_cache: HashMap<String, CachedTexture>,
+    texture_cache_tick: u64,
+    texture_jobs_rx: tokio_mpsc::UnboundedReceiver<TextureJobResult>,
+    texture_jobs_tx: tokio_mpsc::UnboundedSender<TextureJobResult>,
+    texture_inflight: HashSet<String>,
 
     // Cached async data to avoid blocking the UI thread during paint.
     categories_cache: Option<Vec<(String, shared::Category)>>,
@@ -1532,6 +1550,7 @@ struct RiverDeckApp {
     profile_snapshot_cache: Option<Arc<ProfileSnapshot>>,
     profile_snapshot_rx: Option<mpsc::Receiver<anyhow::Result<ProfileSnapshot>>>,
     profile_snapshot_needs_refresh: bool,
+    profile_snapshot_refresh_scheduled: Option<std::time::Instant>,
     profile_snapshot_error: Option<String>,
 
     action_controller_filter: String,
@@ -1598,6 +1617,9 @@ struct RiverDeckApp {
     preview_center_x: Option<f32>,
     // Cached width of the main preview area so overlays scale like it (not like side panels).
     preview_width: Option<f32>,
+
+    // Optional lightweight profiling (env-gated).
+    perf_last_log: Option<std::time::Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -1714,8 +1736,61 @@ enum DragPayload {
 }
 
 struct CachedTexture {
-    modified: Option<std::time::SystemTime>,
     texture: egui::TextureHandle,
+    last_used: u64,
+}
+
+#[derive(Debug)]
+enum TextureJobKind {
+    Plain {
+        input: TextureJobInput,
+        options: TextureOptionsKind,
+    },
+    Rendered {
+        width: u32,
+        height: u32,
+        input: TextureJobInput,
+        overlays: Vec<shared::LabelOverlay>,
+        round_corners: bool,
+        options: TextureOptionsKind,
+    },
+}
+
+#[derive(Debug)]
+enum TextureJobInput {
+    Empty,
+    DataUrl(String),
+    Bytes(Vec<u8>),
+    File { path: PathBuf, is_svg: bool },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TextureOptionsKind {
+    Linear,
+    Nearest,
+}
+
+impl TextureOptionsKind {
+    fn to_egui(self) -> egui::TextureOptions {
+        match self {
+            TextureOptionsKind::Linear => egui::TextureOptions::LINEAR,
+            TextureOptionsKind::Nearest => egui::TextureOptions::NEAREST,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum TextureJobResult {
+    Ready {
+        key: String,
+        rgba: Vec<u8>,
+        width: u32,
+        height: u32,
+        options: TextureOptionsKind,
+    },
+    Failed {
+        key: String,
+    },
 }
 
 #[derive(Clone)]
@@ -1742,6 +1817,8 @@ struct SnapshotKey {
 }
 
 impl RiverDeckApp {
+    const TEXTURE_CACHE_MAX_ENTRIES: usize = 1024;
+
     const DEVICES_PANEL_DEFAULT_WIDTH: f32 = 200.0; // egui::SidePanel default in egui 0.31.x
     const ACTIONS_PANEL_DEFAULT_WIDTH: f32 = 280.0; // allow Actions panel to be half the previous width
     const POPUP_TITLEBAR_HEIGHT: f32 = 28.0;
@@ -1913,6 +1990,8 @@ impl RiverDeckApp {
         let ppp = cc.egui_ctx.input(|i| i.pixels_per_point);
         Self::apply_theme(&cc.egui_ctx);
 
+        let (texture_jobs_tx, texture_jobs_rx) = tokio_mpsc::unbounded_channel::<TextureJobResult>();
+
         Self {
             runtime,
             ui_events,
@@ -1935,9 +2014,20 @@ impl RiverDeckApp {
             button_label_input: String::new(),
             button_label_placement: shared::TextPlacement::Bottom,
             button_show_title: true,
+            button_show_icon: true,
             button_show_action_name: false,
             button_label_size: 14,
             button_label_color: egui::Color32::WHITE,
+            step_editor_open: None,
+            step_editor_parent: None,
+            step_button_label_context: None,
+            step_button_label_input: String::new(),
+            step_button_label_placement: shared::TextPlacement::Bottom,
+            step_button_show_title: true,
+            step_button_show_icon: true,
+            step_button_show_action_name: false,
+            step_button_label_size: 14,
+            step_button_label_color: egui::Color32::WHITE,
             options_editor_context: None,
             schema_editor_context: None,
             schema_editor_draft: serde_json::Value::Object(serde_json::Map::new()),
@@ -1957,6 +2047,10 @@ impl RiverDeckApp {
             sp_device_brightness_value: 50,
             action_search: String::new(),
             texture_cache: HashMap::new(),
+            texture_cache_tick: 0,
+            texture_jobs_rx,
+            texture_jobs_tx,
+            texture_inflight: HashSet::new(),
             categories_cache: None,
             categories_inflight: false,
             categories_rx: None,
@@ -1971,6 +2065,7 @@ impl RiverDeckApp {
             profile_snapshot_cache: None,
             profile_snapshot_rx: None,
             profile_snapshot_needs_refresh: false,
+            profile_snapshot_refresh_scheduled: None,
             profile_snapshot_error: None,
 
             action_controller_filter: "Keypad".to_owned(),
@@ -2012,6 +2107,7 @@ impl RiverDeckApp {
             icon_library_error: None,
             preview_center_x: None,
             preview_width: None,
+            perf_last_log: None,
         }
     }
 
@@ -2034,6 +2130,172 @@ impl RiverDeckApp {
             }
             _ => None,
         }
+    }
+
+    fn poll_texture_jobs(&mut self, ctx: &egui::Context) {
+        // Drain completed decode/render jobs without blocking the UI thread.
+        loop {
+            match self.texture_jobs_rx.try_recv() {
+                Ok(TextureJobResult::Ready {
+                    key,
+                    rgba,
+                    width,
+                    height,
+                    options,
+                }) => {
+                    self.texture_inflight.remove(&key);
+
+                    if width == 0 || height == 0 {
+                        continue;
+                    }
+                    let expected = (width as usize)
+                        .saturating_mul(height as usize)
+                        .saturating_mul(4);
+                    if rgba.len() != expected {
+                        continue;
+                    }
+
+                    let size = [width as usize, height as usize];
+                    let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &rgba);
+                    let tex = ctx.load_texture(
+                        format!("riverdeck_image:{key}"),
+                        color_image,
+                        options.to_egui(),
+                    );
+                    self.insert_cached_texture(key, tex);
+                    ctx.request_repaint();
+                }
+                Ok(TextureJobResult::Failed { key }) => {
+                    self.texture_inflight.remove(&key);
+                }
+                Err(tokio_mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio_mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+    }
+
+    fn texture_cache_is_pinned(key: &str) -> bool {
+        key == "riverdeck_embedded_logo"
+    }
+
+    fn touch_cached_texture(&mut self, key: &str) -> Option<egui::TextureHandle> {
+        self.texture_cache_tick = self.texture_cache_tick.wrapping_add(1);
+        let tick = self.texture_cache_tick;
+        let entry = self.texture_cache.get_mut(key)?;
+        entry.last_used = tick;
+        Some(entry.texture.clone())
+    }
+
+    fn insert_cached_texture(&mut self, key: String, texture: egui::TextureHandle) {
+        self.texture_cache_tick = self.texture_cache_tick.wrapping_add(1);
+        let tick = self.texture_cache_tick;
+        self.texture_cache.insert(
+            key,
+            CachedTexture {
+                texture,
+                last_used: tick,
+            },
+        );
+        self.evict_texture_cache_if_needed();
+    }
+
+    fn evict_texture_cache_if_needed(&mut self) {
+        while self.texture_cache.len() > Self::TEXTURE_CACHE_MAX_ENTRIES {
+            // Evict the least-recently-used entry (excluding pinned keys).
+            let mut lru_key: Option<String> = None;
+            let mut lru_tick: u64 = u64::MAX;
+            for (k, v) in self.texture_cache.iter() {
+                if Self::texture_cache_is_pinned(k) {
+                    continue;
+                }
+                if v.last_used < lru_tick {
+                    lru_tick = v.last_used;
+                    lru_key = Some(k.clone());
+                }
+            }
+            let Some(k) = lru_key else {
+                break;
+            };
+            self.texture_cache.remove(&k);
+        }
+    }
+
+    fn prefetch_snapshot_textures(
+        &mut self,
+        ctx: &egui::Context,
+        device: &shared::DeviceInfo,
+        snapshot: &ProfileSnapshot,
+    ) {
+        // Keypad key previews.
+        let (kw, kh) = riverdeck_core::render::device::key_image_size_for_device_type(device.r#type);
+        for inst in snapshot.keys.iter().filter_map(|v| v.as_ref()) {
+            let st = inst
+                .states
+                .get(inst.current_state as usize)
+                .or_else(|| inst.states.first());
+            let mut state_img = st
+                .map(|s| s.image.trim())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(inst.action.icon.trim());
+            if state_img == "actionDefaultImage" {
+                state_img = inst.action.icon.trim();
+            }
+            let overlays =
+                riverdeck_core::events::outbound::devices::overlays_for_instance(inst)
+                    .unwrap_or_default();
+            let _ = self.rendered_texture_for_size(ctx, "keypad", kw, kh, state_img, &overlays);
+        }
+
+        // Encoder dial previews (Stream Deck+ today).
+        let (iw, ih) = if device.r#type == 7 {
+            (72u32, 72u32)
+        } else {
+            (72u32, 72u32)
+        };
+        for inst in snapshot.sliders.iter().filter_map(|v| v.as_ref()) {
+            let st = inst
+                .states
+                .get(inst.current_state as usize)
+                .or_else(|| inst.states.first());
+            let mut state_img = st
+                .map(|s| s.image.trim())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(inst.action.icon.trim());
+            if state_img == "actionDefaultImage" {
+                state_img = inst.action.icon.trim();
+            }
+            let overlays =
+                riverdeck_core::events::outbound::devices::overlays_for_instance(inst)
+                    .unwrap_or_default();
+            let _ = self.rendered_texture_for_size(ctx, "encoder", iw, ih, state_img, &overlays);
+        }
+
+        // Stream Deck+ strip background.
+        if let Some(bg) = snapshot.encoder_screen_background.as_deref() {
+            let _ = self.texture_for_path(ctx, bg);
+        }
+    }
+
+    fn ensure_texture_job(&mut self, ctx: &egui::Context, key: String, job: TextureJobKind) {
+        if self.texture_cache.contains_key(&key) {
+            return;
+        }
+        if !self.texture_inflight.insert(key.clone()) {
+            return;
+        }
+
+        let tx = self.texture_jobs_tx.clone();
+        let egui_ctx = ctx.clone();
+        let key_for_job = key.clone();
+        self.runtime.spawn(async move {
+            // Do disk I/O + decoding + image processing off-thread.
+            let msg = match tokio::task::spawn_blocking(move || run_texture_job(&key_for_job, job)).await {
+                Ok(Ok(msg)) => msg,
+                _ => TextureJobResult::Failed { key },
+            };
+            let _ = tx.send(msg);
+            egui_ctx.request_repaint();
+        });
     }
 
     fn ensure_options_editor_state(
@@ -2649,14 +2911,13 @@ impl RiverDeckApp {
             };
 
             let is_multi_action = shared::is_multi_action_uuid(instance.action.uuid.as_str());
+            let is_toggle_action = shared::is_toggle_action_uuid(instance.action.uuid.as_str());
             let has_native_options =
                 Self::native_options_kind(instance.action.uuid.as_str()).is_some();
             let has_schema =
                 riverdeck_core::options_schema::get_schema(instance.action.uuid.as_str()).is_some();
-            let show_right = is_multi_action
-                || shared::is_toggle_action_uuid(instance.action.uuid.as_str())
-                || has_native_options
-                || has_schema;
+            let show_right =
+                is_multi_action || is_toggle_action || has_native_options || has_schema;
 
             // Two-column mode: fill the overlay height so the per-column scroll areas can take
             // the full vertical space. We subtract the frame's vertical inner margin so the
@@ -2687,6 +2948,7 @@ impl RiverDeckApp {
                     .map(|s| s.text_placement)
                     .unwrap_or(shared::TextPlacement::Bottom);
                 self.button_show_title = st.map(|s| s.show).unwrap_or(true);
+                self.button_show_icon = st.map(|s| s.show_icon).unwrap_or(true);
                 self.button_show_action_name = st.map(|s| s.show_action_name).unwrap_or(false);
                 self.button_label_size = st.map(|s| s.size.0).unwrap_or(14);
                 self.button_label_color = st
@@ -2801,6 +3063,10 @@ impl RiverDeckApp {
                                             self.draw_action_editor_multi_action_right_column(
                                                 ui, ctx, instance,
                                             );
+                                        } else if is_toggle_action {
+                                            self.draw_action_editor_toggle_action_right_column(
+                                                ui, ctx, instance,
+                                            );
                                         } else if has_schema {
                                             self.draw_action_editor_schema_right_column(
                                                 ui, instance,
@@ -2811,7 +3077,7 @@ impl RiverDeckApp {
                                             );
                                         } else {
                                             ui.label(
-                                                egui::RichText::new("Toggle Action")
+                                                egui::RichText::new("No options")
                                                     .small()
                                                     .color(ui.visuals().weak_text_color()),
                                             );
@@ -2892,6 +3158,7 @@ impl RiverDeckApp {
         );
 
         ui.horizontal(|ui| {
+            ui.checkbox(&mut self.button_show_icon, "Show icon");
             ui.checkbox(&mut self.button_show_action_name, "Show action name");
             ui.checkbox(&mut self.button_show_title, "Show title");
         });
@@ -2983,6 +3250,7 @@ impl RiverDeckApp {
                 let text = self.button_label_input.clone();
                 let placement = self.button_label_placement;
                 let show_title = self.button_show_title;
+                let show_icon = self.button_show_icon;
                 let show_action_name = self.button_show_action_name;
                 let size = self.button_label_size;
                 let colour = color32_to_hex_rgb(self.button_label_color);
@@ -3008,6 +3276,11 @@ impl RiverDeckApp {
                     let _ = riverdeck_core::api::instances::set_button_show_title(
                         ctx_to_set.clone(),
                         show_title,
+                    )
+                    .await;
+                    let _ = riverdeck_core::api::instances::set_button_show_icon(
+                        ctx_to_set.clone(),
+                        show_icon,
                     )
                     .await;
                     let _ = riverdeck_core::api::instances::set_button_show_action_name(
@@ -3185,18 +3458,32 @@ impl RiverDeckApp {
                         if let Some(tex) = self.texture_for_path(ctx, &img) {
                             ui.image((tex.id(), icon_size));
                         } else {
-                            ui.allocate_exact_size(icon_size, egui::Sense::hover());
+                            ui.allocate_ui_with_layout(
+                                icon_size,
+                                egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+                                |ui| {
+                                    ui.label(
+                                        egui::RichText::new("?")
+                                            .small()
+                                            .color(ui.visuals().weak_text_color()),
+                                    );
+                                },
+                            );
                         }
 
-                        ui.add(egui::Label::new(child.action.name.trim()).truncate());
+                        ui.add(
+                            egui::Label::new(format!(
+                                "Step {}: {}",
+                                idx + 1,
+                                child.action.name.trim()
+                            ))
+                            .truncate(),
+                        );
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let btn_w = 22.0;
-                            let btn = |text: &'static str| {
-                                egui::Button::new(text).min_size(egui::vec2(btn_w, 0.0))
-                            };
+                            let btn = |text: &'static str| egui::Button::new(text).small();
 
-                            if ui.add(btn("✕")).on_hover_text("Remove step").clicked() {
+                            if ui.add(btn("Remove")).on_hover_text("Remove step").clicked() {
                                 let ctx_to_remove = child.context.clone();
                                 self.runtime.spawn(async move {
                                     let _ = riverdeck_core::api::instances::remove_instance(
@@ -3207,7 +3494,11 @@ impl RiverDeckApp {
                             }
 
                             let parent_ctx = instance.context.clone();
-                            if ui.add_enabled(idx + 1 < children.len(), btn("↓")).clicked() {
+                            if ui
+                                .add_enabled(idx + 1 < children.len(), btn("Down"))
+                                .on_hover_text("Move step down")
+                                .clicked()
+                            {
                                 let from = idx;
                                 let to = idx + 1;
                                 self.runtime.spawn(async move {
@@ -3220,7 +3511,11 @@ impl RiverDeckApp {
                             }
 
                             let parent_ctx = instance.context.clone();
-                            if ui.add_enabled(idx > 0, btn("↑")).clicked() {
+                            if ui
+                                .add_enabled(idx > 0, btn("Up"))
+                                .on_hover_text("Move step up")
+                                .clicked()
+                            {
                                 let from = idx;
                                 let to = idx - 1;
                                 self.runtime.spawn(async move {
@@ -3230,6 +3525,13 @@ impl RiverDeckApp {
                                         )
                                         .await;
                                 });
+                            }
+
+                            if ui.add(btn("Edit")).on_hover_text("Edit step").clicked() {
+                                self.open_step_editor(
+                                    instance.context.clone(),
+                                    child.context.clone(),
+                                );
                             }
                         });
                     });
@@ -3241,6 +3543,133 @@ impl RiverDeckApp {
         ui.add(
             egui::Label::new(
                 egui::RichText::new("Tip: drag actions onto this button to add steps.")
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+            )
+            .wrap(),
+        );
+    }
+
+    fn draw_action_editor_toggle_action_right_column(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        instance: &shared::ActionInstance,
+    ) {
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new("Toggle Action").strong());
+
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new("States").strong());
+        if let Some(children) = instance.children.as_ref() {
+            if children.is_empty() {
+                ui.label(
+                    egui::RichText::new(
+                        "No states yet. Drag actions onto this button to add states.",
+                    )
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+                );
+            } else {
+                for (idx, child) in children.iter().enumerate() {
+                    ui.horizontal_wrapped(|ui| {
+                        let icon_size = egui::vec2(20.0, 20.0);
+                        let img = child
+                            .states
+                            .get(child.current_state as usize)
+                            .map(|s| s.image.trim())
+                            .filter(|s| !s.is_empty() && *s != "actionDefaultImage")
+                            .map(|s| s.to_owned())
+                            .unwrap_or_else(|| child.action.icon.clone());
+                        if let Some(tex) = self.texture_for_path(ctx, &img) {
+                            ui.image((tex.id(), icon_size));
+                        } else {
+                            ui.allocate_ui_with_layout(
+                                icon_size,
+                                egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+                                |ui| {
+                                    ui.label(
+                                        egui::RichText::new("?")
+                                            .small()
+                                            .color(ui.visuals().weak_text_color()),
+                                    );
+                                },
+                            );
+                        }
+
+                        let mut label = format!("State {}: {}", idx + 1, child.action.name.trim());
+                        if idx == instance.current_state as usize {
+                            label = format!("{label} (current)");
+                        }
+                        ui.add(egui::Label::new(label).truncate());
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let btn = |text: &'static str| egui::Button::new(text).small();
+
+                            if ui
+                                .add(btn("Remove"))
+                                .on_hover_text("Remove state")
+                                .clicked()
+                            {
+                                let ctx_to_remove = child.context.clone();
+                                self.runtime.spawn(async move {
+                                    let _ = riverdeck_core::api::instances::remove_instance(
+                                        ctx_to_remove,
+                                    )
+                                    .await;
+                                });
+                            }
+
+                            let parent_ctx = instance.context.clone();
+                            if ui
+                                .add_enabled(idx + 1 < children.len(), btn("Down"))
+                                .on_hover_text("Move state down")
+                                .clicked()
+                            {
+                                let from = idx;
+                                let to = idx + 1;
+                                self.runtime.spawn(async move {
+                                    let _ =
+                                        riverdeck_core::api::instances::reorder_toggle_action_child(
+                                            parent_ctx, from, to,
+                                        )
+                                        .await;
+                                });
+                            }
+
+                            let parent_ctx = instance.context.clone();
+                            if ui
+                                .add_enabled(idx > 0, btn("Up"))
+                                .on_hover_text("Move state up")
+                                .clicked()
+                            {
+                                let from = idx;
+                                let to = idx - 1;
+                                self.runtime.spawn(async move {
+                                    let _ =
+                                        riverdeck_core::api::instances::reorder_toggle_action_child(
+                                            parent_ctx, from, to,
+                                        )
+                                        .await;
+                                });
+                            }
+
+                            if ui.add(btn("Edit")).on_hover_text("Edit state").clicked() {
+                                self.open_step_editor(
+                                    instance.context.clone(),
+                                    child.context.clone(),
+                                );
+                            }
+                        });
+                    });
+                }
+            }
+        }
+
+        ui.add_space(4.0);
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new("Tip: drag actions onto this button to add states.")
                     .small()
                     .color(ui.visuals().weak_text_color()),
             )
@@ -3287,42 +3716,24 @@ impl RiverDeckApp {
 
         // Support plugin-provided data URLs (common for `setImage`).
         if path.starts_with("data:") {
-            use base64::Engine as _;
             use std::hash::{Hash, Hasher};
 
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             path.hash(&mut hasher);
             let key = format!("riverdeck_data:{:x}", hasher.finish());
 
-            if let Some(cached) = self.texture_cache.get(&key) {
-                return Some(cached.texture.clone());
+            if let Some(tex) = self.touch_cached_texture(&key) {
+                return Some(tex);
             }
-
-            let bytes = if path.contains(";base64,") {
-                let (_meta, b64) = path.split_once(";base64,")?;
-                base64::engine::general_purpose::STANDARD.decode(b64).ok()?
-            } else {
-                let (_meta, raw) = path.split_once(',')?;
-                raw.as_bytes().to_vec()
-            };
-
-            let img = image::load_from_memory(&bytes).ok()?.into_rgba8();
-            let size = [img.width() as usize, img.height() as usize];
-            let color_image = egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw());
-
-            let texture = ctx.load_texture(
-                format!("riverdeck_image:{key}"),
-                color_image,
-                egui::TextureOptions::LINEAR,
-            );
-            self.texture_cache.insert(
-                key,
-                CachedTexture {
-                    modified: None,
-                    texture: texture.clone(),
+            self.ensure_texture_job(
+                ctx,
+                key.clone(),
+                TextureJobKind::Plain {
+                    input: TextureJobInput::DataUrl(path.to_owned()),
+                    options: TextureOptionsKind::Linear,
                 },
             );
-            return Some(texture);
+            return None;
         }
 
         // Core prefers `.svg` when present (see `shared::convert_icon`), but egui can't render SVG directly.
@@ -3359,107 +3770,24 @@ impl RiverDeckApp {
                 continue;
             };
             let cache_key = resolved.to_string_lossy().into_owned();
-            if !resolved.is_file() {
-                self.texture_cache.remove(&cache_key);
-                continue;
+            if let Some(tex) = self.touch_cached_texture(&cache_key) {
+                return Some(tex);
             }
 
-            let modified = fs::metadata(&resolved).ok().and_then(|m| m.modified().ok());
-            if let Some(cached) = self.texture_cache.get(&cache_key)
-                && cached.modified == modified
-            {
-                return Some(cached.texture.clone());
-            }
-
-            let img = if is_svg {
-                // Convert SVG to PNG using the same logic as elgato.rs
-                let svg_data = std::fs::read(&resolved).ok()?;
-                riverdeck_core::convert_svg_to_image(&svg_data)
-                    .ok()?
-                    .into_rgba8()
-            } else {
-                image::open(&resolved).ok()?.into_rgba8()
-            };
-
-            let size = [img.width() as usize, img.height() as usize];
-            let color_image = egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw());
-
-            let texture = ctx.load_texture(
-                format!("riverdeck_image:{cache_key}"),
-                color_image,
-                egui::TextureOptions::LINEAR,
-            );
-            self.texture_cache.insert(
-                cache_key,
-                CachedTexture {
-                    modified,
-                    texture: texture.clone(),
+            self.ensure_texture_job(
+                ctx,
+                cache_key.clone(),
+                TextureJobKind::Plain {
+                    input: TextureJobInput::File {
+                        path: resolved,
+                        is_svg,
+                    },
+                    options: TextureOptionsKind::Linear,
                 },
             );
-            return Some(texture);
-        }
-
-        None
-    }
-
-    fn load_dynamic_image_for_preview(&self, path: &str) -> Option<image::DynamicImage> {
-        let path = path.trim();
-        if path.is_empty() {
             return None;
         }
 
-        // Support plugin-provided data URLs (common for `setImage`).
-        if path.starts_with("data:") {
-            use base64::Engine as _;
-            let bytes = if path.contains(";base64,") {
-                let (_meta, b64) = path.split_once(";base64,")?;
-                base64::engine::general_purpose::STANDARD.decode(b64).ok()?
-            } else {
-                let (_meta, raw) = path.split_once(',')?;
-                raw.as_bytes().to_vec()
-            };
-            return image::load_from_memory(&bytes).ok();
-        }
-
-        // Best-effort SVG fallback (egui can't render SVG; neither can the Stream Deck).
-        let (alt1, alt2) = if path.ends_with(".svg") {
-            let base = path.trim_end_matches(".svg");
-            (Some(format!("{base}@2x.png")), Some(format!("{base}.png")))
-        } else {
-            (None, None)
-        };
-
-        let mut candidates: Vec<&str> = Vec::with_capacity(3);
-        candidates.push(path);
-        if let Some(a) = alt1.as_deref() {
-            candidates.push(a);
-        }
-        if let Some(a) = alt2.as_deref() {
-            candidates.push(a);
-        }
-
-        for cand in candidates {
-            // Now support SVG files by converting them on the fly
-            let is_svg = cand.ends_with(".svg");
-            if !(is_svg
-                || cand.ends_with(".png")
-                || cand.ends_with(".jpg")
-                || cand.ends_with(".jpeg")
-                || cand.ends_with(".gif"))
-            {
-                continue;
-            }
-            let resolved = self.resolve_icon_path(cand)?;
-            if resolved.is_file() {
-                if is_svg {
-                    // Convert SVG to PNG
-                    let svg_data = std::fs::read(&resolved).ok()?;
-                    return riverdeck_core::convert_svg_to_image(&svg_data).ok();
-                } else {
-                    return image::open(resolved).ok();
-                }
-            }
-        }
         None
     }
 
@@ -3475,31 +3803,15 @@ impl RiverDeckApp {
         use std::hash::{Hash, Hasher};
 
         let base_image = base_image.trim();
-        if base_image.is_empty() {
+        if base_image.is_empty() && overlays.is_empty() {
             return None;
         }
-
-        // Resolve for cache invalidation if we can.
-        let (resolved_path, modified) = if base_image.starts_with("data:") {
-            (None, None)
-        } else {
-            let resolved = self.resolve_icon_path(base_image);
-            let modified = resolved
-                .as_ref()
-                .and_then(|p| std::fs::metadata(p).ok())
-                .and_then(|m| m.modified().ok());
-            (resolved, modified)
-        };
 
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         cache_ns.hash(&mut hasher);
         width.hash(&mut hasher);
         height.hash(&mut hasher);
-        resolved_path
-            .as_ref()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|| base_image.to_owned())
-            .hash(&mut hasher);
+        base_image.hash(&mut hasher);
         for o in overlays {
             o.text.hash(&mut hasher);
             o.colour.hash(&mut hasher);
@@ -3515,62 +3827,74 @@ impl RiverDeckApp {
         }
 
         let key = format!("riverdeck_rendered:{:x}", hasher.finish());
-        if let Some(cached) = self.texture_cache.get(&key)
-            && cached.modified == modified
-        {
-            return Some(cached.texture.clone());
+        if let Some(tex) = self.touch_cached_texture(&key) {
+            return Some(tex);
         }
 
-        let dyn_img = self.load_dynamic_image_for_preview(base_image)?;
-        let mut img = dyn_img.resize_exact(width, height, image::imageops::FilterType::Nearest);
-        for o in overlays {
-            img = riverdeck_core::render::label::overlay_label(img, o);
-        }
-        if cache_ns == "keypad" {
-            img = riverdeck_core::render::rounding::round_corners_subtle(img);
-        }
+        let input = if base_image.is_empty() {
+            TextureJobInput::Empty
+        } else if base_image.starts_with("data:") {
+            TextureJobInput::DataUrl(base_image.to_owned())
+        } else {
+            // Use the same SVG fallback strategy as `texture_for_path`.
+            let (alt1, alt2) = if base_image.ends_with(".svg") {
+                let base = base_image.trim_end_matches(".svg");
+                (Some(format!("{base}@2x.png")), Some(format!("{base}.png")))
+            } else {
+                (None, None)
+            };
+            let mut candidates: Vec<&str> = Vec::with_capacity(3);
+            candidates.push(base_image);
+            if let Some(a) = alt1.as_deref() {
+                candidates.push(a);
+            }
+            if let Some(a) = alt2.as_deref() {
+                candidates.push(a);
+            }
+            let mut resolved: Option<(PathBuf, bool)> = None;
+            for cand in candidates {
+                let is_svg = cand.ends_with(".svg");
+                let Some(p) = self.resolve_icon_path(cand) else {
+                    continue;
+                };
+                resolved = Some((p, is_svg));
+                break;
+            }
+            let (path, is_svg) = resolved?;
+            TextureJobInput::File { path, is_svg }
+        };
 
-        let rgba = img.into_rgba8();
-        let size = [rgba.width() as usize, rgba.height() as usize];
-        let color_image = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
-        let texture = ctx.load_texture(
-            format!("riverdeck_image:{key}"),
-            color_image,
-            egui::TextureOptions::NEAREST,
-        );
-        self.texture_cache.insert(
-            key,
-            CachedTexture {
-                modified,
-                texture: texture.clone(),
+        self.ensure_texture_job(
+            ctx,
+            key.clone(),
+            TextureJobKind::Rendered {
+                width,
+                height,
+                input,
+                overlays: overlays.to_vec(),
+                round_corners: cache_ns == "keypad",
+                options: TextureOptionsKind::Nearest,
             },
         );
-        Some(texture)
+        None
     }
 
     fn embedded_logo_texture(&mut self, ctx: &egui::Context) -> Option<egui::TextureHandle> {
         let cache_key = "riverdeck_embedded_logo".to_owned();
-        if let Some(cached) = self.texture_cache.get(&cache_key) {
-            return Some(cached.texture.clone());
+        if let Some(tex) = self.touch_cached_texture(&cache_key) {
+            return Some(tex);
         }
-
-        let bytes = include_bytes!("../../../packaging/icons/icon.png");
-        let img = image::load_from_memory(bytes).ok()?.into_rgba8();
-        let size = [img.width() as usize, img.height() as usize];
-        let color_image = egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw());
-        let texture = ctx.load_texture(
-            "riverdeck_embedded_logo",
-            color_image,
-            egui::TextureOptions::LINEAR,
-        );
-        self.texture_cache.insert(
+        // Decode off-thread; this is tiny but keeps the UI thread "pure" (no image decode).
+        let bytes = include_bytes!("../../../packaging/icons/icon.png").to_vec();
+        self.ensure_texture_job(
+            ctx,
             cache_key,
-            CachedTexture {
-                modified: None,
-                texture: texture.clone(),
+            TextureJobKind::Plain {
+                input: TextureJobInput::Bytes(bytes),
+                options: TextureOptionsKind::Linear,
             },
         );
-        Some(texture)
+        None
     }
 
     fn strip_bg_uv_rect(
@@ -4181,6 +4505,12 @@ impl RiverDeckApp {
             if state_img == "actionDefaultImage" {
                 state_img = instance.action.icon.trim();
             }
+            if st.is_some_and(|s| !s.show_icon) {
+                state_img = "";
+            }
+            if st.is_some_and(|s| !s.show_icon) {
+                state_img = "";
+            }
 
             let overlays =
                 riverdeck_core::events::outbound::devices::overlays_for_instance(instance)
@@ -4401,6 +4731,20 @@ impl RiverDeckApp {
         self.profile_snapshot_error = None;
     }
 
+    fn schedule_profile_snapshot_refresh(&mut self) {
+        // Rate-limit snapshot refreshes. This prevents high-frequency plugin events (setTitle/setImage)
+        // from keeping the UI in a perpetual reload loop.
+        let now = std::time::Instant::now();
+        let debounce = std::time::Duration::from_millis(75);
+        match self.profile_snapshot_refresh_scheduled {
+            None => self.profile_snapshot_refresh_scheduled = Some(now + debounce),
+            Some(t) if t <= now => self.profile_snapshot_refresh_scheduled = Some(now + debounce),
+            Some(_t) => {
+                // Already scheduled soon; keep it (don't keep pushing out).
+            }
+        }
+    }
+
     fn ensure_selected_profile_fetch(&mut self, ctx: &egui::Context, device_id: String) {
         if self.selected_profile_rx.is_some() {
             return;
@@ -4513,18 +4857,18 @@ impl RiverDeckApp {
                         if self.selected_device.as_deref() == Some(context.device.as_str())
                             && self.selected_profile == context.profile
                         {
-                            self.profile_snapshot_needs_refresh = true;
+                            self.schedule_profile_snapshot_refresh();
                         }
                     }
                     ui::UiEvent::RerenderImages { device } => {
                         // Typically fired after device connect; only relevant to the selected device.
                         if self.selected_device.as_deref() == Some(device.as_str()) {
-                            self.profile_snapshot_needs_refresh = true;
+                            self.schedule_profile_snapshot_refresh();
                         }
                     }
                     ui::UiEvent::DevicesUpdated => {
                         // Device list / selected device state may have changed.
-                        self.profile_snapshot_needs_refresh = true;
+                        self.schedule_profile_snapshot_refresh();
                     }
                     _ => {}
                 },
@@ -4795,6 +5139,47 @@ impl RiverDeckApp {
                 });
             });
     }
+
+    fn find_instance_in_snapshot<'a>(
+        snapshot: &'a ProfileSnapshot,
+        ctx: &shared::ActionContext,
+    ) -> Option<&'a shared::ActionInstance> {
+        fn find_in_instance<'a>(
+            instance: &'a shared::ActionInstance,
+            ctx: &shared::ActionContext,
+        ) -> Option<&'a shared::ActionInstance> {
+            if &instance.context == ctx {
+                return Some(instance);
+            }
+            if let Some(children) = instance.children.as_ref() {
+                for child in children {
+                    if let Some(found) = find_in_instance(child, ctx) {
+                        return Some(found);
+                    }
+                }
+            }
+            None
+        }
+
+        for inst in snapshot.keys.iter().filter_map(|i| i.as_ref()) {
+            if let Some(found) = find_in_instance(inst, ctx) {
+                return Some(found);
+            }
+        }
+        for inst in snapshot.sliders.iter().filter_map(|i| i.as_ref()) {
+            if let Some(found) = find_in_instance(inst, ctx) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    fn open_step_editor(&mut self, parent: shared::ActionContext, child: shared::ActionContext) {
+        self.step_editor_parent = Some(parent);
+        self.step_editor_open = Some(child);
+        // Force draft reset on next frame.
+        self.step_button_label_context = None;
+    }
 }
 
 fn open_url_in_browser(url: &str) {
@@ -4814,14 +5199,132 @@ fn open_url_in_browser(url: &str) {
     }
 }
 
+fn decode_data_url_to_bytes(data_url: &str) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    let data_url = data_url.trim();
+    if !data_url.starts_with("data:") {
+        return None;
+    }
+    if data_url.contains(";base64,") {
+        let (_meta, b64) = data_url.split_once(";base64,")?;
+        base64::engine::general_purpose::STANDARD.decode(b64).ok()
+    } else {
+        let (_meta, raw) = data_url.split_once(',')?;
+        Some(raw.as_bytes().to_vec())
+    }
+}
+
+fn decode_input_to_image(input: &TextureJobInput) -> Option<(image::DynamicImage, Option<std::time::SystemTime>)> {
+    match input {
+        TextureJobInput::Empty => None,
+        TextureJobInput::DataUrl(s) => {
+            let bytes = decode_data_url_to_bytes(s)?;
+            let img = image::load_from_memory(&bytes).ok()?;
+            Some((img, None))
+        }
+        TextureJobInput::Bytes(bytes) => {
+            let img = image::load_from_memory(bytes).ok()?;
+            Some((img, None))
+        }
+        TextureJobInput::File { path, is_svg } => {
+            let modified = std::fs::metadata(path).ok().and_then(|m| m.modified().ok());
+            let bytes = std::fs::read(path).ok()?;
+            let img = if *is_svg {
+                riverdeck_core::convert_svg_to_image(&bytes).ok()?
+            } else {
+                image::load_from_memory(&bytes).ok()?
+            };
+            Some((img, modified))
+        }
+    }
+}
+
+fn run_texture_job(key: &str, job: TextureJobKind) -> anyhow::Result<TextureJobResult> {
+    // Preview textures in the UI do not need to be full-resolution images from disk.
+    // Downscale aggressively to keep texture uploads fast and memory bounded.
+    const MAX_PREVIEW_TEX_DIM: u32 = 1024;
+
+    match job {
+        TextureJobKind::Plain { input, options } => {
+            let (mut img, _modified) = decode_input_to_image(&input).ok_or_else(|| {
+                anyhow::anyhow!("failed to decode image for texture job (plain)")
+            })?;
+            let (w0, h0) = (img.width(), img.height());
+            let max0 = w0.max(h0);
+            if max0 > MAX_PREVIEW_TEX_DIM {
+                img = img.resize(
+                    MAX_PREVIEW_TEX_DIM,
+                    MAX_PREVIEW_TEX_DIM,
+                    image::imageops::FilterType::Triangle,
+                );
+            }
+            let rgba = img.into_rgba8();
+            let (w, h) = (rgba.width(), rgba.height());
+            Ok(TextureJobResult::Ready {
+                key: key.to_owned(),
+                rgba: rgba.into_raw(),
+                width: w,
+                height: h,
+                options,
+            })
+        }
+        TextureJobKind::Rendered {
+            width,
+            height,
+            input,
+            overlays,
+            round_corners,
+            options,
+        } => {
+            let (dyn_img, _modified) = if matches!(input, TextureJobInput::Empty) {
+                (
+                    image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+                        width.max(1),
+                        height.max(1),
+                        image::Rgba([0, 0, 0, 255]),
+                    )),
+                    None,
+                )
+            } else {
+                decode_input_to_image(&input).ok_or_else(|| {
+                    anyhow::anyhow!("failed to decode image for texture job (rendered)")
+                })?
+            };
+
+            let mut img = dyn_img.resize_exact(width, height, image::imageops::FilterType::Nearest);
+            for o in overlays.iter() {
+                img = riverdeck_core::render::label::overlay_label(img, o);
+            }
+            if round_corners {
+                img = riverdeck_core::render::rounding::round_corners_subtle(img);
+            }
+
+            let rgba = img.into_rgba8();
+            let (w, h) = (rgba.width(), rgba.height());
+            Ok(TextureJobResult::Ready {
+                key: key.to_owned(),
+                rgba: rgba.into_raw(),
+                width: w,
+                height: h,
+                options,
+            })
+        }
+    }
+}
+
 impl eframe::App for RiverDeckApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let frame_start = std::time::Instant::now();
+
         // Theme is applied once (in `new`) and only re-applied if the UI scale changes.
         let ppp = ctx.input(|i| i.pixels_per_point);
         if (ppp - self.last_pixels_per_point).abs() > 0.0001 {
             self.last_pixels_per_point = ppp;
             Self::apply_theme(ctx);
         }
+
+        // Apply any completed async texture decode/render work before drawing.
+        self.poll_texture_jobs(ctx);
 
         // `tray-icon` on Linux uses GTK/AppIndicator under the hood, which relies on GLib to
         // process DBus registration events. eframe/winit does not run a GTK mainloop, so we
@@ -4894,6 +5397,17 @@ impl eframe::App for RiverDeckApp {
 
         self.poll_ui_events();
 
+        // Apply any scheduled snapshot refresh (rate-limited).
+        if let Some(t) = self.profile_snapshot_refresh_scheduled {
+            let now = std::time::Instant::now();
+            if now >= t {
+                self.profile_snapshot_refresh_scheduled = None;
+                self.profile_snapshot_needs_refresh = true;
+            } else {
+                ctx.request_repaint_after(t - now);
+            }
+        }
+
         // Poll async cache fetches without blocking the UI thread.
         // If any fetch is in-flight, we schedule a low-frequency repaint to pick up the result.
         let mut pending_async = false;
@@ -4946,6 +5460,27 @@ impl eframe::App for RiverDeckApp {
                     self.pages_inflight = None;
                     self.pages_rx = None;
                 }
+            }
+        }
+
+        // Optional lightweight perf logging (once per second).
+        // Enable with: `RIVERDECK_PERF_LOG=1`
+        if env_truthy("RIVERDECK_PERF_LOG") {
+            let now = std::time::Instant::now();
+            let should_log = self
+                .perf_last_log
+                .is_none_or(|t| now.duration_since(t) >= std::time::Duration::from_secs(1));
+            if should_log {
+                self.perf_last_log = Some(now);
+                let frame_ms = frame_start.elapsed().as_secs_f64() * 1000.0;
+                log::info!(
+                    "perf: frame_ms={:.2} textures(cache={}, inflight={}) snapshot(rx={}, cached={})",
+                    frame_ms,
+                    self.texture_cache.len(),
+                    self.texture_inflight.len(),
+                    self.profile_snapshot_rx.is_some(),
+                    self.profile_snapshot_cache.is_some()
+                );
             }
         }
 
@@ -5303,7 +5838,11 @@ impl eframe::App for RiverDeckApp {
                     self.profile_snapshot_rx = None;
                     match res {
                         Ok(s) => {
-                            self.profile_snapshot_cache = Some(Arc::new(s));
+                            let arc = Arc::new(s);
+                            if let Some(device) = selected_device.as_ref() {
+                                self.prefetch_snapshot_textures(ctx, device, arc.as_ref());
+                            }
+                            self.profile_snapshot_cache = Some(arc);
                         }
                         Err(e) => {
                             self.profile_snapshot_cache = None;
@@ -6321,6 +6860,313 @@ impl eframe::App for RiverDeckApp {
                 }
                 if !open {
                     self.show_manage_plugins = false;
+                }
+            }
+
+            if self.step_editor_open.is_some() {
+                let mut window_open = true;
+                let mut should_close = false;
+                egui::Window::new("Edit step")
+                    .open(&mut window_open)
+                    // The main Action Editor is an `egui::Area` rendered in the Foreground layer.
+                    // Keep the step editor above it so the window stays interactive.
+                    .order(egui::Order::Foreground)
+                    .collapsible(false)
+                    .resizable(true)
+                    .default_width(860.0)
+                    .default_height(560.0)
+                    .min_width(720.0)
+                    .max_width(1200.0)
+                    .min_height(420.0)
+                    .max_height(900.0)
+                    .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                    .show(ctx, |ui| {
+                        let snapshot = self.profile_snapshot_cache.clone();
+                        let Some(snapshot) = snapshot.as_ref() else {
+                            ui.label(
+                                egui::RichText::new("Loading…")
+                                    .small()
+                                    .color(ui.visuals().weak_text_color()),
+                            );
+                            return;
+                        };
+
+                        let Some(step_ctx) = self.step_editor_open.clone() else {
+                            return;
+                        };
+                        let Some(step_instance) =
+                            Self::find_instance_in_snapshot(snapshot.as_ref(), &step_ctx).cloned()
+                        else {
+                            ui.colored_label(
+                                ui.visuals().error_fg_color,
+                                "Step not found (it may have been removed).",
+                            );
+                            should_close = true;
+                            return;
+                        };
+
+                        // Best-effort device lookup for native option editors.
+                        let device = riverdeck_core::shared::DEVICES
+                            .get(&step_ctx.device)
+                            .map(|d| d.clone());
+
+                        // Determine whether this is a Multi Action step or Toggle Action state.
+                        let (parent_kind, ordinal) = self
+                            .step_editor_parent
+                            .as_ref()
+                            .and_then(|p| {
+                                Self::find_instance_in_snapshot(snapshot.as_ref(), p).map(|inst| {
+                                    let is_toggle = shared::is_toggle_action_uuid(
+                                        inst.action.uuid.as_str(),
+                                    );
+                                    (
+                                        if is_toggle { "Toggle Action" } else { "Multi Action" },
+                                        if is_toggle { "State" } else { "Step" },
+                                    )
+                                })
+                            })
+                            .unwrap_or(("Multi Action", "Step"));
+
+                        // Header
+                        ui.horizontal(|ui| {
+                            if ui.button("Close").clicked() {
+                                should_close = true;
+                            }
+                            ui.add_space(8.0);
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{parent_kind} → {ordinal} {}",
+                                    step_ctx.index
+                                ))
+                                .strong(),
+                            );
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(
+                                egui::RichText::new(step_instance.action.name.trim())
+                                        .small()
+                                        .color(ui.visuals().weak_text_color()),
+                                );
+                            });
+                        });
+                        ui.separator();
+
+                        // Reset per-step label draft when switching which step is open.
+                        let needs_reset = match self.step_button_label_context.as_ref() {
+                            None => true,
+                            Some(c) => c != &step_ctx,
+                        };
+                        if needs_reset {
+                            self.step_button_label_context = Some(step_ctx.clone());
+                            let st = step_instance.states.get(step_instance.current_state as usize);
+                            self.step_button_label_input = st
+                                .map(|s| s.text.clone())
+                                .unwrap_or_else(|| step_instance.action.name.clone());
+                            self.step_button_label_placement = st
+                                .map(|s| s.text_placement)
+                                .unwrap_or(shared::TextPlacement::Bottom);
+                            self.step_button_show_title = st.map(|s| s.show).unwrap_or(true);
+                            self.step_button_show_icon = st.map(|s| s.show_icon).unwrap_or(true);
+                            self.step_button_show_action_name =
+                                st.map(|s| s.show_action_name).unwrap_or(false);
+                            self.step_button_label_size = st.map(|s| s.size.0).unwrap_or(14);
+                            self.step_button_label_color = st
+                                .and_then(|s| parse_hex_color32(&s.colour))
+                                .unwrap_or(egui::Color32::WHITE);
+                        }
+
+                        let has_native_options = Self::native_options_kind(
+                            step_instance.action.uuid.as_str(),
+                        )
+                        .is_some();
+                        let has_schema = riverdeck_core::options_schema::get_schema(
+                            step_instance.action.uuid.as_str(),
+                        )
+                        .is_some();
+
+                        if has_native_options && let Some(device) = device.as_ref() {
+                            self.ensure_options_editor_state(device, &step_instance);
+                        }
+                        if has_schema {
+                            self.ensure_schema_editor_state(&step_instance);
+                        }
+
+                        let gap = 10.0;
+                        // In auto-sized windows, `available_width/height` can be non-finite.
+                        // Clamp to avoid runaway sizing.
+                        let avail_w = {
+                            let w = ui.available_width();
+                            if w.is_finite() {
+                                w.clamp(0.0, 1200.0)
+                            } else {
+                                860.0
+                            }
+                        };
+                        let usable = (avail_w - gap).max(0.0);
+                        let col_w = (usable * 0.5).max(0.0);
+                        let row_h = {
+                            let h = ui.available_height();
+                            if h.is_finite() {
+                                h.clamp(0.0, 900.0)
+                            } else {
+                                560.0
+                            }
+                        };
+
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(avail_w, row_h),
+                            egui::Layout::left_to_right(egui::Align::Min),
+                            |ui| {
+                                // Left column: reuse existing editor via field swap.
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(col_w, row_h),
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| {
+                                        let scroll_h = ui.available_height().max(0.0);
+                                        egui::ScrollArea::vertical()
+                                            .id_salt("step_editor_left_scroll")
+                                            .auto_shrink([false, false])
+                                            .min_scrolled_height(scroll_h)
+                                            .max_height(scroll_h)
+                                            .show(ui, |ui| {
+                                                let Some(device) = device.as_ref() else {
+                                                    ui.label(
+                                                        egui::RichText::new(
+                                                            "No device info available.",
+                                                        )
+                                                        .small()
+                                                        .color(ui.visuals().weak_text_color()),
+                                                    );
+                                                    return;
+                                                };
+
+                                                // Save main editor draft.
+                                                let saved = (
+                                                    self.button_label_context.clone(),
+                                                    self.button_label_input.clone(),
+                                                    self.button_label_placement,
+                                                    self.button_show_title,
+                                                    self.button_show_icon,
+                                                    self.button_show_action_name,
+                                                    self.button_label_size,
+                                                    self.button_label_color,
+                                                );
+
+                                                // Swap in step editor draft.
+                                                self.button_label_context =
+                                                    self.step_button_label_context.clone();
+                                                self.button_label_input =
+                                                    self.step_button_label_input.clone();
+                                                self.button_label_placement =
+                                                    self.step_button_label_placement;
+                                                self.button_show_title = self.step_button_show_title;
+                                                self.button_show_icon = self.step_button_show_icon;
+                                                self.button_show_action_name =
+                                                    self.step_button_show_action_name;
+                                                self.button_label_size = self.step_button_label_size;
+                                                self.button_label_color =
+                                                    self.step_button_label_color;
+
+                                                self.draw_action_editor_left_column(
+                                                    ui,
+                                                    ctx,
+                                                    device,
+                                                    &step_instance,
+                                                );
+
+                                                // Pull draft back out.
+                                                self.step_button_label_context =
+                                                    self.button_label_context.clone();
+                                                self.step_button_label_input =
+                                                    self.button_label_input.clone();
+                                                self.step_button_label_placement =
+                                                    self.button_label_placement;
+                                                self.step_button_show_title = self.button_show_title;
+                                                self.step_button_show_icon = self.button_show_icon;
+                                                self.step_button_show_action_name =
+                                                    self.button_show_action_name;
+                                                self.step_button_label_size = self.button_label_size;
+                                                self.step_button_label_color =
+                                                    self.button_label_color;
+
+                                                // Restore main editor draft.
+                                                self.button_label_context = saved.0;
+                                                self.button_label_input = saved.1;
+                                                self.button_label_placement = saved.2;
+                                                self.button_show_title = saved.3;
+                                                self.button_show_icon = saved.4;
+                                                self.button_show_action_name = saved.5;
+                                                self.button_label_size = saved.6;
+                                                self.button_label_color = saved.7;
+                                            });
+                                    },
+                                );
+
+                                ui.add_space(gap);
+
+                                // Right column: options editor (native/schema) when available.
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(col_w, row_h),
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| {
+                                        let scroll_h = ui.available_height().max(0.0);
+                                        egui::ScrollArea::vertical()
+                                            .id_salt("step_editor_right_scroll")
+                                            .auto_shrink([false, false])
+                                            .min_scrolled_height(scroll_h)
+                                            .max_height(scroll_h)
+                                            .show(ui, |ui| {
+                                                if has_schema {
+                                                    self.draw_action_editor_schema_right_column(
+                                                        ui,
+                                                        &step_instance,
+                                                    );
+                                                } else if has_native_options {
+                                                    if let Some(device) = device.as_ref() {
+                                                        self.draw_action_editor_native_options_right_column(
+                                                            ui,
+                                                            device,
+                                                            &step_instance,
+                                                        );
+                                                    } else {
+                                                        ui.label(
+                                                            egui::RichText::new(
+                                                                "Options unavailable (no device).",
+                                                            )
+                                                            .small()
+                                                            .color(ui.visuals().weak_text_color()),
+                                                        );
+                                                    }
+                                                } else if !step_instance
+                                                    .action
+                                                    .property_inspector
+                                                    .trim()
+                                                    .is_empty()
+                                                {
+                                                    ui.label(
+                                                        egui::RichText::new(
+                                                            "This step uses a Property Inspector. Use the button on the left to open it.",
+                                                        )
+                                                        .small()
+                                                        .color(ui.visuals().weak_text_color()),
+                                                    );
+                                                } else {
+                                                    ui.label(
+                                                        egui::RichText::new("No options.")
+                                                            .small()
+                                                            .color(ui.visuals().weak_text_color()),
+                                                    );
+                                                }
+                                            });
+                                    },
+                                );
+                            },
+                        );
+                    });
+
+                if should_close || !window_open {
+                    self.step_editor_open = None;
+                    self.step_editor_parent = None;
+                    self.step_button_label_context = None;
                 }
             }
 

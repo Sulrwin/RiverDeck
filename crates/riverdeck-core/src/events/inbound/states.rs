@@ -81,22 +81,9 @@ pub async fn set_title(
         let apply_active =
             active_profile && active_page == instance.context.page && affects_visible;
         if apply_active {
-            let img = instance
-                .states
-                .get(instance.current_state as usize)
-                .map(|s| s.image.trim())
-                .filter(|s| !s.is_empty() && *s != "actionDefaultImage")
-                .map(|s| s.to_owned())
-                .unwrap_or_else(|| instance.action.icon.clone());
-            let _ = crate::events::outbound::devices::update_image_for_instance(
-                instance,
-                if img.trim().is_empty() {
-                    None
-                } else {
-                    Some(img)
-                },
-            )
-            .await;
+            let img = crate::events::outbound::devices::effective_image_for_instance(instance);
+            let _ =
+                crate::events::outbound::devices::update_image_for_instance(instance, img).await;
         }
     }
     request_save_profile(&event.context.device, &mut locks)?;
@@ -173,23 +160,10 @@ pub async fn set_image(
         };
 
         if active && affects_visible {
-            let img = instance
-                .states
-                .get(instance.current_state as usize)
-                .map(|s| s.image.trim())
-                .filter(|s| !s.is_empty() && *s != "actionDefaultImage")
-                .map(|s| s.to_owned())
-                .unwrap_or_else(|| instance.action.icon.clone());
+            let img = crate::events::outbound::devices::effective_image_for_instance(instance);
 
-            if let Err(error) = crate::events::outbound::devices::update_image_for_instance(
-                instance,
-                if img.trim().is_empty() {
-                    None
-                } else {
-                    Some(img)
-                },
-            )
-            .await
+            if let Err(error) =
+                crate::events::outbound::devices::update_image_for_instance(instance, img).await
             {
                 log::warn!("Failed to update device image after setImage: {}", error);
             }
@@ -221,22 +195,9 @@ pub async fn set_state(
         });
 
         if active {
-            let img = instance
-                .states
-                .get(instance.current_state as usize)
-                .map(|s| s.image.trim())
-                .filter(|s| !s.is_empty() && *s != "actionDefaultImage")
-                .map(|s| s.to_owned())
-                .unwrap_or_else(|| instance.action.icon.clone());
-            if let Err(error) = crate::events::outbound::devices::update_image_for_instance(
-                instance,
-                if img.trim().is_empty() {
-                    None
-                } else {
-                    Some(img)
-                },
-            )
-            .await
+            let img = crate::events::outbound::devices::effective_image_for_instance(instance);
+            if let Err(error) =
+                crate::events::outbound::devices::update_image_for_instance(instance, img).await
             {
                 log::warn!("Failed to update device image after setState: {}", error);
             }
