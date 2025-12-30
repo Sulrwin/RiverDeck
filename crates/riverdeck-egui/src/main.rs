@@ -1531,6 +1531,9 @@ struct RiverDeckApp {
     texture_jobs_rx: tokio_mpsc::UnboundedReceiver<TextureJobResult>,
     texture_jobs_tx: tokio_mpsc::UnboundedSender<TextureJobResult>,
     texture_inflight: HashSet<String>,
+    // For frequently-updating actions (e.g. system info), keep showing the last-good slot preview
+    // texture while a new async render is still in-flight. This avoids visible flicker.
+    preview_last_slot_texture: HashMap<String, egui::TextureHandle>,
 
     // Cached async data to avoid blocking the UI thread during paint.
     categories_cache: Option<Vec<(String, shared::Category)>>,
@@ -2051,6 +2054,7 @@ impl RiverDeckApp {
             texture_jobs_rx,
             texture_jobs_tx,
             texture_inflight: HashSet::new(),
+            preview_last_slot_texture: HashMap::new(),
             categories_cache: None,
             categories_inflight: false,
             categories_rx: None,
@@ -4494,6 +4498,8 @@ impl RiverDeckApp {
         );
 
         if let Some(instance) = instance {
+            let slot_key = format!("preview_slot:{}", instance.context.to_string());
+
             let st = instance
                 .states
                 .get(instance.current_state as usize)
@@ -4520,9 +4526,20 @@ impl RiverDeckApp {
             if let Some(tex) =
                 self.rendered_texture_for_size(ctx, "keypad", kw, kh, state_img, &overlays)
             {
+                self.preview_last_slot_texture
+                    .insert(slot_key.clone(), tex.clone());
                 let inner = rect.shrink(2.0);
                 painter.image(
                     tex.id(),
+                    inner,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            } else if let Some(prev) = self.preview_last_slot_texture.get(&slot_key) {
+                // Stale-while-loading: keep showing the last good rendered texture to avoid flicker.
+                let inner = rect.shrink(2.0);
+                painter.image(
+                    prev.id(),
                     inner,
                     egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                     egui::Color32::WHITE,
@@ -4628,6 +4645,8 @@ impl RiverDeckApp {
 
         // Optional: render action image/icon in an inscribed square.
         if let Some(instance) = instance {
+            let slot_key = format!("preview_slot:{}", instance.context.to_string());
+
             let st = instance
                 .states
                 .get(instance.current_state as usize)
@@ -4652,10 +4671,20 @@ impl RiverDeckApp {
             if let Some(tex) =
                 self.rendered_texture_for_size(ctx, "encoder", iw, ih, state_img, &overlays)
             {
+                self.preview_last_slot_texture
+                    .insert(slot_key.clone(), tex.clone());
                 // Inscribed square inside circle (with padding) so it visually reads as a dial.
                 let inner = rect.shrink(rect.width().min(rect.height()) * 0.22);
                 painter.image(
                     tex.id(),
+                    inner,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            } else if let Some(prev) = self.preview_last_slot_texture.get(&slot_key) {
+                let inner = rect.shrink(rect.width().min(rect.height()) * 0.22);
+                painter.image(
+                    prev.id(),
                     inner,
                     egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                     egui::Color32::WHITE,

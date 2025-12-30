@@ -12,19 +12,27 @@ struct AppearEvent {
 }
 
 pub async fn will_appear(instance: &ActionInstance) -> Result<(), anyhow::Error> {
-    send_to_plugin(
-        &instance.action.plugin,
-        &AppearEvent {
-            event: "willAppear",
-            action: instance.action.uuid.clone(),
-            context: instance.context.clone(),
-            device: instance.context.device.clone(),
-            payload: GenericInstancePayload::new(instance),
-        },
-    )
-    .await?;
+    // Some instances are host-side/built-in (no plugin process), and some plugins may not
+    // be connected yet. We still want the device to show something immediately.
+    let plugin = instance.action.plugin.trim();
+    if !plugin.is_empty() {
+        // Best-effort: don't fail `will_appear` if the plugin isn't reachable; still proceed
+        // with pushing initial icon/title to the device.
+        let _ = send_to_plugin(
+            plugin,
+            &AppearEvent {
+                event: "willAppear",
+                action: instance.action.uuid.clone(),
+                context: instance.context.clone(),
+                device: instance.context.device.clone(),
+                payload: GenericInstancePayload::new(instance),
+            },
+        )
+        .await;
+    }
 
-    super::states::title_parameters_did_change(instance, instance.current_state).await?;
+    // Also best-effort: if this fails due to plugin comms, don't block device rendering.
+    let _ = super::states::title_parameters_did_change(instance, instance.current_state).await;
 
     // Ensure something visible is pushed to the device immediately.
     // Many plugins rely on the host to show the manifest icon until they call `setImage`.
@@ -45,17 +53,20 @@ pub async fn will_disappear(
     instance: &ActionInstance,
     clear_on_device: bool,
 ) -> Result<(), anyhow::Error> {
-    send_to_plugin(
-        &instance.action.plugin,
-        &AppearEvent {
-            event: "willDisappear",
-            action: instance.action.uuid.clone(),
-            context: instance.context.clone(),
-            device: instance.context.device.clone(),
-            payload: GenericInstancePayload::new(instance),
-        },
-    )
-    .await?;
+    let plugin = instance.action.plugin.trim();
+    if !plugin.is_empty() {
+        let _ = send_to_plugin(
+            plugin,
+            &AppearEvent {
+                event: "willDisappear",
+                action: instance.action.uuid.clone(),
+                context: instance.context.clone(),
+                device: instance.context.device.clone(),
+                payload: GenericInstancePayload::new(instance),
+            },
+        )
+        .await;
+    }
 
     if clear_on_device
         && let Err(error) =
