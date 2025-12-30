@@ -160,3 +160,4 @@ pub fn cleanup_orphaned_processes() {
 
     write_registry(&kept);
 }
+

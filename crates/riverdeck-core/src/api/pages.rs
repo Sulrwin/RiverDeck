@@ -175,6 +175,11 @@ pub async fn set_selected_page(
         }
     }
 
+    // Notify UI hosts that cached previews may be stale (page selection affects slot + background state).
+    crate::ui::emit(crate::ui::UiEvent::RerenderImages {
+        device: device.clone(),
+    });
+
     Ok(())
 }
 
@@ -335,6 +340,9 @@ pub async fn delete_page(
         .join(&profile_id)
         .join(&page_id);
     let _ = tokio::fs::remove_dir_all(images_dir).await;
+
+    // Notify UI hosts that cached previews may be stale (page list and/or selected page may have changed).
+    crate::ui::emit(crate::ui::UiEvent::RerenderImages { device });
 
     Ok(())
 }

@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img src=".github/readme/mainmenu-plugins-profiles.png" alt="Main menu" /><br>
+  <img src=".github/readme/mainmenu.png" alt="Main menu" /><br>
   <a href="#showcase">More screenshots</a>
 </p>
 

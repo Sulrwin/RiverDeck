@@ -217,6 +217,11 @@ pub async fn set_encoder_screen_background(
         }
     }
 
+    // Notify UI hosts that cached previews may be stale (background path/crop reset affects preview rendering).
+    crate::ui::emit(crate::ui::UiEvent::RerenderImages {
+        device: device.clone(),
+    });
+
     Ok(())
 }
 
@@ -285,6 +290,11 @@ pub async fn set_encoder_screen_background_crop(
             .await;
         }
     }
+
+    // Notify UI hosts that cached previews may be stale (crop affects preview UVs).
+    crate::ui::emit(crate::ui::UiEvent::RerenderImages {
+        device: device.clone(),
+    });
 
     Ok(())
 }

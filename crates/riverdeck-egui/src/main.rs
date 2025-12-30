@@ -1824,7 +1824,9 @@ impl RiverDeckApp {
 
     const DEVICES_PANEL_DEFAULT_WIDTH: f32 = 200.0; // egui::SidePanel default in egui 0.31.x
     const ACTIONS_PANEL_DEFAULT_WIDTH: f32 = 280.0; // allow Actions panel to be half the previous width
-    const POPUP_TITLEBAR_HEIGHT: f32 = 28.0;
+    // Keep titlebars compact: the top panel also adds its own margins.
+    const MAIN_TITLEBAR_HEIGHT: f32 = 24.0;
+    const POPUP_TITLEBAR_HEIGHT: f32 = 24.0;
 
     fn apply_theme(ctx: &egui::Context) {
         // Professional dark theme pass: aim closer to the Stream Deck dark UI.
@@ -1887,8 +1889,8 @@ impl RiverDeckApp {
         ui.painter().rect_filled(rect, rounding, fill);
 
         // Split into two regions so the close button is always flush-right.
-        let outer_pad = 6.0;
-        let buttons_w = 44.0;
+        let outer_pad = 5.0;
+        let buttons_w = 40.0;
         let right_x1 = rect.right() - outer_pad;
         let right_x0 = (right_x1 - buttons_w).max(rect.left());
         let right_rect = egui::Rect::from_min_max(
@@ -1902,7 +1904,7 @@ impl RiverDeckApp {
 
         ui.allocate_new_ui(egui::UiBuilder::new().max_rect(left_rect), |ui| {
             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                ui.add_space(10.0);
+                ui.add_space(8.0);
                 ui.label(egui::RichText::new(title).strong());
             });
         });
@@ -1910,8 +1912,8 @@ impl RiverDeckApp {
         ui.allocate_new_ui(egui::UiBuilder::new().max_rect(right_rect), |ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
-                ui.spacing_mut().button_padding = egui::vec2(7.0, 3.0);
-                let btn_size = egui::vec2(26.0, 20.0);
+                ui.spacing_mut().button_padding = egui::vec2(6.0, 2.0);
+                let btn_size = egui::vec2(24.0, 18.0);
                 if ui.add(egui::Button::new("X").min_size(btn_size)).clicked() {
                     close_requested = true;
                 }
@@ -1993,7 +1995,8 @@ impl RiverDeckApp {
         let ppp = cc.egui_ctx.input(|i| i.pixels_per_point);
         Self::apply_theme(&cc.egui_ctx);
 
-        let (texture_jobs_tx, texture_jobs_rx) = tokio_mpsc::unbounded_channel::<TextureJobResult>();
+        let (texture_jobs_tx, texture_jobs_rx) =
+            tokio_mpsc::unbounded_channel::<TextureJobResult>();
 
         Self {
             runtime,
@@ -2231,7 +2234,8 @@ impl RiverDeckApp {
         snapshot: &ProfileSnapshot,
     ) {
         // Keypad key previews.
-        let (kw, kh) = riverdeck_core::render::device::key_image_size_for_device_type(device.r#type);
+        let (kw, kh) =
+            riverdeck_core::render::device::key_image_size_for_device_type(device.r#type);
         for inst in snapshot.keys.iter().filter_map(|v| v.as_ref()) {
             let st = inst
                 .states
@@ -2244,18 +2248,13 @@ impl RiverDeckApp {
             if state_img == "actionDefaultImage" {
                 state_img = inst.action.icon.trim();
             }
-            let overlays =
-                riverdeck_core::events::outbound::devices::overlays_for_instance(inst)
-                    .unwrap_or_default();
+            let overlays = riverdeck_core::events::outbound::devices::overlays_for_instance(inst)
+                .unwrap_or_default();
             let _ = self.rendered_texture_for_size(ctx, "keypad", kw, kh, state_img, &overlays);
         }
 
         // Encoder dial previews (Stream Deck+ today).
-        let (iw, ih) = if device.r#type == 7 {
-            (72u32, 72u32)
-        } else {
-            (72u32, 72u32)
-        };
+        let (iw, ih) = (72u32, 72u32);
         for inst in snapshot.sliders.iter().filter_map(|v| v.as_ref()) {
             let st = inst
                 .states
@@ -2268,9 +2267,8 @@ impl RiverDeckApp {
             if state_img == "actionDefaultImage" {
                 state_img = inst.action.icon.trim();
             }
-            let overlays =
-                riverdeck_core::events::outbound::devices::overlays_for_instance(inst)
-                    .unwrap_or_default();
+            let overlays = riverdeck_core::events::outbound::devices::overlays_for_instance(inst)
+                .unwrap_or_default();
             let _ = self.rendered_texture_for_size(ctx, "encoder", iw, ih, state_img, &overlays);
         }
 
@@ -2293,7 +2291,9 @@ impl RiverDeckApp {
         let key_for_job = key.clone();
         self.runtime.spawn(async move {
             // Do disk I/O + decoding + image processing off-thread.
-            let msg = match tokio::task::spawn_blocking(move || run_texture_job(&key_for_job, job)).await {
+            let msg = match tokio::task::spawn_blocking(move || run_texture_job(&key_for_job, job))
+                .await
+            {
                 Ok(Ok(msg)) => msg,
                 _ => TextureJobResult::Failed { key },
             };
@@ -3716,12 +3716,13 @@ impl RiverDeckApp {
     }
 
     fn texture_for_path(&mut self, ctx: &egui::Context, path: &str) -> Option<egui::TextureHandle> {
+        use std::hash::{Hash, Hasher};
+        use std::time::UNIX_EPOCH;
+
         let path = path.trim();
 
         // Support plugin-provided data URLs (common for `setImage`).
         if path.starts_with("data:") {
-            use std::hash::{Hash, Hasher};
-
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             path.hash(&mut hasher);
             let key = format!("riverdeck_data:{:x}", hasher.finish());
@@ -3773,7 +3774,21 @@ impl RiverDeckApp {
             let Some(resolved) = self.resolve_icon_path(cand) else {
                 continue;
             };
-            let cache_key = resolved.to_string_lossy().into_owned();
+
+            // Important: many UI assets are written by overwriting an existing path on disk
+            // (e.g. encoder screen background). If we cache purely by path, the UI can get stuck
+            // showing an old texture forever. Include mtime in the cache key so overwrites refresh.
+            let modified_nanos: u128 = std::fs::metadata(&resolved)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            resolved.as_os_str().hash(&mut hasher);
+            modified_nanos.hash(&mut hasher);
+            let cache_key = format!("riverdeck_file:{:x}", hasher.finish());
+
             if let Some(tex) = self.touch_cached_texture(&cache_key) {
                 return Some(tex);
             }
@@ -3805,6 +3820,7 @@ impl RiverDeckApp {
         overlays: &[shared::LabelOverlay],
     ) -> Option<egui::TextureHandle> {
         use std::hash::{Hash, Hasher};
+        use std::time::UNIX_EPOCH;
 
         let base_image = base_image.trim();
         if base_image.is_empty() && overlays.is_empty() {
@@ -3815,26 +3831,6 @@ impl RiverDeckApp {
         cache_ns.hash(&mut hasher);
         width.hash(&mut hasher);
         height.hash(&mut hasher);
-        base_image.hash(&mut hasher);
-        for o in overlays {
-            o.text.hash(&mut hasher);
-            o.colour.hash(&mut hasher);
-            o.size.hash(&mut hasher);
-            let p = match o.placement {
-                shared::TextPlacement::Top => 0u8,
-                shared::TextPlacement::Bottom => 1u8,
-                shared::TextPlacement::Left => 2u8,
-                shared::TextPlacement::Right => 3u8,
-                shared::TextPlacement::Center => 4u8,
-            };
-            p.hash(&mut hasher);
-        }
-
-        let key = format!("riverdeck_rendered:{:x}", hasher.finish());
-        if let Some(tex) = self.touch_cached_texture(&key) {
-            return Some(tex);
-        }
-
         let input = if base_image.is_empty() {
             TextureJobInput::Empty
         } else if base_image.starts_with("data:") {
@@ -3867,6 +3863,52 @@ impl RiverDeckApp {
             let (path, is_svg) = resolved?;
             TextureJobInput::File { path, is_svg }
         };
+
+        // Hash the input with a file mtime fingerprint so overwriting a path refreshes the rendered texture too.
+        match &input {
+            TextureJobInput::Empty => {
+                0u8.hash(&mut hasher);
+            }
+            TextureJobInput::DataUrl(s) => {
+                1u8.hash(&mut hasher);
+                s.hash(&mut hasher);
+            }
+            TextureJobInput::Bytes(bytes) => {
+                2u8.hash(&mut hasher);
+                bytes.hash(&mut hasher);
+            }
+            TextureJobInput::File { path, is_svg } => {
+                3u8.hash(&mut hasher);
+                path.as_os_str().hash(&mut hasher);
+                is_svg.hash(&mut hasher);
+                let modified_nanos: u128 = std::fs::metadata(path)
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                modified_nanos.hash(&mut hasher);
+            }
+        }
+
+        for o in overlays {
+            o.text.hash(&mut hasher);
+            o.colour.hash(&mut hasher);
+            o.size.hash(&mut hasher);
+            let p = match o.placement {
+                shared::TextPlacement::Top => 0u8,
+                shared::TextPlacement::Bottom => 1u8,
+                shared::TextPlacement::Left => 2u8,
+                shared::TextPlacement::Right => 3u8,
+                shared::TextPlacement::Center => 4u8,
+            };
+            p.hash(&mut hasher);
+        }
+
+        let key = format!("riverdeck_rendered:{:x}", hasher.finish());
+        if let Some(tex) = self.touch_cached_texture(&key) {
+            return Some(tex);
+        }
 
         self.ensure_texture_job(
             ctx,
@@ -4074,6 +4116,8 @@ impl RiverDeckApp {
 
                 let instance = snapshot.sliders.get(i).and_then(|v| v.as_ref());
                 if let Some(instance) = instance {
+                    // Stream Deck+ reality check: the dials have no displays; the LCD strip above them does.
+                    // Render the dial's icon + title/action name onto the strip segment preview.
                     let state_img = instance
                         .states
                         .get(instance.current_state as usize)
@@ -4100,6 +4144,42 @@ impl RiverDeckApp {
                             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                             egui::Color32::WHITE,
                         );
+                    }
+
+                    if let Some(overlays) =
+                        riverdeck_core::events::outbound::devices::overlays_for_instance(instance)
+                    {
+                        let font = egui::FontId::proportional(10.0);
+                        let color = ui.visuals().weak_text_color();
+                        for o in overlays {
+                            let text = o.text.trim();
+                            if text.is_empty() {
+                                continue;
+                            }
+                            // Placement mapping: keep it simple for this small preview.
+                            let (pos, align) = match o.placement {
+                                shared::TextPlacement::Top => (
+                                    egui::pos2(seg_rect.center().x, seg_rect.top() + 2.0),
+                                    egui::Align2::CENTER_TOP,
+                                ),
+                                shared::TextPlacement::Bottom => (
+                                    egui::pos2(seg_rect.center().x, seg_rect.bottom() - 2.0),
+                                    egui::Align2::CENTER_BOTTOM,
+                                ),
+                                shared::TextPlacement::Left => (
+                                    egui::pos2(seg_rect.left() + 2.0, seg_rect.center().y),
+                                    egui::Align2::LEFT_CENTER,
+                                ),
+                                shared::TextPlacement::Right => (
+                                    egui::pos2(seg_rect.right() - 2.0, seg_rect.center().y),
+                                    egui::Align2::RIGHT_CENTER,
+                                ),
+                                shared::TextPlacement::Center => {
+                                    (seg_rect.center(), egui::Align2::CENTER_CENTER)
+                                }
+                            };
+                            painter.text(pos, align, text, font.clone(), color);
+                        }
                     }
                 } else {
                     painter.text(
@@ -4498,7 +4578,7 @@ impl RiverDeckApp {
         );
 
         if let Some(instance) = instance {
-            let slot_key = format!("preview_slot:{}", instance.context.to_string());
+            let slot_key = format!("preview_slot:{}", instance.context);
 
             let st = instance
                 .states
@@ -4510,9 +4590,6 @@ impl RiverDeckApp {
                 .unwrap_or(instance.action.icon.trim());
             if state_img == "actionDefaultImage" {
                 state_img = instance.action.icon.trim();
-            }
-            if st.is_some_and(|s| !s.show_icon) {
-                state_img = "";
             }
             if st.is_some_and(|s| !s.show_icon) {
                 state_img = "";
@@ -4645,7 +4722,7 @@ impl RiverDeckApp {
 
         // Optional: render action image/icon in an inscribed square.
         if let Some(instance) = instance {
-            let slot_key = format!("preview_slot:{}", instance.context.to_string());
+            let slot_key = format!("preview_slot:{}", instance.context);
 
             let st = instance
                 .states
@@ -5243,7 +5320,9 @@ fn decode_data_url_to_bytes(data_url: &str) -> Option<Vec<u8>> {
     }
 }
 
-fn decode_input_to_image(input: &TextureJobInput) -> Option<(image::DynamicImage, Option<std::time::SystemTime>)> {
+fn decode_input_to_image(
+    input: &TextureJobInput,
+) -> Option<(image::DynamicImage, Option<std::time::SystemTime>)> {
     match input {
         TextureJobInput::Empty => None,
         TextureJobInput::DataUrl(s) => {
@@ -5275,9 +5354,8 @@ fn run_texture_job(key: &str, job: TextureJobKind) -> anyhow::Result<TextureJobR
 
     match job {
         TextureJobKind::Plain { input, options } => {
-            let (mut img, _modified) = decode_input_to_image(&input).ok_or_else(|| {
-                anyhow::anyhow!("failed to decode image for texture job (plain)")
-            })?;
+            let (mut img, _modified) = decode_input_to_image(&input)
+                .ok_or_else(|| anyhow::anyhow!("failed to decode image for texture job (plain)"))?;
             let (w0, h0) = (img.width(), img.height());
             let max0 = w0.max(h0);
             if max0 > MAX_PREVIEW_TEX_DIM {
@@ -5656,7 +5734,12 @@ impl eframe::App for RiverDeckApp {
         egui::TopBottomPanel::top("top")
             // Keep the top bar tighter than the rest of the window so the window buttons
             // don't feel "floating" away from the right edge.
-            .frame(egui::Frame::NONE.inner_margin(egui::Margin::same(8)))
+            .frame(egui::Frame::NONE.inner_margin(egui::Margin {
+                left: 8,
+                right: 8,
+                top: 4,
+                bottom: 4,
+            }))
             .show(ctx, |ui| {
                 #[cfg(target_os = "linux")]
                 {
@@ -7882,7 +7965,7 @@ impl Drop for RiverDeckApp {
 impl RiverDeckApp {
     fn draw_custom_titlebar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         // A simple custom title bar so we can always render window controls on the top-right.
-        let height = 28.0;
+        let height = Self::MAIN_TITLEBAR_HEIGHT;
         let (_size, resp) = ui.allocate_exact_size(
             egui::vec2(ui.available_width(), height),
             egui::Sense::click_and_drag(),
@@ -7891,9 +7974,9 @@ impl RiverDeckApp {
 
         ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| {
             // Split into three clipped regions so the title can be centered reliably.
-            let outer_pad = 6.0;
-            let buttons_w = 96.0;
-            let gap = 6.0;
+            let outer_pad = 5.0;
+            let buttons_w = 90.0;
+            let gap = 5.0;
 
             let right_x1 = rect.right() - outer_pad;
             let right_x0 = right_x1 - buttons_w;
@@ -7918,7 +8001,7 @@ impl RiverDeckApp {
             // Left: status/info.
             ui.allocate_new_ui(egui::UiBuilder::new().max_rect(left_rect), |ui| {
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    ui.spacing_mut().item_spacing.x = 8.0;
+                    ui.spacing_mut().item_spacing.x = 7.0;
                     if let Some(tex) = self.embedded_logo_texture(ctx) {
                         ui.image((tex.id(), egui::vec2(20.0, 20.0)));
                     }
@@ -7953,7 +8036,7 @@ impl RiverDeckApp {
 
                         let cog = ui
                             .add(
-                                egui::Button::new(egui::RichText::new("⚙").size(14.0)).frame(false),
+                                egui::Button::new(egui::RichText::new("⚙").size(13.0)).frame(false),
                             )
                             .on_hover_text("Settings");
                         if cog.clicked() {
@@ -7978,8 +8061,8 @@ impl RiverDeckApp {
             ui.allocate_new_ui(egui::UiBuilder::new().max_rect(right_rect), |ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 2.0;
-                    ui.spacing_mut().button_padding = egui::vec2(7.0, 3.0);
-                    let btn_size = egui::vec2(26.0, 20.0);
+                    ui.spacing_mut().button_padding = egui::vec2(6.0, 2.0);
+                    let btn_size = egui::vec2(24.0, 18.0);
 
                     // Use plain ASCII so it renders reliably even when the active font lacks the ✕ glyph.
                     let close = ui.add(egui::Button::new("X").min_size(btn_size));

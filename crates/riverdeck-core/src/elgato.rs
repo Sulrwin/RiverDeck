@@ -237,7 +237,8 @@ impl PlusLayer {
 struct PlusDeviceState {
     generation: u64,
     background: PlusLayer, // 800x100
-    dials: Vec<PlusLayer>, // per encoder, each 72x72 (or None)
+    // Per encoder: a 200x100 overlay for that segment (icon + text), composited onto the shared 800x100 LCD.
+    dials: Vec<PlusLayer>,
     task_running: bool,
 }
 
@@ -282,17 +283,19 @@ fn plus_composite_frame(
     };
 
     for (dial, icon) in dials {
-        let icon = icon
-            .resize_exact(72, 72, image::imageops::FilterType::Nearest)
+        // Overlay is expected to be a 200x100 RGBA image with transparency.
+        // Resize defensively so the compositor is robust to mismatched inputs.
+        let seg = icon
+            .resize_exact(200, 100, image::imageops::FilterType::Nearest)
             .to_rgba8();
-        let ox = (*dial as u32) * 200 + 64;
-        let oy = 14u32;
-        for y in 0..icon.height() {
-            for x in 0..icon.width() {
+        let ox = (*dial as u32) * 200;
+        let oy = 0u32;
+        for y in 0..seg.height() {
+            for x in 0..seg.width() {
                 let dst_x = ox + x;
                 let dst_y = oy + y;
                 if dst_x < base.width() && dst_y < base.height() {
-                    let src = *icon.get_pixel(x, y);
+                    let src = *seg.get_pixel(x, y);
                     if src[3] != 0 {
                         let dst = base.get_pixel_mut(dst_x, dst_y);
                         blend_pixel(dst, src);
@@ -416,6 +419,46 @@ async fn plus_ensure_task(device_id: String, state: Arc<Mutex<PlusDeviceState>>,
 }
 
 use crate::render::label::overlay_label;
+
+fn plus_make_segment_overlay(
+    icon: Option<image::DynamicImage>,
+    overlays: Option<&[crate::shared::LabelOverlay]>,
+) -> image::DynamicImage {
+    // Transparent overlay so the background can show through.
+    let mut base = RgbaImage::from_pixel(200, 100, Rgba([0, 0, 0, 0]));
+
+    // Icon is a 72x72 square placed in the segment (matches previous icon placement).
+    if let Some(icon) = icon {
+        let icon = icon
+            .resize_exact(72, 72, image::imageops::FilterType::Nearest)
+            .to_rgba8();
+        let ox = 64u32;
+        let oy = 14u32;
+        for y in 0..icon.height() {
+            for x in 0..icon.width() {
+                let dst_x = ox + x;
+                let dst_y = oy + y;
+                if dst_x < base.width() && dst_y < base.height() {
+                    let src = *icon.get_pixel(x, y);
+                    if src[3] != 0 {
+                        let dst = base.get_pixel_mut(dst_x, dst_y);
+                        blend_pixel(dst, src);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut out = image::DynamicImage::ImageRgba8(base);
+    if let Some(ov) = overlays {
+        for o in ov {
+            if !o.text.trim().is_empty() {
+                out = overlay_label(out, o);
+            }
+        }
+    }
+    out
+}
 
 async fn load_dynamic_image(image: &str) -> Result<image::DynamicImage, anyhow::Error> {
     if image.trim().starts_with("data:") {
@@ -615,24 +658,19 @@ pub async fn update_image(
                                 );
                             }
                             if decoded.len() <= 1 {
-                                // Single-frame GIF: treat as static.
-                                let img = decoded
+                                // Single-frame GIF: treat as static, but render to the full 200x100 segment
+                                // so titles are readable on the LCD strip.
+                                let icon = decoded
                                     .first()
                                     .map(|f| f.image.clone())
                                     .unwrap_or_else(|| image::DynamicImage::new_rgba8(72, 72));
-                                let img =
-                                    img.resize_exact(72, 72, image::imageops::FilterType::Nearest);
-                                let mut img = img;
-                                if let Some(ov) = overlays.as_deref() {
-                                    for o in ov {
-                                        if !o.text.trim().is_empty() {
-                                            img = overlay_label(img, o);
-                                        }
-                                    }
-                                }
-                                st.dials[context.position as usize] = PlusLayer::Static(img);
+                                let seg =
+                                    plus_make_segment_overlay(Some(icon), overlays.as_deref());
+                                st.dials[context.position as usize] = PlusLayer::Static(seg);
                             } else {
-                                let prepared = crate::animation::prepare_frames(
+                                // Prepare icon frames (72x72), then wrap each into a 200x100 segment overlay
+                                // so labels are placed in the segment area (not drawn onto the tiny icon).
+                                let prepared_icons = crate::animation::prepare_frames(
                                     decoded.as_ref(),
                                     crate::animation::Target {
                                         width: 72,
@@ -640,9 +678,19 @@ pub async fn update_image(
                                         resize_mode: crate::animation::ResizeMode::Exact,
                                         filter: image::imageops::FilterType::Nearest,
                                     },
-                                    overlays.as_deref(),
-                                    Some(overlay_label),
+                                    None,
+                                    None,
                                 );
+                                let prepared = prepared_icons
+                                    .into_iter()
+                                    .map(|f| crate::animation::PreparedFrame {
+                                        delay: f.delay,
+                                        image: plus_make_segment_overlay(
+                                            Some(f.image),
+                                            overlays.as_deref(),
+                                        ),
+                                    })
+                                    .collect::<Vec<_>>();
                                 let next_at = Instant::now() + prepared[0].delay;
                                 st.dials[context.position as usize] = PlusLayer::Animated {
                                     frames: prepared,
@@ -786,15 +834,6 @@ pub async fn update_image(
             let dyn_img = load_dynamic_image(image).await?;
 
             if context.controller == "Encoder" {
-                // For the encoder LCD, we draw icons at 72x72; overlay after resizing for sharper text.
-                let mut final_img = dyn_img.resize(72, 72, image::imageops::FilterType::Nearest);
-                if let Some(overlays) = overlays {
-                    for o in overlays {
-                        if !o.text.trim().is_empty() {
-                            final_img = overlay_label(final_img, &o);
-                        }
-                    }
-                }
                 if device.kind() == Kind::Plus {
                     let state = plus_state_for_device(
                         &context.device,
@@ -807,7 +846,9 @@ pub async fn update_image(
                             st.dials
                                 .resize(device.kind().encoder_count() as usize, PlusLayer::None);
                         }
-                        st.dials[context.position as usize] = PlusLayer::Static(final_img);
+                        st.dials[context.position as usize] = PlusLayer::Static(
+                            plus_make_segment_overlay(Some(dyn_img.clone()), overlays.as_deref()),
+                        );
                         plus_bump_generation(&mut st)
                     };
                     plus_render_once(&context.device, state.clone()).await;
@@ -819,6 +860,16 @@ pub async fn update_image(
                         plus_ensure_task(context.device.clone(), state, generation).await;
                     }
                 } else {
+                    // Legacy/non-Plus encoder LCD icons are 72x72; overlay after resizing for sharper text.
+                    let mut final_img =
+                        dyn_img.resize(72, 72, image::imageops::FilterType::Nearest);
+                    if let Some(overlays) = overlays.as_ref() {
+                        for o in overlays {
+                            if !o.text.trim().is_empty() {
+                                final_img = overlay_label(final_img, o);
+                            }
+                        }
+                    }
                     device
                         .write_lcd(
                             (context.position as u16 * 200) + 64,
@@ -838,10 +889,10 @@ pub async fn update_image(
                     kh as u32,
                     image::imageops::FilterType::Nearest,
                 );
-                if let Some(overlays) = overlays {
+                if let Some(overlays) = overlays.as_ref() {
                     for o in overlays {
                         if !o.text.trim().is_empty() {
-                            final_img = overlay_label(final_img, &o);
+                            final_img = overlay_label(final_img, o);
                         }
                     }
                 }
@@ -860,7 +911,16 @@ pub async fn update_image(
                         st.dials
                             .resize(device.kind().encoder_count() as usize, PlusLayer::None);
                     }
-                    st.dials[context.position as usize] = PlusLayer::None;
+                    let has_overlays = overlays
+                        .as_ref()
+                        .is_some_and(|ov| ov.iter().any(|o| !o.text.trim().is_empty()));
+                    if has_overlays {
+                        // Important: encoder segments can still show text even when there's no icon.
+                        st.dials[context.position as usize] =
+                            PlusLayer::Static(plus_make_segment_overlay(None, overlays.as_deref()));
+                    } else {
+                        st.dials[context.position as usize] = PlusLayer::None;
+                    }
                     plus_bump_generation(&mut st)
                 };
                 plus_render_once(&context.device, state.clone()).await;
@@ -893,10 +953,10 @@ pub async fn update_image(
                     kh as u32,
                     Rgba([0, 0, 0, 255]),
                 ));
-                if let Some(ov) = overlays {
+                if let Some(ov) = overlays.as_ref() {
                     for o in ov {
                         if !o.text.trim().is_empty() {
-                            img = overlay_label(img, &o);
+                            img = overlay_label(img, o);
                         }
                     }
                 }
