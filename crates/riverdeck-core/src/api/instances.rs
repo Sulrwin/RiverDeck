@@ -1,5 +1,6 @@
 use crate::shared::{
-    Action, ActionContext, ActionInstance, ActionState, Context, DEVICES, TextPlacement, config_dir,
+    Action, ActionContext, ActionInstance, ActionState, Context, DEVICES, FontSize, TextPlacement,
+    config_dir,
 };
 use crate::store::profiles::{acquire_locks_mut, get_slot_mut, save_profile};
 use crate::ui::{self, UiEvent};
@@ -322,6 +323,130 @@ pub async fn set_button_label_placement(
     let (apply_ctx, apply_img, apply_overlays, apply_active) = {
         for st in instance.states.iter_mut() {
             st.text_placement = placement;
+        }
+        ui::emit(UiEvent::ActionStateChanged {
+            context: instance.context.clone(),
+        });
+        let img = instance
+            .states
+            .get(instance.current_state as usize)
+            .map(|s| s.image.trim())
+            .filter(|s| !s.is_empty() && *s != "actionDefaultImage")
+            .map(|s| s.to_owned())
+            .unwrap_or_else(|| instance.action.icon.clone());
+        (
+            instance.context.clone(),
+            img,
+            crate::events::outbound::devices::overlays_for_instance(instance),
+            active_profile && active_page == instance.context.page,
+        )
+    };
+    save_profile(&context.device, &mut locks).await?;
+    if apply_active {
+        let _ = crate::events::outbound::devices::update_image_with_overlays(
+            (&apply_ctx).into(),
+            if apply_img.trim().is_empty() {
+                None
+            } else {
+                Some(apply_img)
+            },
+            apply_overlays,
+        )
+        .await;
+    }
+    Ok(())
+}
+
+pub async fn set_button_label_font_size(
+    context: ActionContext,
+    size: u16,
+) -> Result<(), anyhow::Error> {
+    let mut locks = acquire_locks_mut().await;
+    let active_profile = locks
+        .device_stores
+        .get_selected_profile(&context.device)
+        .ok()
+        .is_some_and(|p| p == context.profile);
+    let active_page = if active_profile {
+        locks
+            .profile_stores
+            .get_profile_store_mut(&DEVICES.get(&context.device).unwrap(), &context.profile)
+            .await?
+            .value
+            .selected_page
+            .clone()
+    } else {
+        String::new()
+    };
+    let Some(instance) = crate::store::profiles::get_instance_mut(&context, &mut locks).await?
+    else {
+        return Ok(());
+    };
+    let (apply_ctx, apply_img, apply_overlays, apply_active) = {
+        for st in instance.states.iter_mut() {
+            st.size = FontSize(size);
+        }
+        ui::emit(UiEvent::ActionStateChanged {
+            context: instance.context.clone(),
+        });
+        let img = instance
+            .states
+            .get(instance.current_state as usize)
+            .map(|s| s.image.trim())
+            .filter(|s| !s.is_empty() && *s != "actionDefaultImage")
+            .map(|s| s.to_owned())
+            .unwrap_or_else(|| instance.action.icon.clone());
+        (
+            instance.context.clone(),
+            img,
+            crate::events::outbound::devices::overlays_for_instance(instance),
+            active_profile && active_page == instance.context.page,
+        )
+    };
+    save_profile(&context.device, &mut locks).await?;
+    if apply_active {
+        let _ = crate::events::outbound::devices::update_image_with_overlays(
+            (&apply_ctx).into(),
+            if apply_img.trim().is_empty() {
+                None
+            } else {
+                Some(apply_img)
+            },
+            apply_overlays,
+        )
+        .await;
+    }
+    Ok(())
+}
+
+pub async fn set_button_label_colour(
+    context: ActionContext,
+    colour: String,
+) -> Result<(), anyhow::Error> {
+    let mut locks = acquire_locks_mut().await;
+    let active_profile = locks
+        .device_stores
+        .get_selected_profile(&context.device)
+        .ok()
+        .is_some_and(|p| p == context.profile);
+    let active_page = if active_profile {
+        locks
+            .profile_stores
+            .get_profile_store_mut(&DEVICES.get(&context.device).unwrap(), &context.profile)
+            .await?
+            .value
+            .selected_page
+            .clone()
+    } else {
+        String::new()
+    };
+    let Some(instance) = crate::store::profiles::get_instance_mut(&context, &mut locks).await?
+    else {
+        return Ok(());
+    };
+    let (apply_ctx, apply_img, apply_overlays, apply_active) = {
+        for st in instance.states.iter_mut() {
+            st.colour = colour.clone();
         }
         ui::emit(UiEvent::ActionStateChanged {
             context: instance.context.clone(),

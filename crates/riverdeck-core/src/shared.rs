@@ -351,7 +351,7 @@ pub struct ActionState {
     /// Whether the action's display name should be rendered as an additional label on the button.
     ///
     /// This is a RiverDeck extension (not part of the Stream Deck manifest schema).
-    #[serde(default = "default_true")]
+    #[serde(default = "default_false")]
     pub show_action_name: bool,
     #[serde(alias = "TitleColor")]
     pub colour: String,
@@ -370,8 +370,8 @@ pub struct ActionState {
     pub underline: bool,
 }
 
-fn default_true() -> bool {
-    true
+fn default_false() -> bool {
+    false
 }
 
 impl Default for ActionState {
@@ -381,19 +381,20 @@ impl Default for ActionState {
             name: String::new(),
             text: String::new(),
             show: true,
-            show_action_name: true,
+            show_action_name: false,
             colour: "#FFFFFF".to_owned(),
             alignment: "middle".to_owned(),
             text_placement: TextPlacement::Bottom,
             family: "Liberation Sans".to_owned(),
             style: "Regular".to_owned(),
-            size: FontSize(16),
+            // Slightly smaller default so labels don't overpower icons, especially on larger keys.
+            size: FontSize(14),
             underline: false,
         }
     }
 }
 
-#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TextPlacement {
     Top,
@@ -401,6 +402,21 @@ pub enum TextPlacement {
     Bottom,
     Left,
     Right,
+}
+
+/// A concrete label overlay to render on a button image.
+///
+/// This is a host-side rendering concern used by RiverDeck's hardware compositor and UI previews.
+/// It is derived from `ActionState` (title text + display preferences) at a specific moment in
+/// time, so we keep it lightweight and easily hashable for preview caching.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct LabelOverlay {
+    pub text: String,
+    pub placement: TextPlacement,
+    /// Text color (CSS-style hex, typically `#RRGGBB`).
+    pub colour: String,
+    /// Requested font size (Stream Deck style). RiverDeck uses this as a scaling hint.
+    pub size: u16,
 }
 
 #[serde_inline_default]

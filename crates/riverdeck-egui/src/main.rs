@@ -156,6 +156,40 @@ fn env_truthy_any(name: &str) -> bool {
     )
 }
 
+fn parse_hex_color32(s: &str) -> Option<egui::Color32> {
+    let s = s.trim();
+    let hex = s.strip_prefix('#').unwrap_or(s);
+    match hex.len() {
+        6 => {
+            let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+            let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+            let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+            Some(egui::Color32::from_rgb(r, g, b))
+        }
+        8 => {
+            // Accept RRGGBBAA (common) and AARRGGBB (fallback).
+            let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+            let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+            let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+            let a = u8::from_str_radix(&hex[6..8], 16).ok()?;
+            if a == 0 {
+                let a = u8::from_str_radix(&hex[0..2], 16).ok()?;
+                let r = u8::from_str_radix(&hex[2..4], 16).ok()?;
+                let g = u8::from_str_radix(&hex[4..6], 16).ok()?;
+                let b = u8::from_str_radix(&hex[6..8], 16).ok()?;
+                Some(egui::Color32::from_rgba_unmultiplied(r, g, b, a))
+            } else {
+                Some(egui::Color32::from_rgba_unmultiplied(r, g, b, a))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn color32_to_hex_rgb(c: egui::Color32) -> String {
+    format!("#{:02X}{:02X}{:02X}", c.r(), c.g(), c.b())
+}
+
 fn main() -> anyhow::Result<()> {
     // Development quality-of-life: when running under an IDE/debugger, it's easy to end up with an
     // orphaned `riverdeck` process if the parent launcher is force-killed.
@@ -1452,6 +1486,8 @@ struct RiverDeckApp {
     button_label_placement: shared::TextPlacement,
     button_show_title: bool,
     button_show_action_name: bool,
+    button_label_size: u16,
+    button_label_color: egui::Color32,
     // Native action options editor (replaces PI for supported actions).
     options_editor_context: Option<shared::ActionContext>,
     // Schema-driven action options editor (host registry; covers PI-based actions).
@@ -1887,7 +1923,9 @@ impl RiverDeckApp {
             button_label_input: String::new(),
             button_label_placement: shared::TextPlacement::Bottom,
             button_show_title: true,
-            button_show_action_name: true,
+            button_show_action_name: false,
+            button_label_size: 14,
+            button_label_color: egui::Color32::WHITE,
             options_editor_context: None,
             schema_editor_context: None,
             schema_editor_draft: serde_json::Value::Object(serde_json::Map::new()),
@@ -2636,7 +2674,11 @@ impl RiverDeckApp {
                     .map(|s| s.text_placement)
                     .unwrap_or(shared::TextPlacement::Bottom);
                 self.button_show_title = st.map(|s| s.show).unwrap_or(true);
-                self.button_show_action_name = st.map(|s| s.show_action_name).unwrap_or(true);
+                self.button_show_action_name = st.map(|s| s.show_action_name).unwrap_or(false);
+                self.button_label_size = st.map(|s| s.size.0).unwrap_or(14);
+                self.button_label_color = st
+                    .and_then(|s| parse_hex_color32(&s.colour))
+                    .unwrap_or(egui::Color32::WHITE);
             }
 
             let gap = 6.0;
@@ -2845,8 +2887,11 @@ impl RiverDeckApp {
         // which looks like the right side is cut off. Wrap instead of clipping.
         ui.horizontal_wrapped(|ui| {
             ui.label("Placement:");
+            // Placement only affects the title text. When the action name is also shown we
+            // intentionally force Top/Bottom so the two labels don't overlap.
             let placement_locked = self.button_show_title && self.button_show_action_name;
-            ui.add_enabled_ui(!placement_locked, |ui| {
+            let placement_enabled = self.button_show_title && !placement_locked;
+            ui.add_enabled_ui(placement_enabled, |ui| {
                 let combo_w = ui.available_width().min(200.0);
                 egui::ComboBox::from_id_salt("button_label_placement")
                     .width(combo_w)
@@ -2879,13 +2924,36 @@ impl RiverDeckApp {
                         );
                     });
             });
-            if placement_locked {
+            if !self.button_show_title {
+                ui.label(
+                    egui::RichText::new("Title only")
+                        .small()
+                        .color(ui.visuals().weak_text_color()),
+                );
+            } else if placement_locked {
                 ui.label(
                     egui::RichText::new("Auto (Top/Bottom)")
                         .small()
                         .color(ui.visuals().weak_text_color()),
                 );
             }
+        });
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Text size:");
+            ui.add(
+                egui::Slider::new(&mut self.button_label_size, 8..=32)
+                    .clamping(egui::SliderClamping::Always)
+                    .show_value(true),
+            );
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Text color:");
+            egui::color_picker::color_edit_button_srgba(
+                ui,
+                &mut self.button_label_color,
+                egui::color_picker::Alpha::Opaque,
+            );
         });
 
         ui.add_space(6.0);
@@ -2897,6 +2965,8 @@ impl RiverDeckApp {
                 let placement = self.button_label_placement;
                 let show_title = self.button_show_title;
                 let show_action_name = self.button_show_action_name;
+                let size = self.button_label_size;
+                let colour = color32_to_hex_rgb(self.button_label_color);
                 self.runtime.spawn(async move {
                     let _ =
                         riverdeck_core::api::instances::set_button_label(ctx_to_set.clone(), text)
@@ -2904,6 +2974,16 @@ impl RiverDeckApp {
                     let _ = riverdeck_core::api::instances::set_button_label_placement(
                         ctx_to_set.clone(),
                         placement,
+                    )
+                    .await;
+                    let _ = riverdeck_core::api::instances::set_button_label_font_size(
+                        ctx_to_set.clone(),
+                        size,
+                    )
+                    .await;
+                    let _ = riverdeck_core::api::instances::set_button_label_colour(
+                        ctx_to_set.clone(),
+                        colour,
                     )
                     .await;
                     let _ = riverdeck_core::api::instances::set_button_show_title(
@@ -3371,7 +3451,7 @@ impl RiverDeckApp {
         width: u32,
         height: u32,
         base_image: &str,
-        overlays: &[(String, shared::TextPlacement)],
+        overlays: &[shared::LabelOverlay],
     ) -> Option<egui::TextureHandle> {
         use std::hash::{Hash, Hasher};
 
@@ -3401,9 +3481,11 @@ impl RiverDeckApp {
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|| base_image.to_owned())
             .hash(&mut hasher);
-        for (txt, placement) in overlays {
-            txt.hash(&mut hasher);
-            let p = match placement {
+        for o in overlays {
+            o.text.hash(&mut hasher);
+            o.colour.hash(&mut hasher);
+            o.size.hash(&mut hasher);
+            let p = match o.placement {
                 shared::TextPlacement::Top => 0u8,
                 shared::TextPlacement::Bottom => 1u8,
                 shared::TextPlacement::Left => 2u8,
@@ -3421,8 +3503,8 @@ impl RiverDeckApp {
 
         let dyn_img = self.load_dynamic_image_for_preview(base_image)?;
         let mut img = dyn_img.resize_exact(width, height, image::imageops::FilterType::Nearest);
-        for (label, placement) in overlays {
-            img = riverdeck_core::render::label::overlay_label(img, label, *placement);
+        for o in overlays {
+            img = riverdeck_core::render::label::overlay_label(img, o);
         }
 
         let rgba = img.into_rgba8();

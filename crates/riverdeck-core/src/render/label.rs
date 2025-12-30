@@ -2,7 +2,7 @@ use image::{Rgba, RgbaImage};
 
 use font8x8::UnicodeFonts;
 
-use crate::shared::TextPlacement;
+use crate::shared::{LabelOverlay, TextPlacement};
 
 fn blend_pixel(dst: &mut Rgba<u8>, src: Rgba<u8>) {
     let sa = src[3] as f32 / 255.0;
@@ -56,16 +56,46 @@ fn draw_text_8x8(img: &mut RgbaImage, x: u32, y: u32, text: &str, scale: u32, co
     }
 }
 
+fn parse_hex_color(s: &str) -> Option<Rgba<u8>> {
+    let s = s.trim();
+    let hex = s.strip_prefix('#').unwrap_or(s);
+    let bytes = match hex.len() {
+        6 => {
+            let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+            let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+            let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+            [r, g, b, 0xff]
+        }
+        8 => {
+            // Accept both AARRGGBB and RRGGBBAA. Prefer RRGGBBAA (common in CSS-like strings).
+            let a_last = {
+                let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+                let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+                let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+                let a = u8::from_str_radix(&hex[6..8], 16).ok()?;
+                [r, g, b, a]
+            };
+            if a_last[3] == 0 && !hex.starts_with("00") {
+                let a = u8::from_str_radix(&hex[0..2], 16).ok()?;
+                let r = u8::from_str_radix(&hex[2..4], 16).ok()?;
+                let g = u8::from_str_radix(&hex[4..6], 16).ok()?;
+                let b = u8::from_str_radix(&hex[6..8], 16).ok()?;
+                [r, g, b, a]
+            } else {
+                a_last
+            }
+        }
+        _ => return None,
+    };
+    Some(Rgba(bytes))
+}
+
 /// Composite a small label onto an existing button image.
 ///
 /// This is intentionally tiny/pixel-ish (8x8 font) to avoid depending on platform fonts.
 /// The goal is consistency across hardware + preview rather than typographic perfection.
-pub fn overlay_label(
-    base: image::DynamicImage,
-    label: &str,
-    placement: TextPlacement,
-) -> image::DynamicImage {
-    let label = label.trim();
+pub fn overlay_label(base: image::DynamicImage, overlay: &LabelOverlay) -> image::DynamicImage {
+    let label = overlay.text.trim();
     if label.is_empty() {
         return base;
     }
@@ -81,19 +111,28 @@ pub fn overlay_label(
     // NOTE: This is tuned for perceived size on real Stream Deck hardware.
     // On 72x72 keys, scale=2 reads as "huge", so we keep scale=1 unless keys are larger.
     let min_side = w.min(h).max(1);
-    let max_scale = if min_side >= 128 {
+    // Slightly more conservative than the old thresholds: label size is now user-adjustable, and
+    // we prefer icons to remain dominant by default.
+    let max_scale = if min_side >= 144 {
         3
-    } else if min_side >= 96 {
+    } else if min_side >= 112 {
         2
     } else {
         1
     };
 
+    // Convert Stream Deck "font size" into a scale multiplier for our 8x8 raster font.
+    // This is intentionally a soft hint; we still clamp to fit the available label area.
+    let mut size_factor = (overlay.size as f32) / 16.0;
+    // Global tweak: make labels read slightly smaller by default (users can dial it back up).
+    size_factor *= 0.92;
+    size_factor = size_factor.clamp(0.5, 2.0);
+
     // Padding from the button edge.
     let pad = 4u32;
 
     // Available area to place text (no background strip; rely on a subtle shadow).
-    let (max_w, max_h) = match placement {
+    let (max_w, max_h) = match overlay.placement {
         TextPlacement::Top | TextPlacement::Bottom => {
             // Reserve ~3/8 of the key for labels so icons still have room (matches preview better).
             let max_h = (h.saturating_mul(3) / 8).saturating_sub(2).max(10);
@@ -176,7 +215,10 @@ pub fn overlay_label(
     };
 
     // Special case: Left/Right should be truly vertical (stacked glyphs), not rotated sideways text.
-    if matches!(placement, TextPlacement::Left | TextPlacement::Right) {
+    if matches!(
+        overlay.placement,
+        TextPlacement::Left | TextPlacement::Right
+    ) {
         // Remove whitespace so "Hello World" doesn't become a mostly-empty vertical strip.
         let chars: Vec<char> = label.chars().filter(|c| !c.is_whitespace()).collect();
         if chars.is_empty() {
@@ -186,8 +228,10 @@ pub fn overlay_label(
         // Choose the largest scale (tuned earlier via `max_scale`) and compute how many
         // characters fit vertically.
         let scale = max_scale as u32;
-        let line_step = 8 * scale + scale; // glyph height + spacing
-        let max_chars = (max_h / line_step).max(1) as usize;
+        let line_step = 8 * scale + scale; // glyph height + spacing (unscaled)
+        // Wrapping must reflect final (size-adjusted) pixel dimensions.
+        let line_step_px = ((line_step as f32) * size_factor).round().max(1.0) as u32;
+        let max_chars = (max_h / line_step_px).max(1) as usize;
 
         // Create "lines" where each line is a single character.
         let mut lines: Vec<String> = chars
@@ -208,13 +252,22 @@ pub fn overlay_label(
             .max(1);
 
         let mut text_img = RgbaImage::new(text_w, text_h);
+        let fg = parse_hex_color(&overlay.colour).unwrap_or(Rgba([255, 255, 255, 255]));
         for (i, line) in lines.iter().enumerate() {
             let y = (i as u32) * line_step;
             draw_text_8x8(&mut text_img, 1, y + 1, line, scale, Rgba([0, 0, 0, 200]));
-            draw_text_8x8(&mut text_img, 0, y, line, scale, Rgba([255, 255, 255, 255]));
+            draw_text_8x8(&mut text_img, 0, y, line, scale, fg);
         }
 
-        let x = match placement {
+        // Apply user scaling. If shrinking, we upscale first to preserve legibility.
+        if (size_factor - 1.0).abs() > f32::EPSILON {
+            let nw = ((text_img.width() as f32) * size_factor).round().max(1.0) as u32;
+            let nh = ((text_img.height() as f32) * size_factor).round().max(1.0) as u32;
+            text_img =
+                image::imageops::resize(&text_img, nw, nh, image::imageops::FilterType::Triangle);
+        }
+
+        let x = match overlay.placement {
             TextPlacement::Left => pad,
             TextPlacement::Right => w.saturating_sub(text_img.width() + pad),
             _ => pad,
@@ -245,12 +298,20 @@ pub fn overlay_label(
 
     for scale in (1..=max_scale).rev() {
         let scale = scale as u32;
+        // Wrapping must reflect final (size-adjusted) pixel dimensions.
         let char_w = 8 * scale + scale;
         let line_h = 8 * scale;
+        let char_w_px = (char_w as f32) * size_factor;
+        let line_h_px = (line_h as f32) * size_factor;
+        let gap_px = (scale as f32) * size_factor;
 
         // Prefer up to 2 lines, but fall back to 1 if height is tight.
-        let max_lines = if max_h >= (line_h * 2 + scale) { 2 } else { 1 };
-        let max_cols = (max_w / char_w).max(1) as usize;
+        let max_lines = if (max_h as f32) >= (line_h_px * 2.0 + gap_px) {
+            2
+        } else {
+            1
+        };
+        let max_cols = ((max_w as f32) / char_w_px).floor().max(1.0) as usize;
 
         let mut lines = wrap_words(label, max_cols, max_lines);
         if lines.is_empty() {
@@ -271,10 +332,12 @@ pub fn overlay_label(
             .map(|l| l.chars().count() as u32)
             .max()
             .unwrap_or(0);
-        let text_w = max_line_chars * char_w;
-        let text_h = (lines.len() as u32) * line_h + (lines.len().saturating_sub(1) as u32) * scale;
+        // Predict final size after applying `size_factor` so we choose wrapping correctly.
+        let text_w_px = (max_line_chars as f32) * char_w_px;
+        let text_h_px =
+            (lines.len() as f32) * line_h_px + ((lines.len().saturating_sub(1)) as f32) * gap_px;
 
-        if text_w <= max_w && text_h <= max_h {
+        if text_w_px <= (max_w as f32) && text_h_px <= (max_h as f32) {
             chosen_scale = scale;
             chosen_lines = lines;
             break;
@@ -295,14 +358,22 @@ pub fn overlay_label(
         .max(1);
 
     let mut text_img = RgbaImage::new(text_w, text_h);
+    let fg = parse_hex_color(&overlay.colour).unwrap_or(Rgba([255, 255, 255, 255]));
     for (i, line) in chosen_lines.iter().enumerate() {
         let y = (i as u32) * line_step;
         draw_text_8x8(&mut text_img, 1, y + 1, line, scale, Rgba([0, 0, 0, 200]));
-        draw_text_8x8(&mut text_img, 0, y, line, scale, Rgba([255, 255, 255, 255]));
+        draw_text_8x8(&mut text_img, 0, y, line, scale, fg);
+    }
+
+    if (size_factor - 1.0).abs() > f32::EPSILON {
+        let nw = ((text_img.width() as f32) * size_factor).round().max(1.0) as u32;
+        let nh = ((text_img.height() as f32) * size_factor).round().max(1.0) as u32;
+        text_img =
+            image::imageops::resize(&text_img, nw, nh, image::imageops::FilterType::Triangle);
     }
 
     let x = (w.saturating_sub(text_img.width())) / 2;
-    let y = match placement {
+    let y = match overlay.placement {
         TextPlacement::Top => pad.saturating_sub(2),
         TextPlacement::Bottom => h.saturating_sub(text_img.height() + pad.saturating_sub(2)),
         _ => pad,

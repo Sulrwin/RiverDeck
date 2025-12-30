@@ -480,7 +480,7 @@ fn gif_cache_key(bytes: &[u8]) -> String {
 pub async fn update_image(
     context: &crate::shared::Context,
     image: Option<&str>,
-    overlays: Option<Vec<(String, crate::shared::TextPlacement)>>,
+    overlays: Option<Vec<crate::shared::LabelOverlay>>,
 ) -> Result<(), anyhow::Error> {
     if let Some(device) = ELGATO_DEVICES.read().await.get(&context.device) {
         let anim_key = crate::animation::AnimationKey {
@@ -532,9 +532,9 @@ pub async fn update_image(
                                     img.resize_exact(72, 72, image::imageops::FilterType::Nearest);
                                 let mut img = img;
                                 if let Some(ov) = overlays.as_deref() {
-                                    for (label, placement) in ov {
-                                        if !label.trim().is_empty() {
-                                            img = overlay_label(img, label, *placement);
+                                    for o in ov {
+                                        if !o.text.trim().is_empty() {
+                                            img = overlay_label(img, o);
                                         }
                                     }
                                 }
@@ -690,9 +690,9 @@ pub async fn update_image(
                 // For the encoder LCD, we draw icons at 72x72; overlay after resizing for sharper text.
                 let mut final_img = dyn_img.resize(72, 72, image::imageops::FilterType::Nearest);
                 if let Some(overlays) = overlays {
-                    for (label, placement) in overlays {
-                        if !label.trim().is_empty() {
-                            final_img = overlay_label(final_img, &label, placement);
+                    for o in overlays {
+                        if !o.text.trim().is_empty() {
+                            final_img = overlay_label(final_img, &o);
                         }
                     }
                 }
@@ -740,9 +740,9 @@ pub async fn update_image(
                     image::imageops::FilterType::Nearest,
                 );
                 if let Some(overlays) = overlays {
-                    for (label, placement) in overlays {
-                        if !label.trim().is_empty() {
-                            final_img = overlay_label(final_img, &label, placement);
+                    for o in overlays {
+                        if !o.text.trim().is_empty() {
+                            final_img = overlay_label(final_img, &o);
                         }
                     }
                 }
