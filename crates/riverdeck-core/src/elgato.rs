@@ -11,14 +11,200 @@ use elgato_streamdeck::{
     images::{ImageRect, convert_image_with_format_async},
     info::Kind,
 };
-use font8x8::UnicodeFonts;
 use image::{Rgba, RgbaImage};
 use once_cell::sync::Lazy;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::sleep;
 
+use crate::render::rounding::round_corners_subtle;
+
 static ELGATO_DEVICES: Lazy<RwLock<HashMap<String, AsyncStreamDeck>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
+
+fn env_truthy_any(name: &str) -> bool {
+    matches!(
+        std::env::var(name).ok().as_deref(),
+        Some("1")
+            | Some("true")
+            | Some("TRUE")
+            | Some("yes")
+            | Some("YES")
+            | Some("on")
+            | Some("ON")
+    )
+}
+
+fn spawn_all_test_devices_enabled() -> bool {
+    // A single opt-in switch that we can flip from VSCode launch configs or shell env.
+    // Supported values:
+    // - "all" (recommended)
+    // - truthy values ("1"/"true"/"yes"/"on")
+    match std::env::var("RIVERDECK_TEST_DEVICES").ok() {
+        Some(v) if v.trim().eq_ignore_ascii_case("all") => true,
+        _ => env_truthy_any("RIVERDECK_TEST_DEVICES"),
+    }
+}
+
+async fn register_spawn_all_test_devices() {
+    use crate::events::inbound::PayloadEvent;
+
+    // Representative devices for each supported family (distinct SDK `type` values).
+    // Keep IDs stable so their profile/config stores remain stable across restarts.
+    let devices: Vec<(Kind, &'static str, &'static str, u8)> = vec![
+        (Kind::Mk2, "mk2", "Stream Deck MK.2", 0),
+        (Kind::MiniMk2, "mini", "Stream Deck Mini", 1),
+        (Kind::XlV2, "xl", "Stream Deck XL", 2),
+        (Kind::Pedal, "pedal", "Stream Deck Pedal", 5),
+        (Kind::Plus, "plus", "Stream Deck +", 7),
+        (Kind::Neo, "neo", "Stream Deck Neo", 9),
+    ];
+
+    for (kind, suffix, display_name, device_type) in devices {
+        let id = format!("sd-test-{suffix}");
+        if crate::shared::DEVICES.contains_key(&id) {
+            continue;
+        }
+
+        let screen = if kind == Kind::Plus {
+            Some(crate::shared::DeviceScreenInfo {
+                width_px: 800,
+                height_px: 100,
+                segments: kind.encoder_count(),
+                placement: crate::shared::ScreenPlacement::BetweenKeypadAndEncoders,
+            })
+        } else {
+            None
+        };
+
+        let info = crate::shared::DeviceInfo {
+            id,
+            plugin: String::new(),
+            name: format!("(Test) {display_name}"),
+            rows: kind.row_count(),
+            columns: kind.column_count(),
+            encoders: kind.encoder_count(),
+            r#type: device_type,
+            screen,
+        };
+
+        let _ =
+            crate::events::inbound::devices::register_device("", PayloadEvent { payload: info })
+                .await;
+    }
+}
+
+fn blend_pixel(dst: &mut Rgba<u8>, src: Rgba<u8>) {
+    let sa = src[3] as f32 / 255.0;
+    if sa <= 0.0 {
+        return;
+    }
+    let da = dst[3] as f32 / 255.0;
+    let out_a = sa + da * (1.0 - sa);
+    if out_a <= 0.0 {
+        *dst = Rgba([0, 0, 0, 0]);
+        return;
+    }
+    let blend = |sc: u8, dc: u8| -> u8 {
+        let sc = sc as f32 / 255.0;
+        let dc = dc as f32 / 255.0;
+        let out_c = (sc * sa + dc * da * (1.0 - sa)) / out_a;
+        (out_c * 255.0).round().clamp(0.0, 255.0) as u8
+    };
+    dst[0] = blend(src[0], dst[0]);
+    dst[1] = blend(src[1], dst[1]);
+    dst[2] = blend(src[2], dst[2]);
+    dst[3] = (out_a * 255.0).round().clamp(0.0, 255.0) as u8;
+}
+
+fn sanitize_encoder_screen_crop(
+    crop: crate::shared::EncoderScreenCrop,
+) -> crate::shared::EncoderScreenCrop {
+    crate::shared::EncoderScreenCrop {
+        focus_x: crop.focus_x.clamp(0.0, 1.0),
+        focus_y: crop.focus_y.clamp(0.0, 1.0),
+        // Keep zoom bounded to avoid extreme crop math and accidental huge values from bad JSON.
+        zoom: crop.zoom.clamp(1.0, 32.0),
+    }
+}
+
+/// Compute a crop rect (in source pixels) for a "cover" crop into a target aspect ratio,
+/// with optional pan (focus) and zoom.
+///
+/// Returns `(x, y, w, h)` where `w/h >= 1`.
+fn cover_crop_rect(
+    src_w: u32,
+    src_h: u32,
+    target_aspect: f32,
+    crop: crate::shared::EncoderScreenCrop,
+) -> (u32, u32, u32, u32) {
+    let src_w_f = src_w.max(1) as f32;
+    let src_h_f = src_h.max(1) as f32;
+    let src_aspect = src_w_f / src_h_f;
+
+    // Base rect for zoom=1 (largest rect matching target aspect ratio).
+    let (base_w, base_h) = if src_aspect >= target_aspect {
+        // Wider than target: crop width.
+        (src_h_f * target_aspect, src_h_f)
+    } else {
+        // Taller/narrower than target: crop height.
+        (src_w_f, src_w_f / target_aspect)
+    };
+
+    let z = crop.zoom.max(1.0);
+    let mut cw = (base_w / z).max(1.0);
+    let mut ch = (base_h / z).max(1.0);
+    cw = cw.min(src_w_f);
+    ch = ch.min(src_h_f);
+
+    // Center point in source pixels.
+    let fx = crop.focus_x.clamp(0.0, 1.0);
+    let fy = crop.focus_y.clamp(0.0, 1.0);
+    let cx = fx * src_w_f;
+    let cy = fy * src_h_f;
+
+    // Top-left, clamped so the crop rect stays inside the image.
+    let max_x = (src_w_f - cw).max(0.0);
+    let max_y = (src_h_f - ch).max(0.0);
+    let x0 = (cx - cw / 2.0).clamp(0.0, max_x);
+    let y0 = (cy - ch / 2.0).clamp(0.0, max_y);
+
+    let mut x = x0.floor() as i64;
+    let mut y = y0.floor() as i64;
+    let mut w = cw.ceil() as i64;
+    let mut h = ch.ceil() as i64;
+
+    // Clamp to bounds (integer-safe).
+    if x < 0 {
+        x = 0;
+    }
+    if y < 0 {
+        y = 0;
+    }
+    if w < 1 {
+        w = 1;
+    }
+    if h < 1 {
+        h = 1;
+    }
+    if x + w > src_w as i64 {
+        w = (src_w as i64 - x).max(1);
+    }
+    if y + h > src_h as i64 {
+        h = (src_h as i64 - y).max(1);
+    }
+
+    (x as u32, y as u32, w as u32, h as u32)
+}
+
+fn crop_and_resize_strip_background(
+    img: image::DynamicImage,
+    crop: crate::shared::EncoderScreenCrop,
+) -> image::DynamicImage {
+    let crop = sanitize_encoder_screen_crop(crop);
+    let (x, y, w, h) = cover_crop_rect(img.width(), img.height(), 8.0, crop);
+    let cropped = img.crop_imm(x, y, w, h);
+    cropped.resize_exact(800, 100, image::imageops::FilterType::Nearest)
+}
 
 #[derive(Clone)]
 enum PlusLayer {
@@ -51,7 +237,8 @@ impl PlusLayer {
 struct PlusDeviceState {
     generation: u64,
     background: PlusLayer, // 800x100
-    dials: Vec<PlusLayer>, // per encoder, each 72x72 (or None)
+    // Per encoder: a 200x100 overlay for that segment (icon + text), composited onto the shared 800x100 LCD.
+    dials: Vec<PlusLayer>,
     task_running: bool,
 }
 
@@ -96,17 +283,19 @@ fn plus_composite_frame(
     };
 
     for (dial, icon) in dials {
-        let icon = icon
-            .resize_exact(72, 72, image::imageops::FilterType::Nearest)
+        // Overlay is expected to be a 200x100 RGBA image with transparency.
+        // Resize defensively so the compositor is robust to mismatched inputs.
+        let seg = icon
+            .resize_exact(200, 100, image::imageops::FilterType::Nearest)
             .to_rgba8();
-        let ox = (*dial as u32) * 200 + 64;
-        let oy = 14u32;
-        for y in 0..icon.height() {
-            for x in 0..icon.width() {
+        let ox = (*dial as u32) * 200;
+        let oy = 0u32;
+        for y in 0..seg.height() {
+            for x in 0..seg.width() {
                 let dst_x = ox + x;
                 let dst_y = oy + y;
                 if dst_x < base.width() && dst_y < base.height() {
-                    let src = *icon.get_pixel(x, y);
+                    let src = *seg.get_pixel(x, y);
                     if src[3] != 0 {
                         let dst = base.get_pixel_mut(dst_x, dst_y);
                         blend_pixel(dst, src);
@@ -229,280 +418,46 @@ async fn plus_ensure_task(device_id: String, state: Arc<Mutex<PlusDeviceState>>,
     });
 }
 
-fn blend_pixel(dst: &mut Rgba<u8>, src: Rgba<u8>) {
-    let sa = src[3] as f32 / 255.0;
-    if sa <= 0.0 {
-        return;
-    }
-    let da = dst[3] as f32 / 255.0;
-    let out_a = sa + da * (1.0 - sa);
-    if out_a <= 0.0 {
-        *dst = Rgba([0, 0, 0, 0]);
-        return;
-    }
-    let blend = |sc: u8, dc: u8| -> u8 {
-        let sc = sc as f32 / 255.0;
-        let dc = dc as f32 / 255.0;
-        let out_c = (sc * sa + dc * da * (1.0 - sa)) / out_a;
-        (out_c * 255.0).round().clamp(0.0, 255.0) as u8
-    };
-    dst[0] = blend(src[0], dst[0]);
-    dst[1] = blend(src[1], dst[1]);
-    dst[2] = blend(src[2], dst[2]);
-    dst[3] = (out_a * 255.0).round().clamp(0.0, 255.0) as u8;
-}
+use crate::render::label::overlay_label;
 
-fn draw_text_8x8(img: &mut RgbaImage, x: u32, y: u32, text: &str, scale: u32, color: Rgba<u8>) {
-    let scale = scale.max(1);
-    let mut cursor_x = x;
-    for ch in text.chars() {
-        if ch == '\n' {
-            break;
-        }
-        let glyph = font8x8::BASIC_FONTS.get(ch).unwrap_or([0u8; 8]);
-        for (row, bits) in glyph.iter().enumerate() {
-            for col in 0..8 {
-                if (bits >> col) & 1 == 1 {
-                    // `font8x8` stores glyph bits LSB-first (col 0 = left). Do not mirror.
-                    let px = cursor_x + (col as u32) * scale;
-                    let py = y + row as u32 * scale;
-                    for dy in 0..scale {
-                        for dx in 0..scale {
-                            if px + dx < img.width() && py + dy < img.height() {
-                                let p = img.get_pixel_mut(px + dx, py + dy);
-                                blend_pixel(p, color);
-                            }
-                        }
+fn plus_make_segment_overlay(
+    icon: Option<image::DynamicImage>,
+    overlays: Option<&[crate::shared::LabelOverlay]>,
+) -> image::DynamicImage {
+    // Transparent overlay so the background can show through.
+    let mut base = RgbaImage::from_pixel(200, 100, Rgba([0, 0, 0, 0]));
+
+    // Icon is a 72x72 square placed in the segment (matches previous icon placement).
+    if let Some(icon) = icon {
+        let icon = icon
+            .resize_exact(72, 72, image::imageops::FilterType::Nearest)
+            .to_rgba8();
+        let ox = 64u32;
+        let oy = 14u32;
+        for y in 0..icon.height() {
+            for x in 0..icon.width() {
+                let dst_x = ox + x;
+                let dst_y = oy + y;
+                if dst_x < base.width() && dst_y < base.height() {
+                    let src = *icon.get_pixel(x, y);
+                    if src[3] != 0 {
+                        let dst = base.get_pixel_mut(dst_x, dst_y);
+                        blend_pixel(dst, src);
                     }
                 }
             }
         }
-        cursor_x += 8 * scale + scale; // 1px spacing (scaled)
-    }
-}
-
-fn overlay_label(
-    base: image::DynamicImage,
-    label: &str,
-    placement: crate::shared::TextPlacement,
-) -> image::DynamicImage {
-    let label = label.trim();
-    if label.is_empty() {
-        return base;
     }
 
-    let mut img = base.to_rgba8();
-    let (w, h) = (img.width(), img.height());
-    if w == 0 || h == 0 {
-        return image::DynamicImage::ImageRgba8(img);
-    }
-
-    // Auto-scale + wrap so text always fits.
-    let min_side = w.min(h).max(1);
-    let max_scale = if min_side >= 96 {
-        3
-    } else if min_side >= 72 {
-        2
-    } else {
-        1
-    };
-
-    let max_w = w.saturating_sub(8).max(1);
-    let max_h = match placement {
-        // Reserve roughly half the key for the label strip so icons still have room.
-        crate::shared::TextPlacement::Top | crate::shared::TextPlacement::Bottom => {
-            (h / 2).saturating_sub(4).max(8)
-        }
-        crate::shared::TextPlacement::Left | crate::shared::TextPlacement::Right => {
-            h.saturating_sub(8).max(8)
-        }
-    };
-
-    let ellipsize = |s: &str, max_chars: usize| -> String {
-        if max_chars == 0 {
-            return String::new();
-        }
-        let chars: Vec<char> = s.chars().collect();
-        if chars.len() <= max_chars {
-            return s.to_owned();
-        }
-        if max_chars <= 3 {
-            return "...".chars().take(max_chars).collect();
-        }
-        let keep = max_chars.saturating_sub(3);
-        chars.into_iter().take(keep).collect::<String>() + "..."
-    };
-
-    let wrap_words = |text: &str, max_cols: usize, max_lines: usize| -> Vec<String> {
-        if max_cols == 0 || max_lines == 0 {
-            return vec![];
-        }
-        let mut lines: Vec<String> = Vec::new();
-        let mut current = String::new();
-
-        let push_line = |line: String, lines: &mut Vec<String>| {
-            if !line.trim().is_empty() {
-                lines.push(line);
-            }
-        };
-
-        // Split on whitespace, keep words (no punctuation awareness needed for this tiny font).
-        for word in text.split_whitespace() {
-            if lines.len() >= max_lines {
-                break;
-            }
-            // If the current line is empty, try to place the word (or a chunk of it).
-            let sep = if current.is_empty() { "" } else { " " };
-            let candidate = format!("{current}{sep}{word}");
-            if candidate.chars().count() <= max_cols {
-                current = candidate;
-                continue;
-            }
-
-            // Commit current line if it has content.
-            if !current.is_empty() {
-                push_line(std::mem::take(&mut current), &mut lines);
-                if lines.len() >= max_lines {
-                    break;
-                }
-            }
-
-            // Word longer than max_cols: hard-break.
-            let mut remaining = word;
-            while !remaining.is_empty() && lines.len() < max_lines {
-                let chunk: String = remaining.chars().take(max_cols).collect();
-                let taken = chunk.chars().count();
-                push_line(chunk, &mut lines);
-                remaining = &remaining[remaining
-                    .char_indices()
-                    .nth(taken)
-                    .map(|(i, _)| i)
-                    .unwrap_or(remaining.len())..];
-            }
-        }
-
-        if lines.len() < max_lines && !current.is_empty() {
-            push_line(current, &mut lines);
-        }
-
-        lines
-    };
-
-    let mut chosen_scale = 1u32;
-    let mut chosen_lines: Vec<String> = vec![label.to_owned()];
-
-    for scale in (1..=max_scale).rev() {
-        let scale = scale as u32;
-        let char_w = 8 * scale + scale;
-        let line_h = 8 * scale;
-
-        // For left/right placements, we keep a single horizontal line (it will be rotated later).
-        let max_lines = match placement {
-            crate::shared::TextPlacement::Left | crate::shared::TextPlacement::Right => 1usize,
-            _ => {
-                // Prefer up to 2 lines, but fall back to 1 if height is tight.
-                if max_h >= (line_h * 2 + scale) { 2 } else { 1 }
-            }
-        };
-
-        let max_cols = match placement {
-            crate::shared::TextPlacement::Left | crate::shared::TextPlacement::Right => {
-                // After rotation, width becomes height. Constrain by max_h.
-                (max_h / char_w).max(1) as usize
-            }
-            _ => (max_w / char_w).max(1) as usize,
-        };
-
-        let mut lines = wrap_words(label, max_cols, max_lines);
-        if lines.is_empty() {
-            lines = vec![String::new()];
-        }
-
-        // Ellipsize if we had to truncate lines.
-        if lines.len() == max_lines {
-            let last = lines.last().cloned().unwrap_or_default();
-            let last = ellipsize(&last, max_cols);
-            if let Some(last_mut) = lines.last_mut() {
-                *last_mut = last;
-            }
-        }
-
-        let max_line_chars = lines
-            .iter()
-            .map(|l| l.chars().count() as u32)
-            .max()
-            .unwrap_or(0);
-        let text_w = max_line_chars * char_w;
-        let text_h = (lines.len() as u32) * line_h + (lines.len().saturating_sub(1) as u32) * scale;
-
-        if text_w <= max_w && text_h <= max_h {
-            chosen_scale = scale;
-            chosen_lines = lines;
-            break;
-        }
-    }
-
-    let scale = chosen_scale;
-    let char_w = 8 * scale + scale;
-    let line_h = 8 * scale;
-    let line_step = 8 * scale + scale;
-    let max_line_chars = chosen_lines
-        .iter()
-        .map(|l| l.chars().count() as u32)
-        .max()
-        .unwrap_or(0);
-    let text_w = (max_line_chars * char_w).max(1);
-    let text_h = ((chosen_lines.len() as u32) * line_h
-        + (chosen_lines.len().saturating_sub(1) as u32) * scale)
-        .max(1);
-
-    let mut text_img = RgbaImage::new(text_w, text_h);
-    for (i, line) in chosen_lines.iter().enumerate() {
-        let y = (i as u32) * line_step;
-        // Shadow + text (no background strip; keep text readable with subtle shadow).
-        draw_text_8x8(&mut text_img, 1, y + 1, line, scale, Rgba([0, 0, 0, 200]));
-        draw_text_8x8(&mut text_img, 0, y, line, scale, Rgba([255, 255, 255, 255]));
-    }
-
-    let (overlay, ox, oy) = match placement {
-        crate::shared::TextPlacement::Top => {
-            let x = (w.saturating_sub(text_img.width())) / 2;
-            (text_img, x, 2)
-        }
-        crate::shared::TextPlacement::Bottom => {
-            let x = (w.saturating_sub(text_img.width())) / 2;
-            let y = h.saturating_sub(text_img.height() + 2);
-            (text_img, x, y)
-        }
-        crate::shared::TextPlacement::Left => {
-            let rot = image::imageops::rotate270(&text_img);
-            let y = (h.saturating_sub(rot.height())) / 2;
-            (rot, 2, y)
-        }
-        crate::shared::TextPlacement::Right => {
-            let rot = image::imageops::rotate90(&text_img);
-            let x = w.saturating_sub(rot.width() + 2);
-            let y = (h.saturating_sub(rot.height())) / 2;
-            (rot, x, y)
-        }
-    };
-
-    // Composite overlay.
-    for yy in 0..overlay.height() {
-        for xx in 0..overlay.width() {
-            let dst_x = ox + xx;
-            let dst_y = oy + yy;
-            if dst_x < w && dst_y < h {
-                let src = *overlay.get_pixel(xx, yy);
-                if src[3] != 0 {
-                    let dst = img.get_pixel_mut(dst_x, dst_y);
-                    blend_pixel(dst, src);
-                }
+    let mut out = image::DynamicImage::ImageRgba8(base);
+    if let Some(ov) = overlays {
+        for o in ov {
+            if !o.text.trim().is_empty() {
+                out = overlay_label(out, o);
             }
         }
     }
-
-    image::DynamicImage::ImageRgba8(img)
+    out
 }
 
 async fn load_dynamic_image(image: &str) -> Result<image::DynamicImage, anyhow::Error> {
@@ -541,6 +496,15 @@ async fn load_dynamic_image(image: &str) -> Result<image::DynamicImage, anyhow::
         }
 
         let path = candidate.ok_or_else(|| anyhow::anyhow!("image path not found: {image}"))?;
+
+        // Check if it's an SVG file and convert to PNG
+        if path.extension().and_then(|s| s.to_str()) == Some("svg") {
+            log::debug!("Converting SVG to PNG: {}", path.display());
+            let svg_data = std::fs::read(&path)?;
+            let png_image = convert_svg_to_png(&svg_data)?;
+            return Ok(png_image);
+        }
+
         Ok(image::open(path)?)
     }
 }
@@ -578,12 +542,67 @@ async fn resolve_image_bytes(image: &str) -> Result<Vec<u8>, anyhow::Error> {
             }
         }
         let path = candidate.ok_or_else(|| anyhow::anyhow!("image path not found: {image}"))?;
+
+        // Check if it's an SVG file and convert to PNG
+        if path.extension().and_then(|s| s.to_str()) == Some("svg") {
+            log::debug!("Converting SVG to PNG bytes: {}", path.display());
+            let svg_data = std::fs::read(&path)?;
+            let png_image = convert_svg_to_png(&svg_data)?;
+
+            // Convert DynamicImage to PNG bytes
+            let mut png_bytes = Vec::new();
+            png_image.write_to(
+                &mut std::io::Cursor::new(&mut png_bytes),
+                image::ImageFormat::Png,
+            )?;
+            return Ok(png_bytes);
+        }
+
         Ok(tokio::fs::read(path).await?)
     }
 }
 
 fn is_gif(bytes: &[u8]) -> bool {
     bytes.len() >= 6 && &bytes[0..3] == b"GIF"
+}
+
+/// Convert SVG data to a PNG DynamicImage
+/// This is public so the egui UI can also convert SVG icons for display
+pub fn convert_svg_to_image(svg_data: &[u8]) -> Result<image::DynamicImage, anyhow::Error> {
+    convert_svg_to_png(svg_data)
+}
+
+/// Convert SVG data to a PNG DynamicImage (internal implementation)
+fn convert_svg_to_png(svg_data: &[u8]) -> Result<image::DynamicImage, anyhow::Error> {
+    // Parse SVG
+    let opts = usvg::Options::default();
+    let tree = usvg::Tree::from_data(svg_data, &opts)?;
+
+    // Get SVG dimensions (default to 144x144 if not specified)
+    let size = tree.size();
+    let width = size.width() as u32;
+    let height = size.height() as u32;
+
+    // Ensure minimum size for Stream Deck icons
+    let (width, height) = if width == 0 || height == 0 {
+        (144, 144)
+    } else {
+        (width, height)
+    };
+
+    // Create a pixmap to render into
+    let mut pixmap = tiny_skia::Pixmap::new(width, height)
+        .ok_or_else(|| anyhow::anyhow!("Failed to create pixmap for SVG rendering"))?;
+
+    // Render SVG to pixmap
+    resvg::render(&tree, tiny_skia::Transform::default(), &mut pixmap.as_mut());
+
+    // Convert to image::DynamicImage
+    let rgba_data = pixmap.data().to_vec();
+    let img = image::RgbaImage::from_raw(width, height, rgba_data)
+        .ok_or_else(|| anyhow::anyhow!("Failed to create RGBA image from pixmap"))?;
+
+    Ok(image::DynamicImage::ImageRgba8(img))
 }
 
 fn gif_cache_key(bytes: &[u8]) -> String {
@@ -596,7 +615,7 @@ fn gif_cache_key(bytes: &[u8]) -> String {
 pub async fn update_image(
     context: &crate::shared::Context,
     image: Option<&str>,
-    overlays: Option<Vec<(String, crate::shared::TextPlacement)>>,
+    overlays: Option<Vec<crate::shared::LabelOverlay>>,
 ) -> Result<(), anyhow::Error> {
     if let Some(device) = ELGATO_DEVICES.read().await.get(&context.device) {
         let anim_key = crate::animation::AnimationKey {
@@ -639,24 +658,19 @@ pub async fn update_image(
                                 );
                             }
                             if decoded.len() <= 1 {
-                                // Single-frame GIF: treat as static.
-                                let img = decoded
+                                // Single-frame GIF: treat as static, but render to the full 200x100 segment
+                                // so titles are readable on the LCD strip.
+                                let icon = decoded
                                     .first()
                                     .map(|f| f.image.clone())
                                     .unwrap_or_else(|| image::DynamicImage::new_rgba8(72, 72));
-                                let img =
-                                    img.resize_exact(72, 72, image::imageops::FilterType::Nearest);
-                                let mut img = img;
-                                if let Some(ov) = overlays.as_deref() {
-                                    for (label, placement) in ov {
-                                        if !label.trim().is_empty() {
-                                            img = overlay_label(img, label, *placement);
-                                        }
-                                    }
-                                }
-                                st.dials[context.position as usize] = PlusLayer::Static(img);
+                                let seg =
+                                    plus_make_segment_overlay(Some(icon), overlays.as_deref());
+                                st.dials[context.position as usize] = PlusLayer::Static(seg);
                             } else {
-                                let prepared = crate::animation::prepare_frames(
+                                // Prepare icon frames (72x72), then wrap each into a 200x100 segment overlay
+                                // so labels are placed in the segment area (not drawn onto the tiny icon).
+                                let prepared_icons = crate::animation::prepare_frames(
                                     decoded.as_ref(),
                                     crate::animation::Target {
                                         width: 72,
@@ -664,9 +678,19 @@ pub async fn update_image(
                                         resize_mode: crate::animation::ResizeMode::Exact,
                                         filter: image::imageops::FilterType::Nearest,
                                     },
-                                    overlays.as_deref(),
-                                    Some(overlay_label),
+                                    None,
+                                    None,
                                 );
+                                let prepared = prepared_icons
+                                    .into_iter()
+                                    .map(|f| crate::animation::PreparedFrame {
+                                        delay: f.delay,
+                                        image: plus_make_segment_overlay(
+                                            Some(f.image),
+                                            overlays.as_deref(),
+                                        ),
+                                    })
+                                    .collect::<Vec<_>>();
                                 let next_at = Instant::now() + prepared[0].delay;
                                 st.dials[context.position as usize] = PlusLayer::Animated {
                                     frames: prepared,
@@ -763,6 +787,13 @@ pub async fn update_image(
                         overlays.as_deref(),
                         Some(overlay_label),
                     );
+                    let prepared: Vec<crate::animation::PreparedFrame> = prepared
+                        .into_iter()
+                        .map(|mut f| {
+                            f.image = round_corners_subtle(f.image);
+                            f
+                        })
+                        .collect();
 
                     // Render first frame immediately.
                     if let Err(e) = device
@@ -803,15 +834,6 @@ pub async fn update_image(
             let dyn_img = load_dynamic_image(image).await?;
 
             if context.controller == "Encoder" {
-                // For the encoder LCD, we draw icons at 72x72; overlay after resizing for sharper text.
-                let mut final_img = dyn_img.resize(72, 72, image::imageops::FilterType::Nearest);
-                if let Some(overlays) = overlays {
-                    for (label, placement) in overlays {
-                        if !label.trim().is_empty() {
-                            final_img = overlay_label(final_img, &label, placement);
-                        }
-                    }
-                }
                 if device.kind() == Kind::Plus {
                     let state = plus_state_for_device(
                         &context.device,
@@ -824,7 +846,9 @@ pub async fn update_image(
                             st.dials
                                 .resize(device.kind().encoder_count() as usize, PlusLayer::None);
                         }
-                        st.dials[context.position as usize] = PlusLayer::Static(final_img);
+                        st.dials[context.position as usize] = PlusLayer::Static(
+                            plus_make_segment_overlay(Some(dyn_img.clone()), overlays.as_deref()),
+                        );
                         plus_bump_generation(&mut st)
                     };
                     plus_render_once(&context.device, state.clone()).await;
@@ -836,6 +860,16 @@ pub async fn update_image(
                         plus_ensure_task(context.device.clone(), state, generation).await;
                     }
                 } else {
+                    // Legacy/non-Plus encoder LCD icons are 72x72; overlay after resizing for sharper text.
+                    let mut final_img =
+                        dyn_img.resize(72, 72, image::imageops::FilterType::Nearest);
+                    if let Some(overlays) = overlays.as_ref() {
+                        for o in overlays {
+                            if !o.text.trim().is_empty() {
+                                final_img = overlay_label(final_img, o);
+                            }
+                        }
+                    }
                     device
                         .write_lcd(
                             (context.position as u16 * 200) + 64,
@@ -855,13 +889,14 @@ pub async fn update_image(
                     kh as u32,
                     image::imageops::FilterType::Nearest,
                 );
-                if let Some(overlays) = overlays {
-                    for (label, placement) in overlays {
-                        if !label.trim().is_empty() {
-                            final_img = overlay_label(final_img, &label, placement);
+                if let Some(overlays) = overlays.as_ref() {
+                    for o in overlays {
+                        if !o.text.trim().is_empty() {
+                            final_img = overlay_label(final_img, o);
                         }
                     }
                 }
+                final_img = round_corners_subtle(final_img);
                 device.set_button_image(context.position, final_img).await?;
             }
         } else if context.controller == "Encoder" {
@@ -876,7 +911,16 @@ pub async fn update_image(
                         st.dials
                             .resize(device.kind().encoder_count() as usize, PlusLayer::None);
                     }
-                    st.dials[context.position as usize] = PlusLayer::None;
+                    let has_overlays = overlays
+                        .as_ref()
+                        .is_some_and(|ov| ov.iter().any(|o| !o.text.trim().is_empty()));
+                    if has_overlays {
+                        // Important: encoder segments can still show text even when there's no icon.
+                        st.dials[context.position as usize] =
+                            PlusLayer::Static(plus_make_segment_overlay(None, overlays.as_deref()));
+                    } else {
+                        st.dials[context.position as usize] = PlusLayer::None;
+                    }
                     plus_bump_generation(&mut st)
                 };
                 plus_render_once(&context.device, state.clone()).await;
@@ -897,8 +941,31 @@ pub async fn update_image(
                     .await?;
             }
         } else {
-            crate::animation::stop(&anim_key).await;
-            device.clear_button_image(context.position).await?;
+            // Keypad slot: if there's no icon but we still have overlays, render a blank key with text.
+            let has_overlays = overlays
+                .as_ref()
+                .is_some_and(|ov| ov.iter().any(|o| !o.text.trim().is_empty()));
+            if has_overlays {
+                crate::animation::stop(&anim_key).await;
+                let (kw, kh) = device.kind().key_image_format().size;
+                let mut img = image::DynamicImage::ImageRgba8(RgbaImage::from_pixel(
+                    kw as u32,
+                    kh as u32,
+                    Rgba([0, 0, 0, 255]),
+                ));
+                if let Some(ov) = overlays.as_ref() {
+                    for o in ov {
+                        if !o.text.trim().is_empty() {
+                            img = overlay_label(img, o);
+                        }
+                    }
+                }
+                img = round_corners_subtle(img);
+                device.set_button_image(context.position, img).await?;
+            } else {
+                crate::animation::stop(&anim_key).await;
+                device.clear_button_image(context.position).await?;
+            }
         }
         device.flush().await?;
     }
@@ -906,11 +973,21 @@ pub async fn update_image(
 }
 
 pub async fn set_lcd_background(id: &str, image: Option<&str>) -> Result<(), anyhow::Error> {
+    // Backwards-compatible shim: default crop.
+    set_lcd_background_with_crop(id, image, None).await
+}
+
+pub async fn set_lcd_background_with_crop(
+    id: &str,
+    image: Option<&str>,
+    crop: Option<crate::shared::EncoderScreenCrop>,
+) -> Result<(), anyhow::Error> {
     if let Some(device) = ELGATO_DEVICES.read().await.get(id) {
         if device.kind() != Kind::Plus {
             return Ok(());
         }
         let state = plus_state_for_device(id, device.kind().encoder_count() as usize).await;
+        let crop = crop.unwrap_or_default();
 
         let (generation, any_animated) = if let Some(image) = image {
             // Prefer decoding from bytes so GIF detection works for both `data:` and file paths.
@@ -920,25 +997,19 @@ pub async fn set_lcd_background(id: &str, image: Option<&str>) -> Result<(), any
                     crate::animation::decode_gif_cached(gif_cache_key(&bytes), bytes).await?;
                 let mut st = state.lock().await;
                 if decoded.len() <= 1 {
-                    st.background = PlusLayer::Static(
-                        decoded
-                            .first()
-                            .map(|f| f.image.clone())
-                            .unwrap_or_else(|| image::DynamicImage::new_rgb8(800, 100))
-                            .resize_exact(800, 100, image::imageops::FilterType::Nearest),
-                    );
+                    let img = decoded
+                        .first()
+                        .map(|f| f.image.clone())
+                        .unwrap_or_else(|| image::DynamicImage::new_rgb8(800, 100));
+                    st.background = PlusLayer::Static(crop_and_resize_strip_background(img, crop));
                 } else {
-                    let prepared = crate::animation::prepare_frames(
-                        decoded.as_ref(),
-                        crate::animation::Target {
-                            width: 800,
-                            height: 100,
-                            resize_mode: crate::animation::ResizeMode::Exact,
-                            filter: image::imageops::FilterType::Nearest,
-                        },
-                        None,
-                        None,
-                    );
+                    let prepared = decoded
+                        .iter()
+                        .map(|f| crate::animation::PreparedFrame {
+                            delay: f.delay,
+                            image: crop_and_resize_strip_background(f.image.clone(), crop),
+                        })
+                        .collect::<Vec<_>>();
                     let next_at = Instant::now() + prepared[0].delay;
                     st.background = PlusLayer::Animated {
                         frames: prepared,
@@ -950,11 +1021,8 @@ pub async fn set_lcd_background(id: &str, image: Option<&str>) -> Result<(), any
                 let any = st.background.is_animated() || st.dials.iter().any(|d| d.is_animated());
                 (generation, any)
             } else {
-                let dyn_img = image::load_from_memory(&bytes)?.resize_exact(
-                    800,
-                    100,
-                    image::imageops::FilterType::Nearest,
-                );
+                let dyn_img =
+                    crop_and_resize_strip_background(image::load_from_memory(&bytes)?, crop);
                 let mut st = state.lock().await;
                 st.background = PlusLayer::Static(dyn_img);
                 let generation = plus_bump_generation(&mut st);
@@ -1098,7 +1166,18 @@ async fn init(device: AsyncStreamDeck, device_id: String) {
                 // The official Stream Deck SDK surface is the `touchTap` event (with `hold`),
                 // which we emit from the higher-level TouchScreenPress/LongPress updates above.
                 DeviceStateUpdate::TouchPointDown(_) | DeviceStateUpdate::TouchPointUp(_) => Ok(()),
-                DeviceStateUpdate::TouchScreenSwipe(_, _) => Ok(()),
+                DeviceStateUpdate::TouchScreenSwipe(start, end) => {
+                    // Stream Deck+ UX: horizontal swipe switches pages like the official app.
+                    let dx = end.0 as i32 - start.0 as i32;
+                    let dy = end.1 as i32 - start.1 as i32;
+                    if dx.abs() >= dy.abs() {
+                        // Convention (matching the Stream Deck app): swipe left goes to previous page.
+                        let delta = if dx < 0 { -1 } else { 1 };
+                        let _ =
+                            crate::api::pages::shift_selected_page(device_id.clone(), delta).await;
+                    }
+                    encoder::touch_swipe(&device_id, start, end).await
+                }
             } {
                 Ok(_) => (),
                 Err(error) => log::warn!("Failed to process device event {update:?}: {error}"),
@@ -1118,6 +1197,10 @@ async fn init(device: AsyncStreamDeck, device_id: String) {
 
 /// Attempt to initialise all connected devices.
 pub async fn initialise_devices() {
+    if spawn_all_test_devices_enabled() {
+        register_spawn_all_test_devices().await;
+    }
+
     if let Ok(settings) = crate::store::get_settings() {
         if settings.value.disableelgato {
             crate::plugins::DEVICE_NAMESPACES.write().await.insert(

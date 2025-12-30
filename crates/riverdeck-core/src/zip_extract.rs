@@ -39,6 +39,13 @@ impl std::fmt::Display for ZipExtractError {
 impl std::error::Error for ZipExtractError {}
 
 pub fn dir_name<S: Read + Seek>(source: S) -> Result<String, ZipExtractError> {
+    dir_name_with_suffix(source, ".sdplugin")
+}
+
+pub fn dir_name_with_suffix<S: Read + Seek>(
+    source: S,
+    suffix_lower: &str,
+) -> Result<String, ZipExtractError> {
     let mut archive = zip::ZipArchive::new(source)?;
 
     if archive.len() == 1 {
@@ -49,12 +56,14 @@ pub fn dir_name<S: Read + Seek>(source: S) -> Result<String, ZipExtractError> {
                     zip::result::ZipError::UnsupportedArchive("nested archive too large"),
                 ));
             }
-            return dir_name(Cursor::new(
-                BufReader::new(file).bytes().flatten().collect::<Vec<u8>>(),
-            ));
+            return dir_name_with_suffix(
+                Cursor::new(BufReader::new(file).bytes().flatten().collect::<Vec<u8>>()),
+                suffix_lower,
+            );
         }
     }
 
+    let suffix_lower = suffix_lower.to_lowercase();
     for i in 0..archive.len() {
         let file = archive.by_index(i)?;
         if let Some(c) = PathBuf::from(file.name().replace('\\', "/"))
@@ -63,7 +72,7 @@ pub fn dir_name<S: Read + Seek>(source: S) -> Result<String, ZipExtractError> {
                 c.as_os_str()
                     .to_string_lossy()
                     .to_lowercase()
-                    .ends_with(".sdplugin")
+                    .ends_with(&suffix_lower)
             })
         {
             return Ok(c.as_os_str().to_string_lossy().to_string());
@@ -176,4 +185,26 @@ fn set_unix_mode<R: Read>(file: &zip::read::ZipFile<R>, outpath: &Path) -> io::R
         fs::set_permissions(outpath, PermissionsExt::from_mode(m))?
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn dir_name_with_suffix_finds_sdiconpack() {
+        let mut buf = Vec::<u8>::new();
+        let cur = std::io::Cursor::new(&mut buf);
+        let mut w = zip::ZipWriter::new(cur);
+        let opts = zip::write::FileOptions::<()>::default();
+        w.add_directory("com.example.test.sdIconPack/", opts)
+            .unwrap();
+        w.start_file("com.example.test.sdIconPack/manifest.json", opts)
+            .unwrap();
+        use std::io::Write;
+        w.write_all(b"{}").unwrap();
+        let cur = w.finish().unwrap();
+        let bytes = cur.into_inner();
+
+        let got = super::dir_name_with_suffix(std::io::Cursor::new(bytes), ".sdiconpack").unwrap();
+        assert_eq!(got, "com.example.test.sdIconPack");
+    }
 }

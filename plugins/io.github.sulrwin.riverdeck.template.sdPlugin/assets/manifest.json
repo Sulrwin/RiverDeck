@@ -1,0 +1,32 @@
+{
+  "Name": "RiverDeck Template Plugin",
+  "Description": "Template for RiverDeck-native plugins",
+  "Author": "RiverDeck",
+  "Version": "0.1.0",
+
+  "RiverDeck": { "ManifestVersion": 1 },
+
+  "CodePathLin": "linux/bin/riverdeck-template",
+  "Icon": "icons/plugin",
+  "Category": "RiverDeck",
+  "OS": [{ "Platform": "linux" }],
+
+  "Actions": [
+    {
+      "Icon": "icons/action",
+      "Name": "Template Action",
+      "States": [{ "Image": "actionDefaultImage" }],
+      "Controllers": ["Keypad"],
+      "SupportedInMultiActions": true,
+      "Tooltip": "Template action (edit me)",
+      "UUID": "io.github.sulrwin.riverdeck.template.action",
+      "PropertyInspectorPath": "propertyInspector/action.html"
+    }
+  ]
+}
+
+
+
+
+
+

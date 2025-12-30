@@ -2,15 +2,235 @@ use super::Store;
 
 use crate::shared::{ActionInstance, DEVICES, DeviceInfo, Page, Profile, config_dir};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::Entry};
 use std::fs;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, anyhow};
-use once_cell::sync::Lazy;
+use once_cell::sync::{Lazy, OnceCell};
 use serde::{Deserialize, Serialize};
 use std::path::Component;
-use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard, mpsc, oneshot};
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SaveKey {
+    device_id: String,
+    profile_id: String,
+}
+
+struct PendingWrite {
+    path: PathBuf,
+    bytes: Vec<u8>,
+    due_at: tokio::time::Instant,
+}
+
+enum SaveMsg {
+    Save {
+        key: SaveKey,
+        path: PathBuf,
+        bytes: Vec<u8>,
+    },
+    Flush(oneshot::Sender<()>),
+}
+
+struct SaveScheduler {
+    tx: mpsc::UnboundedSender<SaveMsg>,
+}
+
+impl SaveScheduler {
+    fn start(debounce: Duration) -> Self {
+        let (tx, mut rx) = mpsc::unbounded_channel::<SaveMsg>();
+
+        tokio::spawn(async move {
+            use std::pin::Pin;
+            use tokio::time::{Instant, Sleep, sleep};
+
+            let mut pending: HashMap<SaveKey, PendingWrite> = HashMap::new();
+            let mut next_deadline: Option<Instant> = None;
+            // Dummy sleep; we reset it whenever we have a real deadline.
+            let mut sleeper: Pin<Box<Sleep>> =
+                Box::pin(sleep(Duration::from_secs(365 * 24 * 60 * 60)));
+
+            let update_deadline = |pending: &HashMap<SaveKey, PendingWrite>| -> Option<Instant> {
+                pending.values().map(|p| p.due_at).min()
+            };
+
+            loop {
+                tokio::select! {
+                    msg = rx.recv() => {
+                        let Some(msg) = msg else {
+                            break;
+                        };
+                        match msg {
+                            SaveMsg::Save { key, path, bytes } => {
+                                let due_at = Instant::now() + debounce;
+                                match pending.entry(key) {
+                                    Entry::Occupied(mut e) => {
+                                        e.get_mut().path = path;
+                                        e.get_mut().bytes = bytes;
+                                        e.get_mut().due_at = due_at;
+                                    }
+                                    Entry::Vacant(v) => {
+                                        v.insert(PendingWrite { path, bytes, due_at });
+                                    }
+                                }
+                                next_deadline = update_deadline(&pending);
+                                if let Some(dl) = next_deadline {
+                                    sleeper.as_mut().reset(dl);
+                                }
+                            }
+                            SaveMsg::Flush(done) => {
+                                // Drain everything and write immediately.
+                                let mut writes: Vec<PendingWrite> = pending.drain().map(|(_, v)| v).collect();
+                                next_deadline = None;
+
+                                // Write newest last-write-wins snapshots.
+                                for w in writes.drain(..) {
+                                    let path = w.path;
+                                    let bytes = w.bytes;
+                                    let path_display = path.display().to_string();
+                                    let res = tokio::task::spawn_blocking(move || crate::store::write_atomic_bytes(&path, &bytes)).await;
+                                    match res {
+                                        Ok(Ok(())) => {}
+                                        Ok(Err(err)) => log::warn!("Debounced profile save failed ({}): {err:#}", path_display),
+                                        Err(join_err) => log::warn!("Debounced profile save task failed ({}): {join_err}", path_display),
+                                    }
+                                }
+
+                                let _ = done.send(());
+                            }
+                        }
+                    }
+                    _ = &mut sleeper, if next_deadline.is_some() => {
+                        let now = Instant::now();
+                        // Collect due keys first so we can move out the PendingWrite without cloning large buffers.
+                        let due_keys: Vec<SaveKey> = pending
+                            .iter()
+                            .filter(|(_k, v)| v.due_at <= now)
+                            .map(|(k, _v)| k.clone())
+                            .collect();
+                        let mut due: Vec<PendingWrite> = Vec::with_capacity(due_keys.len());
+                        for k in due_keys {
+                            if let Some(w) = pending.remove(&k) {
+                                due.push(w);
+                            }
+                        }
+
+                        for w in due {
+                            let path = w.path;
+                            let bytes = w.bytes;
+                            let path_display = path.display().to_string();
+                            let res = tokio::task::spawn_blocking(move || crate::store::write_atomic_bytes(&path, &bytes)).await;
+                            match res {
+                                Ok(Ok(())) => {}
+                                Ok(Err(err)) => log::warn!("Debounced profile save failed ({}): {err:#}", path_display),
+                                Err(join_err) => log::warn!("Debounced profile save task failed ({}): {join_err}", path_display),
+                            }
+                        }
+
+                        next_deadline = update_deadline(&pending);
+                        if let Some(dl) = next_deadline {
+                            sleeper.as_mut().reset(dl);
+                        }
+                    }
+                }
+            }
+
+            // If the scheduler is dropped (channel closed), flush remaining writes best-effort.
+            for (_k, w) in pending.drain() {
+                let path = w.path;
+                let bytes = w.bytes;
+                let path_display = path.display().to_string();
+                let res = tokio::task::spawn_blocking(move || {
+                    crate::store::write_atomic_bytes(&path, &bytes)
+                })
+                .await;
+                match res {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => {
+                        log::warn!("Debounced profile save failed ({}): {err:#}", path_display)
+                    }
+                    Err(join_err) => log::warn!(
+                        "Debounced profile save task failed ({}): {join_err}",
+                        path_display
+                    ),
+                }
+            }
+        });
+
+        Self { tx }
+    }
+
+    fn request(&self, key: SaveKey, path: PathBuf, bytes: Vec<u8>) {
+        let _ = self.tx.send(SaveMsg::Save { key, path, bytes });
+    }
+
+    async fn flush(&self) {
+        let (tx, rx) = oneshot::channel();
+        let _ = self.tx.send(SaveMsg::Flush(tx));
+        let _ = rx.await;
+    }
+}
+
+static SAVE_SCHEDULER: OnceCell<SaveScheduler> = OnceCell::new();
+
+fn save_debounce_duration() -> Duration {
+    // Default: 500ms
+    let raw = std::env::var("RIVERDECK_SAVE_DEBOUNCE_MS").ok();
+    let ms = raw
+        .as_deref()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(500)
+        .clamp(50, 5000);
+    Duration::from_millis(ms)
+}
+
+fn scheduler() -> Option<&'static SaveScheduler> {
+    if SAVE_SCHEDULER.get().is_none() && tokio::runtime::Handle::try_current().is_ok() {
+        let _ = SAVE_SCHEDULER.set(SaveScheduler::start(save_debounce_duration()));
+    }
+    SAVE_SCHEDULER.get()
+}
+
+/// Debounced profile save request (non-blocking): serializes the current selected profile and schedules it.
+///
+/// Intended for high-frequency inbound events (e.g. plugin `setTitle` / `setImage`).
+pub fn request_save_profile(device: &str, locks: &mut LocksMut<'_>) -> Result<(), anyhow::Error> {
+    let selected_profile = locks.device_stores.get_selected_profile(device)?;
+    let device_info = DEVICES.get(device).unwrap();
+    let store = locks
+        .profile_stores
+        .get_profile_store(&device_info, &selected_profile)?;
+
+    let value = crate::store::FromAndIntoDiskValue::into_value(&store.value)?;
+    let bytes = crate::store::json_value_to_bytes(&value)?;
+    let canonical_id = ProfileStores::canonical_id(&device_info.id, &selected_profile);
+    let path = config_dir()
+        .join("profiles")
+        .join(format!("{canonical_id}.json"));
+
+    let key = SaveKey {
+        device_id: device_info.id.clone(),
+        profile_id: selected_profile,
+    };
+
+    if let Some(s) = scheduler() {
+        s.request(key, path, bytes);
+    } else {
+        // If no Tokio runtime is available, fall back to a synchronous write.
+        crate::store::write_atomic_bytes(&path, &bytes)?;
+    }
+
+    Ok(())
+}
+
+/// Flush any pending debounced profile saves (best effort).
+pub async fn flush_pending_saves() {
+    if let Some(s) = scheduler() {
+        s.flush().await;
+    }
+}
 
 fn validate_profile_id(id: &str) -> Result<(), anyhow::Error> {
     let p = std::path::Path::new(id);
@@ -38,6 +258,7 @@ fn default_page() -> Page {
         keys: Vec::new(),
         sliders: Vec::new(),
         encoder_screen_background: None,
+        encoder_screen_crop: None,
     }
 }
 
@@ -50,6 +271,7 @@ fn ensure_page<'a>(profile: &'a mut Profile, page_id: &str) -> &'a mut Page {
         keys: Vec::new(),
         sliders: Vec::new(),
         encoder_screen_background: None,
+        encoder_screen_crop: None,
     });
     let idx = profile.pages.len().saturating_sub(1);
     &mut profile.pages[idx]

@@ -3,6 +3,7 @@ use std::env::var;
 use std::path::{Path, PathBuf};
 
 use directories::BaseDirs;
+use log::warn;
 use serde::{Deserialize, Deserializer, Serialize, de::Visitor};
 use serde_inline_default::serde_inline_default;
 
@@ -174,6 +175,89 @@ pub fn resource_dir() -> Option<PathBuf> {
     paths().resource_dir.clone()
 }
 
+/// Ensure core built-in action icons exist on disk.
+///
+/// Core built-ins reference `riverdeck/*.png` paths. In packaged builds these typically live under
+/// `resource_dir`, but in dev/debug builds we may not have bundled resources. To keep built-in
+/// actions functional (and avoid noisy "image path not found" warnings), create placeholder icons
+/// under `config_dir/riverdeck/` if they are missing.
+pub fn ensure_builtin_icons() {
+    let dir = config_dir().join("riverdeck");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+
+    const MULTI_SVG: &[u8] = include_bytes!("../assets/riverdeck/multi-action.svg");
+    const TOGGLE_SVG: &[u8] = include_bytes!("../assets/riverdeck/toggle-action.svg");
+
+    fn ensure_file(path: &Path, bytes: &[u8]) {
+        if path.is_file() {
+            return;
+        }
+        if let Err(err) = std::fs::write(path, bytes) {
+            warn!("Failed to write builtin icon {}: {}", path.display(), err);
+        }
+    }
+
+    fn looks_like_old_placeholder_png(path: &Path, rgb: [u8; 3]) -> bool {
+        let Ok(img) = image::open(path) else {
+            return false;
+        };
+        let rgba = img.to_rgba8();
+        let Some(first) = rgba.pixels().next() else {
+            return false;
+        };
+        // Fully opaque solid fill in the specific placeholder color.
+        if first.0[0..3] != rgb || first.0[3] != 0xff {
+            return false;
+        }
+        rgba.pixels().all(|p| p.0 == first.0)
+    }
+
+    fn ensure_png_from_svg(path: &Path, svg_bytes: &[u8]) {
+        // Preserve user overrides, but automatically replace our old solid-color placeholders.
+        if path.is_file()
+            && !looks_like_old_placeholder_png(
+                path,
+                // Multi/Toggle placeholder colors from earlier versions.
+                if path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_default()
+                    .contains("multi-action")
+                {
+                    [0x2d, 0x9c, 0xdb]
+                } else {
+                    [0xf2, 0xc9, 0x4c]
+                },
+            )
+        {
+            return;
+        }
+
+        let img = match crate::elgato::convert_svg_to_image(svg_bytes) {
+            Ok(img) => img,
+            Err(err) => {
+                warn!(
+                    "Failed to rasterize builtin SVG {}: {}",
+                    path.display(),
+                    err
+                );
+                return;
+            }
+        };
+        if let Err(err) = img.save_with_format(path, image::ImageFormat::Png) {
+            warn!("Failed to create builtin icon {}: {}", path.display(), err);
+        }
+    }
+
+    // Install both SVG (for UI/icon picker) and PNG (for compatibility with older profiles).
+    ensure_file(&dir.join("multi-action.svg"), MULTI_SVG);
+    ensure_file(&dir.join("toggle-action.svg"), TOGGLE_SVG);
+    ensure_png_from_svg(&dir.join("multi-action.png"), MULTI_SVG);
+    ensure_png_from_svg(&dir.join("toggle-action.png"), TOGGLE_SVG);
+}
+
 /// Get whether or not the application is running inside the Flatpak sandbox.
 pub fn is_flatpak() -> bool {
     var("FLATPAK_ID").is_ok()
@@ -184,12 +268,28 @@ pub fn is_flatpak() -> bool {
 
 /// Convert an icon specified in a plugin manifest to its full path.
 pub fn convert_icon(path: String) -> String {
+    // If the path already has a recognized image extension, use it as-is
+    let lower = path.to_lowercase();
+    if lower.ends_with(".png")
+        || lower.ends_with(".jpg")
+        || lower.ends_with(".jpeg")
+        || lower.ends_with(".gif")
+        || lower.ends_with(".svg")
+        || lower.ends_with(".bmp")
+        || lower.ends_with(".webp")
+    {
+        return path;
+    }
+
+    // Otherwise, try to find a variant with an extension.
     // Prefer raster formats first so physical devices (which need pixels) can render icons reliably.
     // Many plugins ship both `.svg` and `.png` variants; UI/webviews can use SVG, but devices can't.
     if Path::new(&(path.clone() + "@2x.png")).exists() {
         path + "@2x.png"
     } else if Path::new(&(path.clone() + ".png")).exists() {
         path + ".png"
+    } else if Path::new(&(path.clone() + ".jpg")).exists() {
+        path + ".jpg"
     } else if Path::new(&(path.clone() + ".svg")).exists() {
         path + ".svg"
     } else {
@@ -248,10 +348,15 @@ pub struct ActionState {
     pub text: String,
     #[serde(alias = "ShowTitle")]
     pub show: bool,
-    /// Whether the action's display name should be rendered as an additional label on the button.
+    /// Whether the action icon/image should be rendered on the button.
     ///
     /// This is a RiverDeck extension (not part of the Stream Deck manifest schema).
     #[serde(default = "default_true")]
+    pub show_icon: bool,
+    /// Whether the action's display name should be rendered as an additional label on the button.
+    ///
+    /// This is a RiverDeck extension (not part of the Stream Deck manifest schema).
+    #[serde(default = "default_false")]
     pub show_action_name: bool,
     #[serde(alias = "TitleColor")]
     pub colour: String,
@@ -270,6 +375,10 @@ pub struct ActionState {
     pub underline: bool,
 }
 
+fn default_false() -> bool {
+    false
+}
+
 fn default_true() -> bool {
     true
 }
@@ -281,19 +390,21 @@ impl Default for ActionState {
             name: String::new(),
             text: String::new(),
             show: true,
-            show_action_name: true,
+            show_icon: true,
+            show_action_name: false,
             colour: "#FFFFFF".to_owned(),
             alignment: "middle".to_owned(),
             text_placement: TextPlacement::Bottom,
             family: "Liberation Sans".to_owned(),
             style: "Regular".to_owned(),
-            size: FontSize(16),
+            // Slightly smaller default so labels don't overpower icons, especially on larger keys.
+            size: FontSize(14),
             underline: false,
         }
     }
 }
 
-#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TextPlacement {
     Top,
@@ -301,6 +412,22 @@ pub enum TextPlacement {
     Bottom,
     Left,
     Right,
+    Center,
+}
+
+/// A concrete label overlay to render on a button image.
+///
+/// This is a host-side rendering concern used by RiverDeck's hardware compositor and UI previews.
+/// It is derived from `ActionState` (title text + display preferences) at a specific moment in
+/// time, so we keep it lightweight and easily hashable for preview caching.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct LabelOverlay {
+    pub text: String,
+    pub placement: TextPlacement,
+    /// Text color (CSS-style hex, typically `#RRGGBB`).
+    pub colour: String,
+    /// Requested font size (Stream Deck style). RiverDeck uses this as a scaling hint.
+    pub size: u16,
 }
 
 #[serde_inline_default]
@@ -476,6 +603,32 @@ pub struct Page {
     pub sliders: Vec<Option<ActionInstance>>,
     #[serde(default)]
     pub encoder_screen_background: Option<String>,
+    /// Stream Deck+ strip background crop parameters (RiverDeck extension).
+    ///
+    /// If absent, RiverDeck uses the default "cover" crop (centered) rather than stretching.
+    #[serde(default)]
+    pub encoder_screen_crop: Option<EncoderScreenCrop>,
+}
+
+/// Crop settings for the Stream Deck+ strip background (800x100).
+///
+/// - `focus_x`/`focus_y`: normalized center point in the source image, in `[0, 1]`.
+/// - `zoom`: `>= 1.0`, where `1.0` is the default cover crop; higher zoom crops tighter.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct EncoderScreenCrop {
+    pub focus_x: f32,
+    pub focus_y: f32,
+    pub zoom: f32,
+}
+
+impl Default for EncoderScreenCrop {
+    fn default() -> Self {
+        Self {
+            focus_x: 0.5,
+            focus_y: 0.5,
+            zoom: 1.0,
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]

@@ -1,7 +1,7 @@
 use super::{send_to_all_plugins, send_to_plugin};
 
 use crate::plugins::{DEVICE_NAMESPACES, info_param::DeviceInfo};
-use crate::shared::{ActionInstance, TextPlacement};
+use crate::shared::{ActionInstance, LabelOverlay, TextPlacement};
 use crate::store::profiles;
 
 use serde::Serialize;
@@ -53,9 +53,30 @@ pub async fn update_image(
     update_image_with_overlays(context, image, None).await
 }
 
-pub(crate) fn overlays_for_instance(
-    instance: &ActionInstance,
-) -> Option<Vec<(String, TextPlacement)>> {
+pub fn effective_image_for_instance(instance: &ActionInstance) -> Option<String> {
+    let st = instance
+        .states
+        .get(instance.current_state as usize)
+        .or_else(|| instance.states.first())?;
+
+    if !st.show_icon {
+        return None;
+    }
+
+    let img = st.image.trim();
+    if !img.is_empty() && img != "actionDefaultImage" {
+        return Some(img.to_owned());
+    }
+
+    let icon = instance.action.icon.trim();
+    if icon.is_empty() {
+        None
+    } else {
+        Some(icon.to_owned())
+    }
+}
+
+pub fn overlays_for_instance(instance: &ActionInstance) -> Option<Vec<LabelOverlay>> {
     let st = instance.states.get(instance.current_state as usize)?;
 
     let title = st.text.trim();
@@ -67,19 +88,27 @@ pub(crate) fn overlays_for_instance(
         return None;
     }
 
-    let mut overlays: Vec<(String, TextPlacement)> = Vec::new();
+    let colour = st.colour.clone();
+    let size = st.size.0;
+    let mk = |text: &str, placement: TextPlacement| LabelOverlay {
+        text: text.to_owned(),
+        placement,
+        colour: colour.clone(),
+        size,
+    };
+    let mut overlays: Vec<LabelOverlay> = Vec::new();
 
     // If both are enabled (and different), force Top/Bottom. This makes the UI predictable and
     // avoids overlapping when users toggle both on.
     if show_title && show_action_name && title != action_name {
-        overlays.push((action_name.to_owned(), TextPlacement::Top));
-        overlays.push((title.to_owned(), TextPlacement::Bottom));
+        overlays.push(mk(action_name, TextPlacement::Top));
+        overlays.push(mk(title, TextPlacement::Bottom));
         return Some(overlays);
     }
 
     // Keep legacy behavior: the Stream Deck "Title" uses `text_placement`.
     if show_title {
-        overlays.push((title.to_owned(), st.text_placement));
+        overlays.push(mk(title, st.text_placement));
     }
 
     // If the title already equals the action name (common default), don't render both.
@@ -91,12 +120,13 @@ pub(crate) fn overlays_for_instance(
                 TextPlacement::Bottom => TextPlacement::Top,
                 TextPlacement::Left => TextPlacement::Right,
                 TextPlacement::Right => TextPlacement::Left,
+                TextPlacement::Center => TextPlacement::Bottom,
             }
         } else {
             // If there's no title, keep the action name in the familiar place.
             TextPlacement::Bottom
         };
-        overlays.push((action_name.to_owned(), placement));
+        overlays.push(mk(action_name, placement));
     }
 
     Some(overlays)
@@ -114,9 +144,7 @@ pub async fn update_image_for_instance(
     .await
 }
 
-pub async fn overlays_for_context(
-    context: &crate::shared::Context,
-) -> Option<Vec<(String, TextPlacement)>> {
+pub async fn overlays_for_context(context: &crate::shared::Context) -> Option<Vec<LabelOverlay>> {
     // This is an async lookup that can await locks safely. Do NOT call this from places that
     // already hold profile locks; prefer `overlays_for_instance()` in those cases.
     let locks = profiles::acquire_locks().await;
@@ -127,7 +155,7 @@ pub async fn overlays_for_context(
 pub async fn update_image_with_overlays(
     context: crate::shared::Context,
     image: Option<String>,
-    overlays: Option<Vec<(String, TextPlacement)>>,
+    overlays: Option<Vec<LabelOverlay>>,
 ) -> Result<(), anyhow::Error> {
     if let Some(plugin) = DEVICE_NAMESPACES.read().await.get(&context.device[..2]) {
         send_to_plugin(

@@ -4,6 +4,12 @@ use once_cell::sync::OnceCell;
 use tokio::sync::broadcast;
 
 #[derive(Debug, Clone)]
+pub enum PluginInstallPhase {
+    Started,
+    Finished { ok: bool, error: Option<String> },
+}
+
+#[derive(Debug, Clone)]
 pub enum UiEvent {
     DevicesUpdated,
     ApplicationsUpdated {
@@ -33,6 +39,10 @@ pub enum UiEvent {
     /// A hint that the UI should rerender/reload images for a given device (e.g. after device connect).
     RerenderImages {
         device: String,
+    },
+    PluginInstall {
+        id: String,
+        phase: PluginInstallPhase,
     },
 }
 

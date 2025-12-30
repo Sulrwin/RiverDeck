@@ -140,6 +140,7 @@ pub async fn set_encoder_screen_background(
             keys: vec![],
             sliders: vec![],
             encoder_screen_background: None,
+            encoder_screen_crop: None,
         });
     }
     if store.value.selected_page.trim().is_empty() {
@@ -187,6 +188,10 @@ pub async fn set_encoder_screen_background(
     };
 
     page.encoder_screen_background = new_value.clone();
+    // Reset crop whenever the background changes (new image should start at default cover crop).
+    page.encoder_screen_crop = None;
+    let bg_to_apply = page.encoder_screen_background.clone();
+    let crop_to_apply = page.encoder_screen_crop;
     store.save()?;
 
     // If this profile is active, apply immediately to the device.
@@ -196,23 +201,100 @@ pub async fn set_encoder_screen_background(
         .ok()
         .is_some_and(|p| p == profile);
     if active {
-        let _ = crate::elgato::set_lcd_background(&device, new_value.as_deref()).await;
+        let _ = crate::elgato::set_lcd_background_with_crop(
+            &device,
+            bg_to_apply.as_deref(),
+            crop_to_apply,
+        )
+        .await;
         // Re-apply encoder images on top of the background (Plus LCD).
         for instance in selected_page(&store.value).sliders.iter().flatten() {
-            let img = instance
-                .states
-                .get(instance.current_state as usize)
-                .map(|s| s.image.trim())
-                .filter(|s| !s.is_empty() && *s != "actionDefaultImage")
-                .map(|s| s.to_owned())
-                .unwrap_or_else(|| instance.action.icon.clone());
             let _ = crate::events::outbound::devices::update_image(
                 (&instance.context).into(),
-                Some(img),
+                crate::events::outbound::devices::effective_image_for_instance(instance),
             )
             .await;
         }
     }
+
+    // Notify UI hosts that cached previews may be stale (background path/crop reset affects preview rendering).
+    crate::ui::emit(crate::ui::UiEvent::RerenderImages {
+        device: device.clone(),
+    });
+
+    Ok(())
+}
+
+/// Set (or clear) the crop settings for the Stream Deck+ strip background on the currently selected page.
+///
+/// If the profile is currently active, this re-applies the strip background immediately.
+pub async fn set_encoder_screen_background_crop(
+    device: String,
+    profile: String,
+    crop: Option<crate::shared::EncoderScreenCrop>,
+) -> Result<(), anyhow::Error> {
+    let mut locks = acquire_locks_mut().await;
+    if !DEVICES.contains_key(&device) {
+        return Err(anyhow::anyhow!("device {device} not found"));
+    }
+
+    let store = locks
+        .profile_stores
+        .get_profile_store_mut(&DEVICES.get(&device).unwrap(), &profile)
+        .await?;
+
+    if store.value.pages.is_empty() {
+        store.value.pages.push(crate::shared::Page {
+            id: "1".to_owned(),
+            keys: vec![],
+            sliders: vec![],
+            encoder_screen_background: None,
+            encoder_screen_crop: None,
+        });
+    }
+    if store.value.selected_page.trim().is_empty() {
+        store.value.selected_page = "1".to_owned();
+    }
+    let page_id = store.value.selected_page.clone();
+    let idx = store
+        .value
+        .pages
+        .iter()
+        .position(|p| p.id == page_id)
+        .unwrap_or(0);
+    let page = &mut store.value.pages[idx];
+
+    page.encoder_screen_crop = crop;
+    let bg_to_apply = page.encoder_screen_background.clone();
+    let crop_to_apply = page.encoder_screen_crop;
+    store.save()?;
+
+    let active = locks
+        .device_stores
+        .get_selected_profile(&device)
+        .ok()
+        .is_some_and(|p| p == profile);
+    if active {
+        let _ = crate::elgato::set_lcd_background_with_crop(
+            &device,
+            bg_to_apply.as_deref(),
+            crop_to_apply,
+        )
+        .await;
+        // Re-apply encoder images on top of the background (Plus LCD).
+        for instance in selected_page(&store.value).sliders.iter().flatten() {
+            let _ = crate::events::outbound::devices::update_image(
+                (&instance.context).into(),
+                crate::events::outbound::devices::effective_image_for_instance(instance),
+            )
+            .await;
+        }
+    }
+
+    // Notify UI hosts that cached previews may be stale (crop affects preview UVs).
+    crate::ui::emit(crate::ui::UiEvent::RerenderImages {
+        device: device.clone(),
+    });
 
     Ok(())
 }
@@ -263,7 +345,12 @@ pub async fn set_selected_profile(device: String, id: String) -> Result<(), anyh
     // If this profile has an encoder LCD background (Stream Deck+), apply it before `willAppear`
     // so per-dial images render on top.
     if let Some(bg) = new_page.encoder_screen_background.as_deref() {
-        let _ = crate::elgato::set_lcd_background(&device, Some(bg)).await;
+        let _ = crate::elgato::set_lcd_background_with_crop(
+            &device,
+            Some(bg),
+            new_page.encoder_screen_crop,
+        )
+        .await;
     }
     for instance in new_page
         .keys
@@ -276,6 +363,14 @@ pub async fn set_selected_profile(device: String, id: String) -> Result<(), anyh
         {
             let _ = crate::events::outbound::will_appear::will_appear(instance).await;
         } else {
+            // Multi/Toggle parent instances are built-in and don't have a real plugin process.
+            // Avoid queuing `willAppear`, but do ensure a visible icon is pushed after `clear_screen()`.
+            let _ = crate::events::outbound::devices::update_image_for_instance(
+                instance,
+                crate::events::outbound::devices::effective_image_for_instance(instance),
+            )
+            .await;
+
             for child in instance.children.as_ref().unwrap() {
                 let _ = crate::events::outbound::will_appear::will_appear(child).await;
             }

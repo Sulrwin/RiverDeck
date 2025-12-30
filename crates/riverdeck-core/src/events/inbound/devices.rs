@@ -61,9 +61,15 @@ pub async fn register_device(
                 s.placement,
                 crate::shared::ScreenPlacement::BetweenKeypadAndEncoders
             )
-        }) && let Some(bg) = page.and_then(|p| p.encoder_screen_background.as_deref())
+        }) && let Some(page) = page
+            && let Some(bg) = page.encoder_screen_background.as_deref()
         {
-            let _ = crate::elgato::set_lcd_background(&event.payload.id, Some(bg)).await;
+            let _ = crate::elgato::set_lcd_background_with_crop(
+                &event.payload.id,
+                Some(bg),
+                page.encoder_screen_crop,
+            )
+            .await;
         }
         if let Some(page) = page {
             for instance in page
@@ -72,7 +78,25 @@ pub async fn register_device(
                 .flatten()
                 .chain(page.sliders.iter().flatten())
             {
-                let _ = crate::events::outbound::will_appear::will_appear(instance).await;
+                if !(crate::shared::is_multi_action_uuid(instance.action.uuid.as_str())
+                    || crate::shared::is_toggle_action_uuid(instance.action.uuid.as_str()))
+                {
+                    let _ = crate::events::outbound::will_appear::will_appear(instance).await;
+                } else {
+                    // Multi/Toggle parent instances are host-side (no real plugin process).
+                    // Don't require `send_to_plugin` to succeed; still push a visible icon now.
+                    let _ = crate::events::outbound::devices::update_image_for_instance(
+                        instance,
+                        crate::events::outbound::devices::effective_image_for_instance(instance),
+                    )
+                    .await;
+
+                    if let Some(children) = instance.children.as_ref() {
+                        for child in children {
+                            let _ = crate::events::outbound::will_appear::will_appear(child).await;
+                        }
+                    }
+                }
             }
         }
 

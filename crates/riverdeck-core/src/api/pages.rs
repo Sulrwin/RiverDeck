@@ -20,6 +20,7 @@ fn selected_page_mut(profile: &mut Profile) -> &mut Page {
             keys: vec![],
             sliders: vec![],
             encoder_screen_background: None,
+            encoder_screen_crop: None,
         });
     }
     if profile.selected_page.trim().is_empty() {
@@ -79,6 +80,7 @@ pub async fn set_selected_page(
             keys: vec![],
             sliders: vec![],
             encoder_screen_background: None,
+            encoder_screen_crop: None,
         });
     }
 
@@ -129,9 +131,19 @@ pub async fn set_selected_page(
         let new_page = selected_page(&store.value).unwrap();
 
         if let Some(bg) = new_page.encoder_screen_background.as_deref() {
-            let _ = crate::elgato::set_lcd_background(&device, Some(bg)).await;
+            let _ = crate::elgato::set_lcd_background_with_crop(
+                &device,
+                Some(bg),
+                new_page.encoder_screen_crop,
+            )
+            .await;
         } else {
-            let _ = crate::elgato::set_lcd_background(&device, None).await;
+            let _ = crate::elgato::set_lcd_background_with_crop(
+                &device,
+                None,
+                new_page.encoder_screen_crop,
+            )
+            .await;
         }
 
         for instance in new_page
@@ -144,15 +156,81 @@ pub async fn set_selected_page(
                 || crate::shared::is_toggle_action_uuid(instance.action.uuid.as_str()))
             {
                 let _ = crate::events::outbound::will_appear::will_appear(instance).await;
-            } else if let Some(children) = instance.children.as_ref() {
-                for child in children {
-                    let _ = crate::events::outbound::will_appear::will_appear(child).await;
+            } else {
+                // Multi/Toggle parent instances are built-in and don't have a real plugin process
+                // behind them, so we avoid queuing `willAppear`. But we *must* still push a visible
+                // icon back to the device after `clear_screen()` (e.g. when paging via swipe).
+                let _ = crate::events::outbound::devices::update_image_for_instance(
+                    instance,
+                    crate::events::outbound::devices::effective_image_for_instance(instance),
+                )
+                .await;
+
+                if let Some(children) = instance.children.as_ref() {
+                    for child in children {
+                        let _ = crate::events::outbound::will_appear::will_appear(child).await;
+                    }
                 }
             }
         }
     }
 
+    // Notify UI hosts that cached previews may be stale (page selection affects slot + background state).
+    crate::ui::emit(crate::ui::UiEvent::RerenderImages {
+        device: device.clone(),
+    });
+
     Ok(())
+}
+
+/// Shift the currently selected page for the device's active profile.
+///
+/// - `delta = 1` selects the next page (wraps at end).
+/// - `delta = -1` selects the previous page (wraps at start).
+pub async fn shift_selected_page(device: String, delta: i32) -> Result<(), anyhow::Error> {
+    if delta == 0 {
+        return Ok(());
+    }
+
+    // Compute the next page id under a single lock, then drop and route through `set_selected_page`
+    // for correct willDisappear/willAppear + device update behavior.
+    let (profile_id, next_page_id) = {
+        let mut locks = acquire_locks_mut().await;
+        if !DEVICES.contains_key(&device) {
+            return Err(anyhow::anyhow!("device {device} not found"));
+        }
+        let profile_id = locks.device_stores.get_selected_profile(&device)?;
+
+        let dev = DEVICES.get(&device).unwrap();
+        let store = locks
+            .profile_stores
+            .get_profile_store_mut(&dev, &profile_id)
+            .await?;
+
+        if store.value.pages.len() <= 1 {
+            return Ok(());
+        }
+
+        let cur_id = store.value.selected_page.clone();
+        let cur_idx = store
+            .value
+            .pages
+            .iter()
+            .position(|p| p.id == cur_id)
+            .unwrap_or(0) as i32;
+        let len = store.value.pages.len() as i32;
+        let next_idx = (cur_idx + delta).rem_euclid(len) as usize;
+        let next_page_id = store
+            .value
+            .pages
+            .get(next_idx)
+            .map(|p| p.id.clone())
+            .unwrap_or_else(|| "1".to_owned());
+
+        (profile_id, next_page_id)
+    };
+
+    set_selected_page(device, profile_id, next_page_id).await
 }
 
 pub async fn create_page_and_select(
@@ -179,6 +257,7 @@ pub async fn create_page_and_select(
                 keys: vec![None; (dev.rows * dev.columns) as usize],
                 sliders: vec![None; dev.encoders as usize],
                 encoder_screen_background: None,
+                encoder_screen_crop: None,
             });
             store.save()?;
             drop(locks);
@@ -261,6 +340,9 @@ pub async fn delete_page(
         .join(&profile_id)
         .join(&page_id);
     let _ = tokio::fs::remove_dir_all(images_dir).await;
+
+    // Notify UI hosts that cached previews may be stale (page list and/or selected page may have changed).
+    crate::ui::emit(crate::ui::UiEvent::RerenderImages { device });
 
     Ok(())
 }

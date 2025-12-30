@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="144" height="144" viewBox="0 0 144 144">
+  <!-- RiverDeck built-in icon: Toggle Action (matches starterpack icon style) -->
+  <rect x="0" y="0" width="144" height="144" fill="#3b3640"/>
+  <g fill="none" stroke="#e8e8e8" stroke-width="10" stroke-linecap="round" stroke-linejoin="round">
+    <!-- Two states -->
+    <rect x="34" y="36" width="76" height="36" rx="10"/>
+    <rect x="34" y="72" width="76" height="36" rx="10"/>
+
+    <!-- Swap arrows between states -->
+    <path d="M98 54 C112 54 112 90 98 90"/>
+    <path d="M98 90 L108 82"/>
+    <path d="M98 90 L108 98"/>
+
+    <path d="M46 90 C32 90 32 54 46 54"/>
+    <path d="M46 54 L36 62"/>
+    <path d="M46 54 L36 46"/>
+  </g>
+</svg>
+
+
+

@@ -144,9 +144,9 @@ pub async fn decode_gif_cached(
 pub fn prepare_frames(
     frames: &[PreparedFrame],
     target: Target,
-    overlays: Option<&[(String, crate::shared::TextPlacement)]>,
+    overlays: Option<&[crate::shared::LabelOverlay]>,
     overlay_fn: Option<
-        fn(image::DynamicImage, &str, crate::shared::TextPlacement) -> image::DynamicImage,
+        fn(image::DynamicImage, &crate::shared::LabelOverlay) -> image::DynamicImage,
     >,
 ) -> Vec<PreparedFrame> {
     let mut out: Vec<PreparedFrame> = Vec::with_capacity(frames.len());
@@ -160,9 +160,9 @@ pub fn prepare_frames(
         };
 
         if let (Some(ov), Some(apply)) = (overlays, overlay_fn) {
-            for (label, placement) in ov {
-                if !label.trim().is_empty() {
-                    img = apply(img, label, *placement);
+            for o in ov {
+                if !o.text.trim().is_empty() {
+                    img = apply(img, o);
                 }
             }
         }

@@ -1,5 +1,6 @@
 pub mod info_param;
 pub mod manifest;
+pub mod marketplace;
 mod webserver;
 
 use crate::shared::{CATEGORIES, Category, config_dir, convert_icon, is_flatpak, log_dir};
@@ -126,9 +127,21 @@ pub static PORT_BASE: Lazy<u16> = Lazy::new(|| {
 /// Initialise a plugin from a given directory.
 pub async fn initialise_plugin(path: &path::Path) -> anyhow::Result<()> {
     let plugin_uuid = path.file_name().unwrap().to_str().unwrap();
-    let target = std::env::var("TARGET").unwrap_or_default();
+    log::info!("Attempting to initialise plugin: {}", plugin_uuid);
+    let target = manifest::host_target_triple();
 
     let mut manifest = manifest::read_manifest(path)?;
+    log::info!("Manifest read successfully for {}", plugin_uuid);
+
+    // Native binary plugins only: refuse non-native plugins early with a clear reason.
+    if let Err(reason) = manifest::validate_riverdeck_native(plugin_uuid, &manifest) {
+        log::warn!(
+            "Plugin {} is unsupported by policy: {:?}",
+            plugin_uuid,
+            reason
+        );
+        return Err(anyhow!("unsupported plugin"));
+    }
 
     // RiverDeck branding: treat legacy OpenDeck categories as our built-in category.
     // This covers plugins installed under the user's config dir that still declare `"Category": "OpenDeck"`.
@@ -274,8 +287,22 @@ pub async fn initialise_plugin(path: &path::Path) -> anyhow::Result<()> {
     }
 
     if !supported || code_path.is_none() {
+        log::warn!(
+            "Plugin {} is unsupported on platform {} (supported={}, code_path={:?})",
+            plugin_uuid,
+            platform,
+            supported,
+            code_path
+        );
         return Err(anyhow!("unsupported on platform {}", platform));
     }
+
+    log::info!(
+        "Plugin {} will launch with code_path: {:?}, use_wine: {}",
+        plugin_uuid,
+        code_path,
+        use_wine
+    );
 
     let code_path = code_path.unwrap();
     if !is_safe_relative_path(&code_path) {
@@ -341,6 +368,7 @@ pub async fn initialise_plugin(path: &path::Path) -> anyhow::Result<()> {
         || code_path.to_lowercase().ends_with(".mjs")
         || code_path.to_lowercase().ends_with(".cjs")
     {
+        log::info!("Plugin {} is a Node.js plugin", plugin_uuid);
         // Check for Node.js installation and version in one go.
         let command = if is_flatpak() {
             "flatpak-spawn"
@@ -363,12 +391,22 @@ pub async fn initialise_plugin(path: &path::Path) -> anyhow::Result<()> {
             .and_then(|s| semver::Version::parse(&s).ok())
             .is_some_and(|v| v >= semver::Version::new(20, 0, 0));
         if !version_ok {
+            log::error!(
+                "Node.js version 20.0.0 or higher is required for plugin {}",
+                plugin_uuid
+            );
             return Err(anyhow!("Node.js version 20.0.0 or higher is required"));
         }
+        log::info!("Node.js version check passed for {}", plugin_uuid);
 
         let info = info_param::make_info(plugin_uuid.to_owned(), manifest.version, true).await;
         let log_file =
             fs::File::create(log_dir().join("plugins").join(format!("{plugin_uuid}.log")))?;
+        log::info!(
+            "Created log file for {} at {:?}",
+            plugin_uuid,
+            log_dir().join("plugins").join(format!("{plugin_uuid}.log"))
+        );
 
         #[cfg(target_os = "windows")]
         {
@@ -395,9 +433,9 @@ pub async fn initialise_plugin(path: &path::Path) -> anyhow::Result<()> {
         #[cfg(not(target_os = "windows"))]
         {
             let mut cmd = Command::new(command);
-            cmd.current_dir(path)
-                .args(extra_args)
-                .arg(code_path)
+            cmd.current_dir(path).args(extra_args);
+
+            cmd.arg(code_path)
                 .args(args)
                 .arg(serde_json::to_string(&info)?)
                 .stdin(Stdio::null())
@@ -406,6 +444,11 @@ pub async fn initialise_plugin(path: &path::Path) -> anyhow::Result<()> {
             #[cfg(unix)]
             unix_set_new_process_group(&mut cmd);
             let child = cmd.spawn()?;
+            log::info!(
+                "Spawned Node.js plugin {} with PID {}",
+                plugin_uuid,
+                child.id()
+            );
             record_child_process(child.id(), "plugin_node", plugin_uuid);
 
             INSTANCES
@@ -414,6 +457,7 @@ pub async fn initialise_plugin(path: &path::Path) -> anyhow::Result<()> {
                 .insert(plugin_uuid.to_owned(), PluginInstance::Node(child));
         }
     } else if use_wine {
+        log::info!("Plugin {} will run via Wine", plugin_uuid);
         let command = if is_flatpak() {
             "flatpak-spawn"
         } else {
@@ -619,8 +663,10 @@ pub async fn deactivate_all_plugins() -> Result<(), anyhow::Error> {
 
 /// Initialise plugins from the plugins directory.
 pub fn initialise_plugins() {
+    log::info!("initialise_plugins() called");
     // Servers should be started only once; reloading plugins should not rebind ports.
     if !PLUGIN_SERVERS_STARTED.swap(true, Ordering::SeqCst) {
+        log::info!("Starting plugin servers for the first time");
         tokio::spawn(init_websocket_server());
         tokio::spawn(webserver::init_webserver(config_dir()));
     } else {
@@ -697,6 +743,11 @@ pub fn initialise_plugins() {
         }
     }
 
+    let disabled_plugins = crate::store::get_settings()
+        .ok()
+        .map(|s| s.value.disabled_plugins)
+        .unwrap_or_default();
+
     let entries = match fs::read_dir(&plugin_dir) {
         Ok(p) => p,
         Err(error) => {
@@ -710,6 +761,7 @@ pub fn initialise_plugins() {
     };
 
     // Iterate through all directory entries in the plugins folder and initialise them as plugins if appropriate
+    log::info!("Scanning plugins directory: {}", plugin_dir.display());
     for entry in entries {
         if let Ok(entry) = entry {
             let entry_path = entry.path();
@@ -748,6 +800,15 @@ pub fn initialise_plugins() {
                 Err(_) => continue,
             };
             if metadata.is_dir() {
+                // Folder name is the plugin ID used throughout RiverDeck.
+                let plugin_id = match path.file_name().and_then(|s| s.to_str()) {
+                    Some(s) => s.to_owned(),
+                    None => continue,
+                };
+                if disabled_plugins.contains(&plugin_id) {
+                    log::info!("Skipping disabled plugin {}", plugin_id);
+                    continue;
+                }
                 tokio::spawn(async move {
                     if let Err(error) = initialise_plugin(&path).await {
                         warn!(

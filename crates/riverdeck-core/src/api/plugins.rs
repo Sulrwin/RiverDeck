@@ -1,5 +1,6 @@
 use crate::shared::{config_dir, log_dir};
 use crate::store::profiles::{acquire_locks, get_instance};
+use crate::ui::{PluginInstallPhase, UiEvent};
 
 use tokio::fs;
 
@@ -87,9 +88,47 @@ pub async fn install_plugin(
             if !(url.starts_with("https://") || url.starts_with("http://")) {
                 return Err(anyhow::anyhow!("unsupported url scheme"));
             }
-            let resp = reqwest::get(url).await?;
+            let parsed = reqwest::Url::parse(&url).ok();
+            let host = parsed
+                .as_ref()
+                .and_then(|u| u.host_str())
+                .unwrap_or_default();
+
+            // Some marketplace/CDN downloads require browser-like headers; otherwise they can return
+            // HTML/error pages that look like a successful download but aren't a zip archive.
+            let client = reqwest::Client::new();
+            let mut rb = client.get(&url).header("accept", "*/*");
+            if host.ends_with("mp-cdn.elgato.com") || host.ends_with("mp-gateway.elgato.com") {
+                rb = rb
+                    .header(
+                        "user-agent",
+                        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) RiverDeck/1.0",
+                    )
+                    .header("origin", "https://marketplace.elgato.com")
+                    .header("referer", "https://marketplace.elgato.com/");
+            }
+
+            let resp = rb.send().await?;
+            let status = resp.status();
+            if !status.is_success() {
+                let body = resp.bytes().await.unwrap_or_default();
+                let preview = String::from_utf8_lossy(&body[..body.len().min(256)]).into_owned();
+                return Err(anyhow::anyhow!(
+                    "download failed (status={status}) body_preview={preview:?}"
+                ));
+            }
             use std::ops::Deref;
-            resp.bytes().await?.deref().to_owned()
+            let bytes = resp.bytes().await?.deref().to_owned();
+
+            // Quick sanity check: Stream Deck plugin archives are zip files (start with "PK").
+            // If this doesn't look like a zip, surface a clearer error before unzip.
+            if bytes.len() >= 2 && &bytes[0..2] != b"PK" {
+                let preview = String::from_utf8_lossy(&bytes[..bytes.len().min(256)]).into_owned();
+                return Err(anyhow::anyhow!(
+                    "downloaded file does not look like a zip (missing PK header); body_preview={preview:?}"
+                ));
+            }
+            bytes
         }
         Some(path) => std::fs::read(path)?,
     };
@@ -102,103 +141,156 @@ pub async fn install_plugin(
         },
     };
 
-    let _ = crate::plugins::deactivate_plugin(&id).await;
+    crate::ui::emit(UiEvent::PluginInstall {
+        id: id.clone(),
+        phase: PluginInstallPhase::Started,
+    });
 
-    let config_dir = config_dir();
-    let plugins_dir = config_dir.join("plugins");
-    let actual = plugins_dir.join(&id);
+    let result: Result<(), anyhow::Error> = async {
+        let _ = crate::plugins::deactivate_plugin(&id).await;
 
-    // Extract into an isolated temp directory, then atomically move the plugin folder into place.
-    // This reduces symlink/TOCTOU footguns and ensures we don't partially clobber an existing plugin.
-    let temp_root = config_dir.join("temp");
-    fs::create_dir_all(&temp_root).await?;
-    let extract_root = temp_root.join(format!(
-        "extract_{}_{}",
-        id.replace('/', "_"),
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&extract_root).await;
-    fs::create_dir_all(&extract_root).await?;
+        let config_dir = config_dir();
+        let plugins_dir = config_dir.join("plugins");
+        let actual = plugins_dir.join(&id);
 
-    if let Err(error) = crate::zip_extract::extract(std::io::Cursor::new(bytes), &extract_root) {
-        log::error!("Failed to unzip file: {}", error);
+        // Extract into an isolated temp directory, then atomically move the plugin folder into place.
+        // This reduces symlink/TOCTOU footguns and ensures we don't partially clobber an existing plugin.
+        let temp_root = config_dir.join("temp");
+        fs::create_dir_all(&temp_root).await?;
+        let extract_root = temp_root.join(format!(
+            "extract_{}_{}",
+            id.replace('/', "_"),
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&extract_root).await;
-        return Err(error.into());
-    }
+        fs::create_dir_all(&extract_root).await?;
 
-    // Find the plugin directory within the extracted tree.
-    fn find_plugin_dir(
-        root: &std::path::Path,
-        name: &str,
-        depth: usize,
-    ) -> Option<std::path::PathBuf> {
-        if depth == 0 {
-            return None;
+        if let Err(error) = crate::zip_extract::extract(std::io::Cursor::new(bytes), &extract_root)
+        {
+            log::error!("Failed to unzip file: {}", error);
+            let _ = fs::remove_dir_all(&extract_root).await;
+            return Err(error.into());
         }
-        let entries = std::fs::read_dir(root).ok()?;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let meta = std::fs::symlink_metadata(&path).ok()?;
-            if meta.file_type().is_symlink() {
-                continue;
+
+        // Find the plugin directory within the extracted tree.
+        fn find_plugin_dir(
+            root: &std::path::Path,
+            name: &str,
+            depth: usize,
+        ) -> Option<std::path::PathBuf> {
+            if depth == 0 {
+                return None;
             }
-            if meta.is_dir() {
-                if path.file_name().and_then(|n| n.to_str()) == Some(name) {
-                    return Some(path);
+            let entries = std::fs::read_dir(root).ok()?;
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let meta = std::fs::symlink_metadata(&path).ok()?;
+                if meta.file_type().is_symlink() {
+                    continue;
                 }
-                if let Some(found) = find_plugin_dir(&path, name, depth - 1) {
-                    return Some(found);
+                if meta.is_dir() {
+                    if path.file_name().and_then(|n| n.to_str()) == Some(name) {
+                        return Some(path);
+                    }
+                    if let Some(found) = find_plugin_dir(&path, name, depth - 1) {
+                        return Some(found);
+                    }
                 }
             }
+            None
         }
-        None
-    }
 
-    let extracted_plugin = find_plugin_dir(&extract_root, &id, 6)
-        .ok_or_else(|| anyhow::anyhow!("extracted archive did not contain {id}"))?;
+        let extracted_plugin = find_plugin_dir(&extract_root, &id, 6)
+            .ok_or_else(|| anyhow::anyhow!("extracted archive did not contain {id}"))?;
 
-    // Backup existing plugin dir, if present.
-    let backup = temp_root.join(format!(
-        "backup_{}_{}",
-        id.replace('/', "_"),
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&backup).await;
-    if actual.exists() {
-        fs::rename(&actual, &backup).await?;
-    }
-
-    // Ensure target parent exists.
-    fs::create_dir_all(&plugins_dir).await?;
-    if let Err(e) = fs::rename(&extracted_plugin, &actual).await {
-        // Restore backup on failure.
-        let _ = fs::remove_dir_all(&actual).await;
-        if backup.exists() {
-            let _ = fs::rename(&backup, &actual).await;
+        // Backup existing plugin dir, if present.
+        let backup = temp_root.join(format!(
+            "backup_{}_{}",
+            id.replace('/', "_"),
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&backup).await;
+        if actual.exists() {
+            fs::rename(&actual, &backup).await?;
         }
+
+        // Ensure target parent exists.
+        fs::create_dir_all(&plugins_dir).await?;
+        if let Err(e) = fs::rename(&extracted_plugin, &actual).await {
+            // Restore backup on failure.
+            let _ = fs::remove_dir_all(&actual).await;
+            if backup.exists() {
+                let _ = fs::rename(&backup, &actual).await;
+            }
+            let _ = fs::remove_dir_all(&extract_root).await;
+            return Err(e.into());
+        }
+
+        // Initialize and rollback if initialization fails.
+        if let Err(error) = crate::plugins::initialise_plugin(&actual).await {
+            log::warn!(
+                "Failed to initialise plugin at {}: {}",
+                actual.display(),
+                error
+            );
+            // If the failure looks like a manifest decoding issue, keep a copy for debugging.
+            // This helps us support edge-case encodings found in Marketplace plugins.
+            let err_s = error.to_string();
+            let looks_like_manifest = err_s.contains("manifest")
+                && (err_s.contains("encoding")
+                    || err_s.contains("ELGATO")
+                    || err_s.contains("binary format"));
+            let looks_like_platform = err_s.contains("unsupported on platform");
+            if looks_like_manifest || looks_like_platform {
+                let bad = temp_root.join(format!(
+                    "bad_{}_{}",
+                    id.replace('/', "_"),
+                    std::process::id()
+                ));
+                let _ = fs::remove_dir_all(&bad).await;
+                if fs::rename(&actual, &bad).await.is_ok() {
+                    log::warn!(
+                        "Preserved failed plugin install for inspection at {}",
+                        bad.display()
+                    );
+                } else {
+                    let _ = fs::remove_dir_all(&actual).await;
+                }
+            } else {
+                let _ = fs::remove_dir_all(&actual).await;
+            }
+            if backup.exists() {
+                let _ = fs::rename(&backup, &actual).await;
+                let _ = crate::plugins::initialise_plugin(&actual).await;
+            }
+            let _ = fs::remove_dir_all(&extract_root).await;
+            return Err(error);
+        }
+
+        let _ = fs::remove_dir_all(&backup).await;
         let _ = fs::remove_dir_all(&extract_root).await;
-        return Err(e.into());
+        Ok(())
+    }
+    .await;
+
+    match &result {
+        Ok(()) => crate::ui::emit(UiEvent::PluginInstall {
+            id,
+            phase: PluginInstallPhase::Finished {
+                ok: true,
+                error: None,
+            },
+        }),
+        Err(err) => crate::ui::emit(UiEvent::PluginInstall {
+            id,
+            phase: PluginInstallPhase::Finished {
+                ok: false,
+                error: Some(format!("{err:#}")),
+            },
+        }),
     }
 
-    // Initialize and rollback if initialization fails.
-    if let Err(error) = crate::plugins::initialise_plugin(&actual).await {
-        log::warn!(
-            "Failed to initialise plugin at {}: {}",
-            actual.display(),
-            error
-        );
-        let _ = fs::remove_dir_all(&actual).await;
-        if backup.exists() {
-            let _ = fs::rename(&backup, &actual).await;
-            let _ = crate::plugins::initialise_plugin(&actual).await;
-        }
-        let _ = fs::remove_dir_all(&extract_root).await;
-        return Err(error);
-    }
-
-    let _ = fs::remove_dir_all(&backup).await;
-    let _ = fs::remove_dir_all(&extract_root).await;
-    Ok(())
+    result
 }
 
 pub async fn remove_plugin(id: String) -> Result<(), anyhow::Error> {

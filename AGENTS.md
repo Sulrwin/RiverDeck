@@ -153,13 +153,35 @@ Port allocation: `PORT_BASE` (WebSocket), `PORT_BASE + 2` (HTTP static files)
 
 ### File Locations
 
+RiverDeck uses the application id `io.github.sulrwin.riverdeck` for its directories (see `crates/riverdeck-core/src/shared.rs`).
+
 ```
-Config: ~/.config/io.github.sulrwin.riverdeck/ (Linux) / ~/Library/Application Support/io.github.sulrwin.riverdeck/ (macOS)
-Logs:   ~/.local/share/io.github.sulrwin.riverdeck/logs/ (Linux) / ~/Library/Logs/io.github.sulrwin.riverdeck/ (macOS)
+Linux:
+  Config:  ~/.config/io.github.sulrwin.riverdeck/
+  Data:    ~/.local/share/io.github.sulrwin.riverdeck/
+  Logs:    ~/.local/share/io.github.sulrwin.riverdeck/logs/
+
+Flatpak:
+  Config:  ~/.var/app/io.github.sulrwin.riverdeck/config/io.github.sulrwin.riverdeck/
+  Data:    ~/.var/app/io.github.sulrwin.riverdeck/data/io.github.sulrwin.riverdeck/
+  Logs:    ~/.var/app/io.github.sulrwin.riverdeck/data/io.github.sulrwin.riverdeck/logs/
+
+Windows:
+  Config:  %APPDATA%\io.github.sulrwin.riverdeck\
+  Data:    %APPDATA%\io.github.sulrwin.riverdeck\
+  Logs:    %APPDATA%\io.github.sulrwin.riverdeck\logs\
+
+macOS:
+  Config:  ~/Library/Application Support/io.github.sulrwin.riverdeck/
+  Data:    ~/Library/Application Support/io.github.sulrwin.riverdeck/
+  Logs:    ~/Library/Application Support/io.github.sulrwin.riverdeck/logs/
+
 Plugins: <config_dir>/plugins/
 ```
 
-Flatpak uses different paths with `~/.var/app/io.github.sulrwin.riverdeck/` prefix.
+Notes:
+- On most platforms, logs are stored under the data directory as `<data_dir>/logs/`.
+- macOS may also surface logs through Console.app and `~/Library/Logs/`, but RiverDeck’s internal log directory follows `<data_dir>/logs/`.
 
 ## Testing & Debugging
 
