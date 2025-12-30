@@ -38,7 +38,6 @@ Special thanks go to the developers of the [elgato-streamdeck](https://github.co
 
 <p align="center">
   <img src=".github/readme/mainmenu.png" alt="Main menu" /><br>
-  <img src=".github/readme/mainmenu-plugins-profiles.png" alt="Plugins and profiles" />
 </p>
 
 ## Installation
