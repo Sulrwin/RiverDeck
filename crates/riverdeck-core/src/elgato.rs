@@ -1080,6 +1080,22 @@ pub async fn reset_devices() {
     }
 }
 
+/// Best-effort shutdown of all Stream Deck device connections.
+///
+/// This is meant for app exit paths. It drops the underlying device handles so other processes
+/// can immediately re-open the devices.
+pub async fn shutdown_devices() {
+    // Reset visuals first (best effort), then drop handles.
+    reset_devices().await;
+
+    // Drop all known device handles.
+    ELGATO_DEVICES.write().await.clear();
+    PLUS_STATE.write().await.clear();
+
+    // Also clear the shared device registry so frontends stop referencing stale devices.
+    crate::shared::DEVICES.clear();
+}
+
 async fn init(device: AsyncStreamDeck, device_id: String) {
     if ELGATO_DEVICES.read().await.contains_key(&device_id) {
         return;

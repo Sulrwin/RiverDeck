@@ -22,14 +22,18 @@ pub async fn shutdown_all() {
     )
     .await;
 
-    // Best-effort: reset Stream Deck devices so they don't remain "stuck" on the last rendered
-    // frame after RiverDeck exits. This must not block shutdown.
-    let _ = tokio::time::timeout(Duration::from_millis(500), crate::elgato::reset_devices()).await;
-
     // Kill any plugin instances we know about.
     let _ = tokio::time::timeout(
         Duration::from_secs(2),
         crate::plugins::deactivate_all_plugins(),
+    )
+    .await;
+
+    // Best-effort: reset and then drop Stream Deck devices so other processes can re-open them.
+    // This must not block shutdown.
+    let _ = tokio::time::timeout(
+        Duration::from_millis(800),
+        crate::elgato::shutdown_devices(),
     )
     .await;
 

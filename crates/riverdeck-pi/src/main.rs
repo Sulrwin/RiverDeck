@@ -16,6 +16,9 @@ use wry::WebViewBuilderExtUnix;
 use wry::http::Request;
 use wry::{WebContext, WebView, WebViewBuilder};
 
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 #[derive(Debug, Clone)]
 enum PiEvent {
     Eval(String),
@@ -746,6 +749,183 @@ struct FetchResponsePayload<'a> {
     body_base64: String,
 }
 
+const FETCH_QUEUE_CAP_PER_WORKER: usize = 16;
+const FETCH_MAX_WORKERS: usize = 8;
+
+fn fetch_worker_count() -> usize {
+    let raw = std::env::var("RIVERDECK_PI_FETCH_WORKERS").ok();
+    raw.as_deref()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(4)
+        .clamp(1, FETCH_MAX_WORKERS)
+}
+
+struct FetchJob {
+    id: u64,
+    context: String,
+    url: String,
+    method: Option<String>,
+    headers: Option<Vec<(String, String)>>,
+    body_base64: Option<String>,
+    proxy: EventLoopProxy<PiEvent>,
+}
+
+struct FetchPool {
+    workers: Vec<std::sync::mpsc::SyncSender<FetchJob>>,
+    next: AtomicUsize,
+}
+
+static FETCH_POOL: OnceLock<FetchPool> = OnceLock::new();
+
+fn fetch_pool() -> &'static FetchPool {
+    FETCH_POOL.get_or_init(FetchPool::start)
+}
+
+impl FetchPool {
+    fn start() -> Self {
+        let workers = fetch_worker_count();
+        let mut senders = Vec::with_capacity(workers);
+
+        for idx in 0..workers {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<FetchJob>(FETCH_QUEUE_CAP_PER_WORKER);
+            senders.push(tx);
+            std::thread::spawn(move || fetch_worker_loop(idx, rx));
+        }
+
+        Self {
+            workers: senders,
+            next: AtomicUsize::new(0),
+        }
+    }
+
+    fn try_submit(&self, mut job: FetchJob) -> Result<(), FetchJob> {
+        if self.workers.is_empty() {
+            return Err(job);
+        }
+
+        // Try workers in round-robin order; if all queues are full, reject quickly.
+        let start = self.next.fetch_add(1, Ordering::Relaxed);
+        for off in 0..self.workers.len() {
+            let idx = (start + off) % self.workers.len();
+            match self.workers[idx].try_send(job) {
+                Ok(()) => return Ok(()),
+                Err(std::sync::mpsc::TrySendError::Full(j)) => job = j,
+                Err(std::sync::mpsc::TrySendError::Disconnected(j)) => job = j,
+            }
+        }
+        Err(job)
+    }
+}
+
+fn post_fetch_response_js(proxy: &EventLoopProxy<PiEvent>, payload: &FetchResponsePayload<'_>) {
+    let js = format!(
+        "window.postMessage({{event:'riverdeckFetchResponse',payload:{}}}, '*');",
+        serde_json::to_string(payload).unwrap_or_else(|_| "null".to_owned())
+    );
+    let _ = proxy.send_event(PiEvent::Eval(js));
+}
+
+fn fetch_worker_loop(_worker_idx: usize, rx: std::sync::mpsc::Receiver<FetchJob>) {
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .unwrap_or_else(|_| reqwest::blocking::Client::new());
+
+    while let Ok(job) = rx.recv() {
+        let url_trim = job.url.trim();
+        if !(url_trim.starts_with("http://") || url_trim.starts_with("https://")) {
+            post_fetch_response_js(
+                &job.proxy,
+                &FetchResponsePayload {
+                    id: job.id,
+                    context: &job.context,
+                    url: &job.url,
+                    status: 400,
+                    status_text: "blocked url scheme".to_owned(),
+                    headers: vec![],
+                    body_base64: String::new(),
+                },
+            );
+            continue;
+        }
+
+        let mut rb = client.request(
+            job.method
+                .unwrap_or_else(|| "GET".to_owned())
+                .parse()
+                .unwrap_or(reqwest::Method::GET),
+            &job.url,
+        );
+        if let Some(headers) = job.headers {
+            for (k, v) in headers {
+                rb = rb.header(k, v);
+            }
+        }
+        if let Some(body) = job
+            .body_base64
+            .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
+        {
+            // Avoid huge request bodies from untrusted PIs.
+            if body.len() > (2 * 1024 * 1024) {
+                post_fetch_response_js(
+                    &job.proxy,
+                    &FetchResponsePayload {
+                        id: job.id,
+                        context: &job.context,
+                        url: &job.url,
+                        status: 413,
+                        status_text: "request body too large".to_owned(),
+                        headers: vec![],
+                        body_base64: String::new(),
+                    },
+                );
+                continue;
+            }
+            rb = rb.body(body);
+        }
+
+        let payload = match rb.send() {
+            Ok(resp) => {
+                let status = resp.status();
+                let status_text = status.canonical_reason().unwrap_or("").to_owned();
+                let headers = resp
+                    .headers()
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or_default().to_owned()))
+                    .collect::<Vec<_>>();
+                let bytes = resp.bytes().unwrap_or_default();
+                // Cap response size to avoid base64-bombing the helper process.
+                let bytes = if bytes.len() > (5 * 1024 * 1024) {
+                    bytes.slice(..(5 * 1024 * 1024))
+                } else {
+                    bytes
+                };
+                FetchResponsePayload {
+                    id: job.id,
+                    context: &job.context,
+                    url: &job.url,
+                    status: status.as_u16(),
+                    status_text,
+                    headers,
+                    body_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+                }
+            }
+            Err(err) => FetchResponsePayload {
+                id: job.id,
+                context: &job.context,
+                url: &job.url,
+                status: 599,
+                status_text: err.to_string(),
+                headers: vec![],
+                body_base64: String::new(),
+            },
+        };
+
+        post_fetch_response_js(&job.proxy, &payload);
+    }
+}
+
 fn handle_ipc(req: Request<String>, proxy: EventLoopProxy<PiEvent>, ipc_port: Option<u16>) {
     let msg = req.body().clone();
     let Ok(req) = serde_json::from_str::<IpcRequest>(&msg) else {
@@ -786,94 +966,30 @@ fn handle_ipc(req: Request<String>, proxy: EventLoopProxy<PiEvent>, ipc_port: Op
             headers,
             body_base64,
         } => {
-            std::thread::spawn(move || {
-                let url_trim = url.trim();
-                if !(url_trim.starts_with("http://") || url_trim.starts_with("https://")) {
-                    let js = format!(
-                        "window.postMessage({{event:'riverdeckFetchResponse',payload:{}}}, '*');",
-                        serde_json::to_string(&FetchResponsePayload {
-                            id,
-                            context: &context,
-                            url: &url,
-                            status: 400,
-                            status_text: "blocked url scheme".to_owned(),
-                            headers: vec![],
-                            body_base64: String::new(),
-                        })
-                        .unwrap_or_else(|_| "null".to_owned())
-                    );
-                    let _ = proxy.send_event(PiEvent::Eval(js));
-                    return;
-                }
-
-                let client = reqwest::blocking::Client::new();
-                let mut rb = client.request(
-                    method
-                        .unwrap_or_else(|| "GET".to_owned())
-                        .parse()
-                        .unwrap_or(reqwest::Method::GET),
-                    &url,
-                );
-                if let Some(headers) = headers {
-                    for (k, v) in headers {
-                        rb = rb.header(k, v);
-                    }
-                }
-                if let Some(body) = body_base64
-                    .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
-                {
-                    // Avoid huge request bodies from untrusted PIs.
-                    if body.len() > (2 * 1024 * 1024) {
-                        return;
-                    }
-                    rb = rb.body(body);
-                }
-
-                let payload = match rb.send() {
-                    Ok(resp) => {
-                        let status = resp.status();
-                        let status_text = status.canonical_reason().unwrap_or("").to_owned();
-                        let headers = resp
-                            .headers()
-                            .iter()
-                            .map(|(k, v)| {
-                                (k.to_string(), v.to_str().unwrap_or_default().to_owned())
-                            })
-                            .collect::<Vec<_>>();
-                        let bytes = resp.bytes().unwrap_or_default();
-                        // Cap response size to avoid base64-bombing the host process.
-                        let bytes = if bytes.len() > (5 * 1024 * 1024) {
-                            bytes.slice(..(5 * 1024 * 1024))
-                        } else {
-                            bytes
-                        };
-                        FetchResponsePayload {
-                            id,
-                            context: &context,
-                            url: &url,
-                            status: status.as_u16(),
-                            status_text,
-                            headers,
-                            body_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
-                        }
-                    }
-                    Err(err) => FetchResponsePayload {
-                        id,
-                        context: &context,
-                        url: &url,
-                        status: 599,
-                        status_text: err.to_string(),
+            let job = FetchJob {
+                id,
+                context,
+                url,
+                method,
+                headers,
+                body_base64,
+                proxy: proxy.clone(),
+            };
+            if let Err(job) = fetch_pool().try_submit(job) {
+                // Backpressure: avoid spawning unlimited threads if a PI spams fetch().
+                post_fetch_response_js(
+                    &job.proxy,
+                    &FetchResponsePayload {
+                        id: job.id,
+                        context: &job.context,
+                        url: &job.url,
+                        status: 429,
+                        status_text: "too many concurrent fetches".to_owned(),
                         headers: vec![],
                         body_base64: String::new(),
                     },
-                };
-
-                let js = format!(
-                    "window.postMessage({{event:'riverdeckFetchResponse',payload:{}}}, '*');",
-                    serde_json::to_string(&payload).unwrap_or_else(|_| "null".to_owned())
                 );
-                let _ = proxy.send_event(PiEvent::Eval(js));
-            });
+            }
         }
         IpcRequest::MarketplaceToken { token } => {
             log::info!(

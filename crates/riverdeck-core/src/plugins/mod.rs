@@ -668,7 +668,10 @@ pub fn initialise_plugins() {
     if !PLUGIN_SERVERS_STARTED.swap(true, Ordering::SeqCst) {
         log::info!("Starting plugin servers for the first time");
         tokio::spawn(init_websocket_server());
-        tokio::spawn(webserver::init_webserver(config_dir()));
+        // `tiny_http` is blocking; run the plugin asset server on its own OS thread so it
+        // can't starve the Tokio runtime.
+        let prefix = config_dir();
+        std::thread::spawn(move || webserver::init_webserver(prefix));
     } else {
         log::debug!("Plugin servers already running; skipping server init");
     }

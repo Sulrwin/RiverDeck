@@ -501,6 +501,7 @@ fn env_truthy(name: &str) -> bool {
 /// Motivation: on some desktops (notably GNOME without an AppIndicator extension), the tray icon
 /// may not appear even if `tray-icon` succeeds in creating it. In that case, hiding the window
 /// creates an invisible background process with no obvious way to restore it.
+#[allow(dead_code)]
 #[cfg(feature = "tray")]
 fn tray_hide_is_safe_by_default() -> bool {
     if env_truthy("RIVERDECK_DISABLE_TRAY") {
@@ -1456,7 +1457,7 @@ async fn maybe_build_repo_builtin_plugins() {
 
 struct RiverDeckApp {
     runtime: Arc<Runtime>,
-    ui_events: Option<tokio_mpsc::UnboundedReceiver<ui::UiEvent>>,
+    ui_events: Option<tokio_mpsc::Receiver<ui::UiEvent>>,
 
     // Keep the lock file alive for the lifetime of the app.
     #[allow(dead_code)]
@@ -1952,18 +1953,14 @@ impl RiverDeckApp {
         if tray.is_some() {
             log_tray_status_to_file("tray init ok");
         }
+        // Project policy: when tray is enabled, window close should hide-to-tray so RiverDeck can
+        // keep driving the Stream Deck without staying on-screen.
         #[cfg(feature = "tray")]
-        let tray_hide_ok = tray.is_some() && tray_hide_is_safe_by_default();
-        #[cfg(feature = "tray")]
-        if tray.is_some() && !tray_hide_ok {
-            log::warn!(
-                "Tray icon initialized but hide-to-tray is disabled for this desktop (set RIVERDECK_FORCE_TRAY=1 to override)"
-            );
-            log_tray_status_to_file("tray init ok, but hide-to-tray disabled by desktop heuristic");
-        }
+        let tray_hide_ok = tray.is_some();
 
         let ui_events = ui::subscribe().map(|mut rx| {
-            let (tx, out_rx) = tokio_mpsc::unbounded_channel::<ui::UiEvent>();
+            // Bounded channel to avoid unbounded memory growth if the UI falls behind.
+            let (tx, out_rx) = tokio_mpsc::channel::<ui::UiEvent>(256);
             let egui_ctx = cc.egui_ctx.clone();
             runtime.spawn(async move {
                 let mut last_repaint = std::time::Instant::now()
@@ -1972,7 +1969,9 @@ impl RiverDeckApp {
                 loop {
                     match rx.recv().await {
                         Ok(ev) => {
-                            let _ = tx.send(ev);
+                            // Best-effort: if the UI is overwhelmed, drop events rather than
+                            // queueing forever (repaint throttling below still nudges the UI).
+                            let _ = tx.try_send(ev);
                             // Throttle wakeups: UI events can be frequent; we only need to ensure
                             // we get *a* frame soon after background state changes (e.g. toasts).
                             let now = std::time::Instant::now();
@@ -5455,9 +5454,7 @@ impl eframe::App for RiverDeckApp {
         if ctx.input(|i| i.viewport().close_requested()) {
             if QUIT_REQUESTED.load(Ordering::SeqCst) {
                 // Allow the close to proceed.
-            } else if self.hide_to_tray_available()
-                && (cfg!(not(target_os = "linux")) || env_truthy("RIVERDECK_CLOSE_TO_TRAY"))
-            {
+            } else if self.hide_to_tray_available() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.hide_to_tray_requested = true;
             }

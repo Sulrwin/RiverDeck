@@ -35,12 +35,13 @@ enum SaveMsg {
 }
 
 struct SaveScheduler {
-    tx: mpsc::UnboundedSender<SaveMsg>,
+    tx: mpsc::Sender<SaveMsg>,
 }
 
 impl SaveScheduler {
     fn start(debounce: Duration) -> Self {
-        let (tx, mut rx) = mpsc::unbounded_channel::<SaveMsg>();
+        // Bounded channel: avoids unbounded memory growth if producers outpace the debouncer.
+        let (tx, mut rx) = mpsc::channel::<SaveMsg>(64);
 
         tokio::spawn(async move {
             use std::pin::Pin;
@@ -162,13 +163,28 @@ impl SaveScheduler {
         Self { tx }
     }
 
-    fn request(&self, key: SaveKey, path: PathBuf, bytes: Vec<u8>) {
-        let _ = self.tx.send(SaveMsg::Save { key, path, bytes });
+    /// Enqueue a debounced write request. If the queue is full, return the payload so the caller
+    /// can fall back to a direct write (best-effort).
+    fn request(&self, key: SaveKey, path: PathBuf, bytes: Vec<u8>) -> Option<(PathBuf, Vec<u8>)> {
+        match self.tx.try_send(SaveMsg::Save { key, path, bytes }) {
+            Ok(()) => None,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(SaveMsg::Save {
+                path,
+                bytes,
+                ..
+            }))
+            | Err(tokio::sync::mpsc::error::TrySendError::Closed(SaveMsg::Save {
+                path,
+                bytes,
+                ..
+            })) => Some((path, bytes)),
+            Err(_) => None,
+        }
     }
 
     async fn flush(&self) {
         let (tx, rx) = oneshot::channel();
-        let _ = self.tx.send(SaveMsg::Flush(tx));
+        let _ = self.tx.send(SaveMsg::Flush(tx)).await;
         let _ = rx.await;
     }
 }
@@ -216,7 +232,10 @@ pub fn request_save_profile(device: &str, locks: &mut LocksMut<'_>) -> Result<()
     };
 
     if let Some(s) = scheduler() {
-        s.request(key, path, bytes);
+        if let Some((path, bytes)) = s.request(key, path, bytes) {
+            // Last resort: if the debouncer is overloaded, avoid losing the save entirely.
+            crate::store::write_atomic_bytes(&path, &bytes)?;
+        }
     } else {
         // If no Tokio runtime is available, fall back to a synchronous write.
         crate::store::write_atomic_bytes(&path, &bytes)?;

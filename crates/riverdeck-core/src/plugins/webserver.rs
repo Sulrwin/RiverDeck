@@ -56,7 +56,7 @@ fn mime(extension: &str) -> String {
 }
 
 /// Start a simple webserver to serve files of plugins that run in a browser environment.
-pub async fn init_webserver(prefix: PathBuf) {
+pub fn init_webserver(prefix: PathBuf) {
     let server = {
         let listener = match std::net::TcpListener::bind(("127.0.0.1", *super::PORT_BASE + 2)) {
             Ok(l) => l,
@@ -160,7 +160,7 @@ pub async fn init_webserver(prefix: PathBuf) {
         // and requests the Svelte frontend to maximise the property inspector.
 
         if let Some(path) = url.strip_suffix(RIVERDECK_PROPERTY_INSPECTOR_SUFFIX) {
-            if !matches!(tokio::fs::try_exists(path).await, Ok(true)) {
+            if !Path::new(path).exists() {
                 let mut resp = Response::empty(404);
                 if let Some(acao) = access_control_allow_origin.clone() {
                     resp.add_header(acao);
@@ -169,7 +169,7 @@ pub async fn init_webserver(prefix: PathBuf) {
                 continue;
             }
 
-            let mut content = tokio::fs::read_to_string(path).await.unwrap_or_default();
+            let mut content = std::fs::read_to_string(path).unwrap_or_default();
             content += r#"
 				<div id="riverdeck_iframe_container" style="position: absolute; z-index: 100; top: 0; left: 0; width: 100%; height: 100%; display: none;"></div>
 				<script>
@@ -284,7 +284,7 @@ pub async fn init_webserver(prefix: PathBuf) {
             });
             let _ = request.respond(response);
         } else if let Some(path) = url.strip_suffix(RIVERDECK_PROPERTY_INSPECTOR_CHILD_SUFFIX) {
-            if !matches!(tokio::fs::try_exists(path).await, Ok(true)) {
+            if !Path::new(path).exists() {
                 let mut resp = Response::empty(404);
                 if let Some(acao) = access_control_allow_origin.clone() {
                     resp.add_header(acao);
@@ -293,7 +293,7 @@ pub async fn init_webserver(prefix: PathBuf) {
                 continue;
             }
 
-            let mut content = tokio::fs::read_to_string(path).await.unwrap_or_default();
+            let mut content = std::fs::read_to_string(path).unwrap_or_default();
             content = format!("<script>window.opener ??= window.parent;</script>{content}");
 
             let mut response = Response::from_string(content);
@@ -306,7 +306,7 @@ pub async fn init_webserver(prefix: PathBuf) {
             });
             let _ = request.respond(response);
         } else {
-            if !matches!(tokio::fs::try_exists(&url).await, Ok(true)) {
+            if !Path::new(&url).exists() {
                 let mut resp = Response::empty(404);
                 if let Some(acao) = access_control_allow_origin.clone() {
                     resp.add_header(acao);
@@ -327,15 +327,15 @@ pub async fn init_webserver(prefix: PathBuf) {
 
             if mime_type.starts_with("text/") || mime_type == "image/svg+xml" {
                 let mut response =
-                    Response::from_string(tokio::fs::read_to_string(url).await.unwrap_or_default());
+                    Response::from_string(std::fs::read_to_string(url).unwrap_or_default());
                 if let Some(acao) = access_control_allow_origin.clone() {
                     response.add_header(acao);
                 }
                 response.add_header(content_type);
                 let _ = request.respond(response);
             } else {
-                let mut response = Response::from_file(match tokio::fs::File::open(url).await {
-                    Ok(file) => file.into_std().await,
+                let mut response = Response::from_file(match std::fs::File::open(url) {
+                    Ok(file) => file,
                     Err(_) => continue,
                 });
                 if let Some(acao) = access_control_allow_origin.clone() {

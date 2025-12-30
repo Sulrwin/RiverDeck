@@ -10,6 +10,52 @@ pub mod will_appear;
 
 use futures::SinkExt;
 use serde::Serialize;
+use tokio_tungstenite::tungstenite::Message;
+
+const MAX_QUEUED_MESSAGES_PER_PLUGIN: usize = 256;
+const MAX_QUEUED_BYTES_PER_PLUGIN: usize = 2 * 1024 * 1024;
+const MAX_QUEUED_MESSAGES_PER_PROPERTY_INSPECTOR: usize = 256;
+const MAX_QUEUED_BYTES_PER_PROPERTY_INSPECTOR: usize = 2 * 1024 * 1024;
+
+fn message_size_bytes(m: &Message) -> usize {
+    match m {
+        Message::Text(s) => s.len(),
+        Message::Binary(b) => b.len(),
+        // Control frames are tiny and shouldn't be queued often anyway.
+        _ => 0,
+    }
+}
+
+fn retain_newest_within_limits(queue: &mut Vec<Message>, max_msgs: usize, max_bytes: usize) {
+    if queue.is_empty() {
+        return;
+    }
+
+    // If the newest message alone violates the cap, drop it.
+    if message_size_bytes(queue.last().unwrap()) > max_bytes {
+        let _ = queue.pop();
+        return;
+    }
+
+    let mut bytes = 0usize;
+    let mut count = 0usize;
+    let mut start = queue.len();
+
+    // Walk from newest to oldest; keep the largest suffix within caps.
+    for idx in (0..queue.len()).rev() {
+        let sz = message_size_bytes(&queue[idx]);
+        if count > 0 && (count + 1 > max_msgs || bytes + sz > max_bytes) {
+            break;
+        }
+        bytes += sz;
+        count += 1;
+        start = idx;
+    }
+
+    if start > 0 {
+        queue.drain(0..start);
+    }
+}
 
 #[derive(Serialize)]
 struct Coordinates {
@@ -57,19 +103,20 @@ impl GenericInstancePayload {
 }
 
 async fn send_to_plugin(plugin: &str, data: &impl Serialize) -> Result<(), anyhow::Error> {
-    let message =
-        tokio_tungstenite::tungstenite::Message::Text(serde_json::to_string(data)?.into());
+    let message = Message::Text(serde_json::to_string(data)?.into());
     let mut sockets = super::PLUGIN_SOCKETS.lock().await;
 
     if let Some(socket) = sockets.get_mut(plugin) {
         socket.send(message).await?;
     } else {
         let mut queues = super::PLUGIN_QUEUES.write().await;
-        if queues.contains_key(plugin) {
-            queues.get_mut(plugin).unwrap().push(message);
-        } else {
-            queues.insert(plugin.to_owned(), vec![message]);
-        }
+        let q = queues.entry(plugin.to_owned()).or_default();
+        q.push(message);
+        retain_newest_within_limits(
+            q,
+            MAX_QUEUED_MESSAGES_PER_PLUGIN,
+            MAX_QUEUED_BYTES_PER_PLUGIN,
+        );
     }
 
     Ok(())
@@ -109,19 +156,21 @@ async fn send_to_property_inspector(
     context: &crate::shared::ActionContext,
     data: &impl Serialize,
 ) -> Result<(), anyhow::Error> {
-    let message =
-        tokio_tungstenite::tungstenite::Message::Text(serde_json::to_string(data)?.into());
+    let message = Message::Text(serde_json::to_string(data)?.into());
     let mut sockets = super::PROPERTY_INSPECTOR_SOCKETS.lock().await;
 
     if let Some(socket) = sockets.get_mut(&context.to_string()) {
         socket.send(message).await?;
     } else {
         let mut queues = super::PROPERTY_INSPECTOR_QUEUES.write().await;
-        if queues.contains_key(&context.to_string()) {
-            queues.get_mut(&context.to_string()).unwrap().push(message);
-        } else {
-            queues.insert(context.to_string(), vec![message]);
-        }
+        let key = context.to_string();
+        let q = queues.entry(key).or_default();
+        q.push(message);
+        retain_newest_within_limits(
+            q,
+            MAX_QUEUED_MESSAGES_PER_PROPERTY_INSPECTOR,
+            MAX_QUEUED_BYTES_PER_PROPERTY_INSPECTOR,
+        );
     }
 
     Ok(())

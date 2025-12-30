@@ -62,9 +62,11 @@ pub async fn register_plugin(event: RegisterEvent, stream: WebSocketStream<TcpSt
     match event {
         RegisterEvent::RegisterPlugin { uuid } => {
             log::debug!("Registered plugin {}", uuid);
-            if let Some(queue) = PLUGIN_QUEUES.read().await.get(&uuid) {
+            // Drain queued messages (if any) to avoid unbounded memory growth.
+            let queued = { PLUGIN_QUEUES.write().await.remove(&uuid) };
+            if let Some(queue) = queued {
                 for message in queue {
-                    let _ = read.feed(message.clone()).await;
+                    let _ = read.feed(message).await;
                 }
                 let _ = read.flush().await;
             }
@@ -80,9 +82,11 @@ pub async fn register_plugin(event: RegisterEvent, stream: WebSocketStream<TcpSt
         RegisterEvent::RegisterPropertyInspector { uuid } => {
             // Mark as unauthenticated until we see a `riverdeckAuth` message on this socket.
             set_property_inspector_authed(&uuid, false).await;
-            if let Some(queue) = PROPERTY_INSPECTOR_QUEUES.read().await.get(&uuid) {
+            // Drain queued messages (if any) to avoid unbounded memory growth.
+            let queued = { PROPERTY_INSPECTOR_QUEUES.write().await.remove(&uuid) };
+            if let Some(queue) = queued {
                 for message in queue {
-                    let _ = read.feed(message.clone()).await;
+                    let _ = read.feed(message).await;
                 }
                 let _ = read.flush().await;
             }
