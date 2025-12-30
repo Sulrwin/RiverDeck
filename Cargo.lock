@@ -5023,7 +5023,7 @@ dependencies = [
 
 [[package]]
 name = "riverdeck-core"
-version = "2.7.1"
+version = "0.1.0"
 dependencies = [
  "active-win-pos-rs",
  "anyhow",
@@ -5063,7 +5063,7 @@ dependencies = [
 
 [[package]]
 name = "riverdeck-egui"
-version = "2.7.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "auto-launch",
@@ -5090,7 +5090,7 @@ dependencies = [
 
 [[package]]
 name = "riverdeck-pi"
-version = "2.7.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",

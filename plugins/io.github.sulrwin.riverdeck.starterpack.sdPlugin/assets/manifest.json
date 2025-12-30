@@ -1,8 +1,8 @@
 {
 	"Name": "RiverDeck Starter Pack",
 	"Description": "RiverDeck starter pack plugin",
-	"Author": "Aman Khanna (nekename)",
-	"Version": "2.7.1",
+	"Author": "Ethan Wright (sulrwin)",
+	"Version": "0.1.0",
 	"RiverDeck": { "ManifestVersion": 1 },
 	"CodePathWin": "windows/bin/riverdeck-starterpack.exe",
 	"CodePathMac": "darwin/bin/riverdeck-starterpack",

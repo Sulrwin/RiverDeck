@@ -1,6 +1,6 @@
 [package]
 name = "riverdeck-core"
-version = "2.7.1"
+version = "0.1.0"
 description = "RiverDeck backend core (device + plugin runtime + persistence)"
 authors = ["Ethan Wright (sulrwin)"]
 license = "GPL-3.0-or-later"

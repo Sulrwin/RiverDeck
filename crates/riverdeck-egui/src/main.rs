@@ -7945,6 +7945,26 @@ impl eframe::App for RiverDeckApp {
         // Popups (non-modal windows).
         self.draw_screen_bg_crop_editor(ctx);
 
+        // Bottom-right version label (paint-only; does not affect layout).
+        //
+        // Note: toast notifications also use the bottom-right corner; those will draw on top.
+        {
+            let text = format!("v{}", env!("CARGO_PKG_VERSION"));
+            let pad = egui::vec2(8.0, 8.0);
+            let pos = ctx.screen_rect().right_bottom() - pad;
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("version_overlay"),
+            ));
+            painter.text(
+                pos,
+                egui::Align2::RIGHT_BOTTOM,
+                text,
+                egui::FontId::proportional(12.0),
+                ctx.style().visuals.weak_text_color(),
+            );
+        }
+
         // Bottom-right toast notifications (plugin installs, etc).
         self.draw_toasts(ctx);
     }
