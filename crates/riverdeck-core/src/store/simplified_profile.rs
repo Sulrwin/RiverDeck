@@ -259,6 +259,8 @@ pub struct DiskPage {
     pub sliders: Vec<Option<DiskActionInstance>>,
     #[serde(default)]
     pub encoder_screen_background: Option<String>,
+    #[serde(default)]
+    pub encoder_screen_crop: Option<crate::shared::EncoderScreenCrop>,
 }
 
 impl From<&Page> for DiskPage {
@@ -294,6 +296,7 @@ impl From<&Page> for DiskPage {
                 .encoder_screen_background
                 .as_deref()
                 .map(normalise_path),
+            encoder_screen_crop: value.encoder_screen_crop,
         }
     }
 }
@@ -333,6 +336,7 @@ impl DiskPage {
                 .encoder_screen_background
                 .as_deref()
                 .map(reconstruct_path),
+            encoder_screen_crop: self.encoder_screen_crop,
         }
     }
 }
@@ -387,6 +391,7 @@ impl DiskProfileV2 {
                 keys: vec![],
                 sliders: vec![],
                 encoder_screen_background: None,
+                encoder_screen_crop: None,
             });
         }
         let selected_page = self.selected_page.unwrap_or_else(|| "1".to_owned());
@@ -435,6 +440,7 @@ impl DiskProfileLegacy {
                     .map(|x| x.map(|v| v.into_action_instance(path, &page_id)))
                     .collect(),
                 encoder_screen_background: self.encoder_screen_background,
+                encoder_screen_crop: None,
             }],
         }
     }

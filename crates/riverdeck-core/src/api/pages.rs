@@ -20,6 +20,7 @@ fn selected_page_mut(profile: &mut Profile) -> &mut Page {
             keys: vec![],
             sliders: vec![],
             encoder_screen_background: None,
+            encoder_screen_crop: None,
         });
     }
     if profile.selected_page.trim().is_empty() {
@@ -79,6 +80,7 @@ pub async fn set_selected_page(
             keys: vec![],
             sliders: vec![],
             encoder_screen_background: None,
+            encoder_screen_crop: None,
         });
     }
 
@@ -129,9 +131,19 @@ pub async fn set_selected_page(
         let new_page = selected_page(&store.value).unwrap();
 
         if let Some(bg) = new_page.encoder_screen_background.as_deref() {
-            let _ = crate::elgato::set_lcd_background(&device, Some(bg)).await;
+            let _ = crate::elgato::set_lcd_background_with_crop(
+                &device,
+                Some(bg),
+                new_page.encoder_screen_crop,
+            )
+            .await;
         } else {
-            let _ = crate::elgato::set_lcd_background(&device, None).await;
+            let _ = crate::elgato::set_lcd_background_with_crop(
+                &device,
+                None,
+                new_page.encoder_screen_crop,
+            )
+            .await;
         }
 
         for instance in new_page
@@ -247,6 +259,7 @@ pub async fn create_page_and_select(
                 keys: vec![None; (dev.rows * dev.columns) as usize],
                 sliders: vec![None; dev.encoders as usize],
                 encoder_screen_background: None,
+                encoder_screen_crop: None,
             });
             store.save()?;
             drop(locks);

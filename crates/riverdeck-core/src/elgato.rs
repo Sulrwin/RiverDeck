@@ -16,6 +16,8 @@ use once_cell::sync::Lazy;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::sleep;
 
+use crate::render::rounding::round_corners_subtle;
+
 static ELGATO_DEVICES: Lazy<RwLock<HashMap<String, AsyncStreamDeck>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 
@@ -112,6 +114,96 @@ fn blend_pixel(dst: &mut Rgba<u8>, src: Rgba<u8>) {
     dst[1] = blend(src[1], dst[1]);
     dst[2] = blend(src[2], dst[2]);
     dst[3] = (out_a * 255.0).round().clamp(0.0, 255.0) as u8;
+}
+
+fn sanitize_encoder_screen_crop(
+    crop: crate::shared::EncoderScreenCrop,
+) -> crate::shared::EncoderScreenCrop {
+    crate::shared::EncoderScreenCrop {
+        focus_x: crop.focus_x.clamp(0.0, 1.0),
+        focus_y: crop.focus_y.clamp(0.0, 1.0),
+        // Keep zoom bounded to avoid extreme crop math and accidental huge values from bad JSON.
+        zoom: crop.zoom.clamp(1.0, 32.0),
+    }
+}
+
+/// Compute a crop rect (in source pixels) for a "cover" crop into a target aspect ratio,
+/// with optional pan (focus) and zoom.
+///
+/// Returns `(x, y, w, h)` where `w/h >= 1`.
+fn cover_crop_rect(
+    src_w: u32,
+    src_h: u32,
+    target_aspect: f32,
+    crop: crate::shared::EncoderScreenCrop,
+) -> (u32, u32, u32, u32) {
+    let src_w_f = src_w.max(1) as f32;
+    let src_h_f = src_h.max(1) as f32;
+    let src_aspect = src_w_f / src_h_f;
+
+    // Base rect for zoom=1 (largest rect matching target aspect ratio).
+    let (base_w, base_h) = if src_aspect >= target_aspect {
+        // Wider than target: crop width.
+        (src_h_f * target_aspect, src_h_f)
+    } else {
+        // Taller/narrower than target: crop height.
+        (src_w_f, src_w_f / target_aspect)
+    };
+
+    let z = crop.zoom.max(1.0);
+    let mut cw = (base_w / z).max(1.0);
+    let mut ch = (base_h / z).max(1.0);
+    cw = cw.min(src_w_f);
+    ch = ch.min(src_h_f);
+
+    // Center point in source pixels.
+    let fx = crop.focus_x.clamp(0.0, 1.0);
+    let fy = crop.focus_y.clamp(0.0, 1.0);
+    let cx = fx * src_w_f;
+    let cy = fy * src_h_f;
+
+    // Top-left, clamped so the crop rect stays inside the image.
+    let max_x = (src_w_f - cw).max(0.0);
+    let max_y = (src_h_f - ch).max(0.0);
+    let x0 = (cx - cw / 2.0).clamp(0.0, max_x);
+    let y0 = (cy - ch / 2.0).clamp(0.0, max_y);
+
+    let mut x = x0.floor() as i64;
+    let mut y = y0.floor() as i64;
+    let mut w = cw.ceil() as i64;
+    let mut h = ch.ceil() as i64;
+
+    // Clamp to bounds (integer-safe).
+    if x < 0 {
+        x = 0;
+    }
+    if y < 0 {
+        y = 0;
+    }
+    if w < 1 {
+        w = 1;
+    }
+    if h < 1 {
+        h = 1;
+    }
+    if x + w > src_w as i64 {
+        w = (src_w as i64 - x).max(1);
+    }
+    if y + h > src_h as i64 {
+        h = (src_h as i64 - y).max(1);
+    }
+
+    (x as u32, y as u32, w as u32, h as u32)
+}
+
+fn crop_and_resize_strip_background(
+    img: image::DynamicImage,
+    crop: crate::shared::EncoderScreenCrop,
+) -> image::DynamicImage {
+    let crop = sanitize_encoder_screen_crop(crop);
+    let (x, y, w, h) = cover_crop_rect(img.width(), img.height(), 8.0, crop);
+    let cropped = img.crop_imm(x, y, w, h);
+    cropped.resize_exact(800, 100, image::imageops::FilterType::Nearest)
 }
 
 #[derive(Clone)]
@@ -647,6 +739,13 @@ pub async fn update_image(
                         overlays.as_deref(),
                         Some(overlay_label),
                     );
+                    let prepared: Vec<crate::animation::PreparedFrame> = prepared
+                        .into_iter()
+                        .map(|mut f| {
+                            f.image = round_corners_subtle(f.image);
+                            f
+                        })
+                        .collect();
 
                     // Render first frame immediately.
                     if let Err(e) = device
@@ -746,6 +845,7 @@ pub async fn update_image(
                         }
                     }
                 }
+                final_img = round_corners_subtle(final_img);
                 device.set_button_image(context.position, final_img).await?;
             }
         } else if context.controller == "Encoder" {
@@ -790,11 +890,21 @@ pub async fn update_image(
 }
 
 pub async fn set_lcd_background(id: &str, image: Option<&str>) -> Result<(), anyhow::Error> {
+    // Backwards-compatible shim: default crop.
+    set_lcd_background_with_crop(id, image, None).await
+}
+
+pub async fn set_lcd_background_with_crop(
+    id: &str,
+    image: Option<&str>,
+    crop: Option<crate::shared::EncoderScreenCrop>,
+) -> Result<(), anyhow::Error> {
     if let Some(device) = ELGATO_DEVICES.read().await.get(id) {
         if device.kind() != Kind::Plus {
             return Ok(());
         }
         let state = plus_state_for_device(id, device.kind().encoder_count() as usize).await;
+        let crop = crop.unwrap_or_default();
 
         let (generation, any_animated) = if let Some(image) = image {
             // Prefer decoding from bytes so GIF detection works for both `data:` and file paths.
@@ -804,25 +914,19 @@ pub async fn set_lcd_background(id: &str, image: Option<&str>) -> Result<(), any
                     crate::animation::decode_gif_cached(gif_cache_key(&bytes), bytes).await?;
                 let mut st = state.lock().await;
                 if decoded.len() <= 1 {
-                    st.background = PlusLayer::Static(
-                        decoded
-                            .first()
-                            .map(|f| f.image.clone())
-                            .unwrap_or_else(|| image::DynamicImage::new_rgb8(800, 100))
-                            .resize_exact(800, 100, image::imageops::FilterType::Nearest),
-                    );
+                    let img = decoded
+                        .first()
+                        .map(|f| f.image.clone())
+                        .unwrap_or_else(|| image::DynamicImage::new_rgb8(800, 100));
+                    st.background = PlusLayer::Static(crop_and_resize_strip_background(img, crop));
                 } else {
-                    let prepared = crate::animation::prepare_frames(
-                        decoded.as_ref(),
-                        crate::animation::Target {
-                            width: 800,
-                            height: 100,
-                            resize_mode: crate::animation::ResizeMode::Exact,
-                            filter: image::imageops::FilterType::Nearest,
-                        },
-                        None,
-                        None,
-                    );
+                    let prepared = decoded
+                        .iter()
+                        .map(|f| crate::animation::PreparedFrame {
+                            delay: f.delay,
+                            image: crop_and_resize_strip_background(f.image.clone(), crop),
+                        })
+                        .collect::<Vec<_>>();
                     let next_at = Instant::now() + prepared[0].delay;
                     st.background = PlusLayer::Animated {
                         frames: prepared,
@@ -834,11 +938,8 @@ pub async fn set_lcd_background(id: &str, image: Option<&str>) -> Result<(), any
                 let any = st.background.is_animated() || st.dials.iter().any(|d| d.is_animated());
                 (generation, any)
             } else {
-                let dyn_img = image::load_from_memory(&bytes)?.resize_exact(
-                    800,
-                    100,
-                    image::imageops::FilterType::Nearest,
-                );
+                let dyn_img =
+                    crop_and_resize_strip_background(image::load_from_memory(&bytes)?, crop);
                 let mut st = state.lock().await;
                 st.background = PlusLayer::Static(dyn_img);
                 let generation = plus_bump_generation(&mut st);

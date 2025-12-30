@@ -97,6 +97,7 @@ pub fn overlays_for_instance(instance: &ActionInstance) -> Option<Vec<LabelOverl
                 TextPlacement::Bottom => TextPlacement::Top,
                 TextPlacement::Left => TextPlacement::Right,
                 TextPlacement::Right => TextPlacement::Left,
+                TextPlacement::Center => TextPlacement::Bottom,
             }
         } else {
             // If there's no title, keep the action name in the familiar place.

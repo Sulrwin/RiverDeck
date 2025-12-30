@@ -143,6 +143,10 @@ pub fn overlay_label(base: image::DynamicImage, overlay: &LabelOverlay) -> image
             let max_w = (w / 4).max(10).min(w.saturating_sub(pad * 2).max(1));
             (max_w, h.saturating_sub(pad * 2).max(1))
         }
+        TextPlacement::Center => (
+            w.saturating_sub(pad * 2).max(1),
+            h.saturating_sub(pad * 2).max(1),
+        ),
     };
 
     let ellipsize = |s: &str, max_chars: usize| -> String {
@@ -292,7 +296,7 @@ pub fn overlay_label(base: image::DynamicImage, overlay: &LabelOverlay) -> image
         return image::DynamicImage::ImageRgba8(img);
     }
 
-    // Top/Bottom: normal wrapped text (up to 2 lines).
+    // Top/Bottom/Center: normal wrapped text.
     let mut chosen_scale = 1u32;
     let mut chosen_lines: Vec<String> = vec![label.to_owned()];
 
@@ -305,12 +309,21 @@ pub fn overlay_label(base: image::DynamicImage, overlay: &LabelOverlay) -> image
         let line_h_px = (line_h as f32) * size_factor;
         let gap_px = (scale as f32) * size_factor;
 
-        // Prefer up to 2 lines, but fall back to 1 if height is tight.
-        let max_lines = if (max_h as f32) >= (line_h_px * 2.0 + gap_px) {
-            2
+        // Prefer more lines when centered (it intentionally overlays the icon), but keep
+        // Top/Bottom conservative so icons remain dominant.
+        let preferred_lines: usize = if overlay.placement == TextPlacement::Center {
+            3
         } else {
-            1
+            2
         };
+        let mut max_lines = 1usize;
+        for lines in (1usize..=preferred_lines).rev() {
+            let needed_h = (lines as f32) * line_h_px + ((lines.saturating_sub(1)) as f32) * gap_px;
+            if (max_h as f32) >= needed_h {
+                max_lines = lines;
+                break;
+            }
+        }
         let max_cols = ((max_w as f32) / char_w_px).floor().max(1.0) as usize;
 
         let mut lines = wrap_words(label, max_cols, max_lines);
@@ -376,6 +389,7 @@ pub fn overlay_label(base: image::DynamicImage, overlay: &LabelOverlay) -> image
     let y = match overlay.placement {
         TextPlacement::Top => pad.saturating_sub(2),
         TextPlacement::Bottom => h.saturating_sub(text_img.height() + pad.saturating_sub(2)),
+        TextPlacement::Center => (h.saturating_sub(text_img.height())) / 2,
         _ => pad,
     };
 

@@ -1582,6 +1582,9 @@ struct RiverDeckApp {
     pending_icon_pick: Option<(mpsc::Receiver<Option<PathBuf>>, shared::ActionContext, u16)>,
     pending_screen_bg_pick: Option<(mpsc::Receiver<Option<PathBuf>>, String, String)>, // (rx, device_id, profile_id)
 
+    // Stream Deck+ strip background crop editor window state.
+    screen_bg_crop_editor: Option<ScreenBgCropEditorState>,
+
     // Icon Library (built-in + marketplace icon packs).
     icon_library_open: Option<(shared::ActionContext, u16)>,
     icon_library_packs_cache: Vec<riverdeck_core::api::icon_packs::IconPackInfo>,
@@ -1721,6 +1724,15 @@ struct ProfileSnapshot {
     keys: Vec<Option<shared::ActionInstance>>,
     sliders: Vec<Option<shared::ActionInstance>>,
     encoder_screen_background: Option<String>,
+    encoder_screen_crop: Option<shared::EncoderScreenCrop>,
+}
+
+#[derive(Debug, Clone)]
+struct ScreenBgCropEditorState {
+    device_id: String,
+    profile_id: String,
+    bg_path: String,
+    crop: shared::EncoderScreenCrop,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1990,6 +2002,7 @@ impl RiverDeckApp {
             toasts: ToastManager::default(),
             pending_icon_pick: None,
             pending_screen_bg_pick: None,
+            screen_bg_crop_editor: None,
             icon_library_open: None,
             icon_library_packs_cache: vec![],
             icon_library_selected_pack: None,
@@ -2900,6 +2913,7 @@ impl RiverDeckApp {
                         shared::TextPlacement::Bottom => "Bottom",
                         shared::TextPlacement::Left => "Left",
                         shared::TextPlacement::Right => "Right",
+                        shared::TextPlacement::Center => "Center",
                     })
                     .show_ui(ui, |ui| {
                         ui.selectable_value(
@@ -2921,6 +2935,11 @@ impl RiverDeckApp {
                             &mut self.button_label_placement,
                             shared::TextPlacement::Right,
                             "Right",
+                        );
+                        ui.selectable_value(
+                            &mut self.button_label_placement,
+                            shared::TextPlacement::Center,
+                            "Center",
                         );
                     });
             });
@@ -3490,6 +3509,7 @@ impl RiverDeckApp {
                 shared::TextPlacement::Bottom => 1u8,
                 shared::TextPlacement::Left => 2u8,
                 shared::TextPlacement::Right => 3u8,
+                shared::TextPlacement::Center => 4u8,
             };
             p.hash(&mut hasher);
         }
@@ -3505,6 +3525,9 @@ impl RiverDeckApp {
         let mut img = dyn_img.resize_exact(width, height, image::imageops::FilterType::Nearest);
         for o in overlays {
             img = riverdeck_core::render::label::overlay_label(img, o);
+        }
+        if cache_ns == "keypad" {
+            img = riverdeck_core::render::rounding::round_corners_subtle(img);
         }
 
         let rgba = img.into_rgba8();
@@ -3550,6 +3573,40 @@ impl RiverDeckApp {
         Some(texture)
     }
 
+    fn strip_bg_uv_rect(
+        tex_size: egui::Vec2,
+        crop: Option<shared::EncoderScreenCrop>,
+    ) -> egui::Rect {
+        let mut crop = crop.unwrap_or_default();
+        crop.focus_x = crop.focus_x.clamp(0.0, 1.0);
+        crop.focus_y = crop.focus_y.clamp(0.0, 1.0);
+        crop.zoom = crop.zoom.clamp(1.0, 32.0);
+
+        let w = tex_size.x.max(1.0);
+        let h = tex_size.y.max(1.0);
+        let target_aspect = 8.0f32;
+        let src_aspect = w / h;
+
+        let (base_w, base_h) = if src_aspect >= target_aspect {
+            (h * target_aspect, h)
+        } else {
+            (w, w / target_aspect)
+        };
+
+        let cw = (base_w / crop.zoom).clamp(1.0, w);
+        let ch = (base_h / crop.zoom).clamp(1.0, h);
+        let cx = crop.focus_x * w;
+        let cy = crop.focus_y * h;
+        let x0 = (cx - cw / 2.0).clamp(0.0, (w - cw).max(0.0));
+        let y0 = (cy - ch / 2.0).clamp(0.0, (h - ch).max(0.0));
+
+        let u0 = (x0 / w).clamp(0.0, 1.0);
+        let v0 = (y0 / h).clamp(0.0, 1.0);
+        let u1 = ((x0 + cw) / w).clamp(0.0, 1.0);
+        let v1 = ((y0 + ch) / h).clamp(0.0, 1.0);
+        egui::Rect::from_min_max(egui::pos2(u0, v0), egui::pos2(u1, v1))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn draw_screen_strip(
         &mut self,
@@ -3592,12 +3649,8 @@ impl RiverDeckApp {
             if let Some(bg) = snapshot.encoder_screen_background.as_deref()
                 && let Some(tex) = self.texture_for_path(ctx, bg)
             {
-                painter.image(
-                    tex.id(),
-                    rect,
-                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                    egui::Color32::WHITE,
-                );
+                let uv = Self::strip_bg_uv_rect(tex.size_vec2(), snapshot.encoder_screen_crop);
+                painter.image(tex.id(), rect, uv, egui::Color32::WHITE);
             } else {
                 painter.rect_filled(
                     rect,
@@ -3627,10 +3680,26 @@ impl RiverDeckApp {
                             Some((rx, device.id.clone(), selected_profile.to_owned()));
                     }
                 }
+                let can_adjust = snapshot.encoder_screen_background.is_some();
+                if ui
+                    .add_enabled(can_adjust, egui::Button::new("Adjust background crop…"))
+                    .clicked()
+                {
+                    ui.close_menu();
+                    if let Some(bg) = snapshot.encoder_screen_background.as_deref() {
+                        self.screen_bg_crop_editor = Some(ScreenBgCropEditorState {
+                            device_id: device.id.clone(),
+                            profile_id: selected_profile.to_owned(),
+                            bg_path: bg.to_owned(),
+                            crop: snapshot.encoder_screen_crop.unwrap_or_default(),
+                        });
+                    }
+                }
                 if ui.button("Clear background").clicked() {
                     ui.close_menu();
                     let device_id = device.id.clone();
                     let profile_id = selected_profile.to_owned();
+                    self.screen_bg_crop_editor = None;
                     self.runtime.spawn(async move {
                         let _ = riverdeck_core::api::profiles::set_encoder_screen_background(
                             device_id, profile_id, None,
@@ -4399,6 +4468,7 @@ impl RiverDeckApp {
             keys: page.map(|p| p.keys.clone()).unwrap_or_default(),
             sliders: page.map(|p| p.sliders.clone()).unwrap_or_default(),
             encoder_screen_background: page.and_then(|p| p.encoder_screen_background.clone()),
+            encoder_screen_crop: page.and_then(|p| p.encoder_screen_crop),
         })
     }
 
@@ -4468,6 +4538,164 @@ impl RiverDeckApp {
 
         if !disconnected {
             self.ui_events = Some(rx);
+        }
+    }
+
+    fn draw_screen_bg_crop_editor(&mut self, ctx: &egui::Context) {
+        let Some(mut editor) = self.screen_bg_crop_editor.take() else {
+            return;
+        };
+
+        // If the user navigated away, close to avoid applying changes to the wrong place.
+        if self.selected_device.as_deref() != Some(editor.device_id.as_str())
+            || self.selected_profile != editor.profile_id
+        {
+            return;
+        }
+
+        let mut open = true;
+        let mut save_requested = false;
+        let mut reset_requested = false;
+        let mut cancel_requested = false;
+
+        egui::Window::new("Strip background crop")
+            .open(&mut open)
+            .resizable(true)
+            .default_width(640.0)
+            .default_height(560.0)
+            .show(ctx, |ui| {
+                ui.label("Drag on the image to choose the crop center. Use zoom to crop tighter.");
+                ui.add_space(8.0);
+
+                ui.horizontal(|ui| {
+                    ui.label("Zoom");
+                    ui.add(
+                        egui::Slider::new(&mut editor.crop.zoom, 1.0..=8.0)
+                            .logarithmic(true)
+                            .clamping(egui::SliderClamping::Always),
+                    );
+                    if ui.button("Reset").clicked() {
+                        reset_requested = true;
+                    }
+                });
+
+                ui.add_space(10.0);
+
+                let tex = self.texture_for_path(ctx, &editor.bg_path);
+                if let Some(tex) = tex {
+                    let tex_size = tex.size_vec2();
+                    let tw = tex_size.x.max(1.0);
+                    let th = tex_size.y.max(1.0);
+
+                    let max_w = ui.available_width().min(760.0);
+                    let max_h = 320.0;
+                    let scale = (max_w / tw).min(max_h / th).max(0.01);
+                    let draw_size = egui::vec2(tw * scale, th * scale);
+
+                    let (rect, resp) =
+                        ui.allocate_exact_size(draw_size, egui::Sense::click_and_drag());
+                    let painter = ui.painter_at(rect);
+                    painter.image(
+                        tex.id(),
+                        rect,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    );
+
+                    // Pan: set crop center to pointer position while dragging.
+                    if resp.dragged()
+                        && let Some(pos) = resp.interact_pointer_pos()
+                    {
+                        let u = ((pos.x - rect.min.x) / rect.width()).clamp(0.0, 1.0);
+                        let v = ((pos.y - rect.min.y) / rect.height()).clamp(0.0, 1.0);
+                        editor.crop.focus_x = u;
+                        editor.crop.focus_y = v;
+                    }
+
+                    // Crop overlay.
+                    let uv = Self::strip_bg_uv_rect(tex_size, Some(editor.crop));
+                    let to_screen = |u: f32, v: f32| -> egui::Pos2 {
+                        egui::pos2(
+                            rect.min.x + rect.width() * u,
+                            rect.min.y + rect.height() * v,
+                        )
+                    };
+                    let crop_rect = egui::Rect::from_min_max(
+                        to_screen(uv.min.x, uv.min.y),
+                        to_screen(uv.max.x, uv.max.y),
+                    );
+                    painter.rect_stroke(
+                        crop_rect,
+                        egui::CornerRadius::same(0),
+                        egui::Stroke::new(2.0, ui.visuals().selection.stroke.color),
+                        egui::StrokeKind::Inside,
+                    );
+
+                    ui.add_space(10.0);
+                    ui.label("Preview (as shown on the device strip):");
+
+                    let preview_w = ui.available_width().min(760.0);
+                    let preview_h = (preview_w / 8.0).max(1.0);
+                    let (strip_rect, _strip_resp) = ui.allocate_exact_size(
+                        egui::vec2(preview_w, preview_h),
+                        egui::Sense::hover(),
+                    );
+                    let strip_painter = ui.painter_at(strip_rect);
+                    strip_painter.image(tex.id(), strip_rect, uv, egui::Color32::WHITE);
+                    strip_painter.rect_stroke(
+                        strip_rect,
+                        egui::CornerRadius::same(0),
+                        ui.visuals().widgets.inactive.bg_stroke,
+                        egui::StrokeKind::Inside,
+                    );
+                } else {
+                    ui.label("Background image could not be loaded.");
+                }
+
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Save").clicked() {
+                            save_requested = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel_requested = true;
+                        }
+                    });
+                });
+            });
+
+        if reset_requested {
+            editor.crop = shared::EncoderScreenCrop::default();
+        }
+
+        if cancel_requested {
+            open = false;
+        }
+
+        if save_requested {
+            let device_id = editor.device_id.clone();
+            let profile_id = editor.profile_id.clone();
+            let crop = editor.crop;
+            let is_default = (crop.focus_x - 0.5).abs() < 1e-3
+                && (crop.focus_y - 0.5).abs() < 1e-3
+                && (crop.zoom - 1.0).abs() < 1e-3;
+            let crop_to_store = if is_default { None } else { Some(crop) };
+            self.profile_snapshot_needs_refresh = true;
+            ctx.request_repaint();
+            self.runtime.spawn(async move {
+                let _ = riverdeck_core::api::profiles::set_encoder_screen_background_crop(
+                    device_id,
+                    profile_id,
+                    crop_to_store,
+                )
+                .await;
+            });
+            open = false;
+        }
+
+        if open {
+            self.screen_bg_crop_editor = Some(editor);
         }
     }
 
@@ -4780,6 +5008,8 @@ impl eframe::App for RiverDeckApp {
             let profile_id = profile_id.clone();
             self.pending_screen_bg_pick = None;
             if let Some(path) = picked {
+                // Background changed; close any open crop editor (it would be for the old image).
+                self.screen_bg_crop_editor = None;
                 let path = path.to_string_lossy().into_owned();
                 self.runtime.spawn(async move {
                     let _ = riverdeck_core::api::profiles::set_encoder_screen_background(
@@ -6753,6 +6983,9 @@ impl eframe::App for RiverDeckApp {
         if self.drag_payload.is_some() {
             ctx.request_repaint();
         }
+
+        // Popups (non-modal windows).
+        self.draw_screen_bg_crop_editor(ctx);
 
         // Bottom-right toast notifications (plugin installs, etc).
         self.draw_toasts(ctx);

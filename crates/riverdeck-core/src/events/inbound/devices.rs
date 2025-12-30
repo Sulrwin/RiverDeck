@@ -61,9 +61,15 @@ pub async fn register_device(
                 s.placement,
                 crate::shared::ScreenPlacement::BetweenKeypadAndEncoders
             )
-        }) && let Some(bg) = page.and_then(|p| p.encoder_screen_background.as_deref())
+        }) && let Some(page) = page
+            && let Some(bg) = page.encoder_screen_background.as_deref()
         {
-            let _ = crate::elgato::set_lcd_background(&event.payload.id, Some(bg)).await;
+            let _ = crate::elgato::set_lcd_background_with_crop(
+                &event.payload.id,
+                Some(bg),
+                page.encoder_screen_crop,
+            )
+            .await;
         }
         if let Some(page) = page {
             for instance in page

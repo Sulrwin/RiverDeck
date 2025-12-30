@@ -258,6 +258,7 @@ fn default_page() -> Page {
         keys: Vec::new(),
         sliders: Vec::new(),
         encoder_screen_background: None,
+        encoder_screen_crop: None,
     }
 }
 
@@ -270,6 +271,7 @@ fn ensure_page<'a>(profile: &'a mut Profile, page_id: &str) -> &'a mut Page {
         keys: Vec::new(),
         sliders: Vec::new(),
         encoder_screen_background: None,
+        encoder_screen_crop: None,
     });
     let idx = profile.pages.len().saturating_sub(1);
     &mut profile.pages[idx]

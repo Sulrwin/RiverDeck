@@ -402,6 +402,7 @@ pub enum TextPlacement {
     Bottom,
     Left,
     Right,
+    Center,
 }
 
 /// A concrete label overlay to render on a button image.
@@ -592,6 +593,32 @@ pub struct Page {
     pub sliders: Vec<Option<ActionInstance>>,
     #[serde(default)]
     pub encoder_screen_background: Option<String>,
+    /// Stream Deck+ strip background crop parameters (RiverDeck extension).
+    ///
+    /// If absent, RiverDeck uses the default "cover" crop (centered) rather than stretching.
+    #[serde(default)]
+    pub encoder_screen_crop: Option<EncoderScreenCrop>,
+}
+
+/// Crop settings for the Stream Deck+ strip background (800x100).
+///
+/// - `focus_x`/`focus_y`: normalized center point in the source image, in `[0, 1]`.
+/// - `zoom`: `>= 1.0`, where `1.0` is the default cover crop; higher zoom crops tighter.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct EncoderScreenCrop {
+    pub focus_x: f32,
+    pub focus_y: f32,
+    pub zoom: f32,
+}
+
+impl Default for EncoderScreenCrop {
+    fn default() -> Self {
+        Self {
+            focus_x: 0.5,
+            focus_y: 0.5,
+            zoom: 1.0,
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
