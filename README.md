@@ -14,23 +14,32 @@
   <a href="#showcase">More screenshots</a>
 </p>
 
-RiverDeck is a desktop application for using stream controller devices like the Elgato Stream Deck on Linux, Windows, and macOS. RiverDeck supports plugins made for the original Stream Deck SDK, allowing many plugins made for the Elgato software ecosystem to be used, or the [OpenAction](https://openaction.amankhanna.me/) API.
+RiverDeck is a native Rust desktop application for using stream controller devices like the Elgato Stream Deck on Linux, Windows, and macOS.
+
+RiverDeck supports **RiverDeck-native** plugins (recommended), and also has **best-effort compatibility** with Stream Deck SDK plugin bundles and the [OpenAction](https://openaction.amankhanna.me/) ecosystem. Plugin compatibility depends on your OS and how the plugin is packaged (see [Plugins](#plugins)).
 
 Only Elgato hardware is officially supported, but plugins are available for support for other hardware vendors.
 
-RiverDeck is made by Ethan Wright (`sulrwin`) and is forked from OpenDeck. A lot of fundimental components and systems have been changed from OpenDeck, all that would have been impossible without OpenDeck. Thanks to OpenDeck and its contributors for the original work.
+RiverDeck is made by Ethan Wright (`sulrwin`) and is forked from OpenDeck. A lot of fundamental components and systems have been changed from OpenDeck — thanks to OpenDeck and its contributors for the original work.
 
 Special thanks go to the developers of the [elgato-streamdeck](https://github.com/OpenActionAPI/rust-elgato-streamdeck) Rust library, [Wine](https://www.winehq.org/), and [Phosphor Icons](https://phosphoricons.com/).
 
 ### Why use RiverDeck?
 
-- **OpenDeck?**: RiverDeck brings a more modern and sleek interface while implementing a lot of features not found in OpenDeck but can be found in the official software. Along with a few unique features not found in the official software with plans for even more!
+- **Modern native UI**: RiverDeck brings a modern interface and implements many features users expect from the official software, plus RiverDeck-specific improvements.
 
-- **Stream Deck plugins**: RiverDeck supports the majority of the Stream Deck plugins that users of the Elgato ecosystem are already familiar with, unlike other third-party softwares which are much more limited (e.g. streamdeck-ui, StreamController, Boatswain etc).
-- **Cross-platform**: RiverDeck supports Linux alongside Windows and macOS. macOS users also benefit from switching from the first-party Elgato software as RiverDeck can run plugins only built for Windows on Linux and macOS thanks to Wine. Additionally, profile files are easily moveable between platforms with no changes to them necessary.
+- **Stream Deck plugins**: RiverDeck supports the majority of the Stream Deck plugins that users of the Elgato ecosystem are already familiar with, unlike other third-party software which is much more limited (e.g. streamdeck-ui, StreamController, Boatswain etc).
+- **Cross-platform**: RiverDeck supports Linux alongside Windows and macOS. Profile files are portable between platforms with no changes needed.
 - **Feature-packed**: From Multi Actions and Toggle Actions to switching profiles when you switch apps and brightness control, RiverDeck has all the features you'd expect from stream controller software.
 - **Open source**: RiverDeck source code is licensed under the GNU General Public License, allowing anyone to view it and improve it for feature, stability, privacy or security reasons.
 - **Written in Rust**: RiverDeck is built in Rust for performance and safety. (Some built-in plugin build scripts are written in TypeScript and run via Deno.)
+
+## Showcase
+
+<p align="center">
+  <img src=".github/readme/mainmenu.png" alt="Main menu" /><br>
+  <img src=".github/readme/mainmenu-plugins-profiles.png" alt="Plugins and profiles" />
+</p>
 
 ## Installation
 
@@ -41,18 +50,20 @@ Special thanks go to the developers of the [elgato-streamdeck](https://github.co
 > ```bash
 > bash <(curl -sSL https://raw.githubusercontent.com/sulrwin/RiverDeck/main/install_riverdeck.sh)
 > ```
-> The script installs RiverDeck from a released .deb or .rpm file, the AUR, or Flathub (if available), appropriately, and also installs and reloads the appropriate udev subsystem rules. Additionally, you can choose to install Wine from your distribution during the process.
+> The script installs RiverDeck from a released `.deb`/`.rpm` file, the AUR, or Flathub (if available), and also installs + reloads the udev rules required for Stream Deck device access.
 
 - Download the latest release from [GitHub Releases](https://github.com/sulrwin/RiverDeck/releases/latest).
 - Install RiverDeck using your package manager of choice.
-- Install the appropriate udev subsystem rules from [here](https://raw.githubusercontent.com/OpenActionAPI/rust-elgato-streamdeck/main/40-streamdeck.rules):
+- Install the udev subsystem rules (required for device access) from [`packaging/linux/40-streamdeck.rules`](packaging/linux/40-streamdeck.rules):
 	- If you're using a `.deb` or `.rpm` release artifact, this file should be installed automatically.
 	- Otherwise, download and copy it to the correct location with `sudo cp 40-streamdeck.rules /etc/udev/rules.d/`.
 	- In both cases, you will need to reload your udev subsystem rules with `sudo udevadm control --reload-rules && sudo udevadm trigger`.
-- If you intend to use plugins that are not compiled for Linux (which are the majority of plugins), you will need to have [Wine](https://www.winehq.org/) installed on your system. Some plugins may also depend on Wine Mono (which is sometimes, but not always included, in your distro's packaging of Wine).
 
 > [!NOTE]
-> If Flatpak is your only option, check whether RiverDeck is available on Flathub. Please note that you still need to install the udev subsystem rules as described above. To use Windows plugins, you should have Wine installed natively (the Wine Flatpak is not supported).
+> **Plugins on Linux are native-first.** RiverDeck currently requires plugins to provide a native Linux executable (via `CodePathLin` / `CodePaths`) and does not run Windows-only plugins via Wine on Linux.
+
+> [!NOTE]
+> If Flatpak is your only option, check whether RiverDeck is available on Flathub. Please note that you still need to install the udev subsystem rules as described above.
 
 ### Windows
 
@@ -65,6 +76,21 @@ Special thanks go to the developers of the [elgato-streamdeck](https://github.co
 - If you downloaded a `.dmg`, open the downloaded disk image and drag the application inside into your Applications folder; otherwise, extract the `.tar.gz` to your Applications folder.
 - Open the installed application. Note: if you receive a warning about RiverDeck being distributed by an unknown developer, *right-click the app in Finder and then click Open* to suppress the warning.
 - If you intend to use plugins that are only compiled for Windows, you will need to have [Wine](https://www.winehq.org/) installed on your system.
+
+## Plugins
+
+RiverDeck supports multiple plugin “ecosystems”, but **not every plugin will work on every OS**.
+
+- **RiverDeck-native plugins (recommended)**: native binaries designed for RiverDeck. A minimal starting point lives at [`plugins/io.github.sulrwin.riverdeck.template.sdPlugin/`](plugins/io.github.sulrwin.riverdeck.template.sdPlugin/).
+- **Stream Deck SDK bundles (`.streamDeckPlugin`)**: RiverDeck can install these (including marketplace deep links) and supports many of them, but compatibility varies:
+	- On **Linux**, plugins must include a native Linux binary.
+	- On **Windows**, Windows plugins generally work best.
+	- On **macOS**, some Windows-only plugins may work via Wine (if installed natively).
+- **OpenAction Marketplace**: RiverDeck can handle OpenAction marketplace installs and will install the plugin if it can find a suitable downloadable bundle.
+
+You can manage plugins in-app via **Settings → Plugins**.
+
+RiverDeck also supports installing Stream Deck **icon packs** (`.streamDeckIconPack`).
 
 ## Support
 
@@ -90,7 +116,7 @@ To change other options, open Settings. From here, you can also view information
 		- Flatpak: `~/.var/app/io.github.sulrwin.riverdeck/data/io.github.sulrwin.riverdeck/logs/`
 		- Windows: `%APPDATA%\io.github.sulrwin.riverdeck\logs\`
 		- macOS: `~/Library/Application Support/io.github.sulrwin.riverdeck/logs/`
-- When trying to run plugins built for Windows (which are the majority of plugins) on Linux or macOS, please ensure you have the latest version of Wine (and Wine Mono) installed on your system.
+- When trying to run Windows-only plugins on macOS, please ensure you have a recent version of Wine installed (natively; the Wine Flatpak is not supported).
 - If your device isn't showing up, ensure you have the correct permissions to access it (e.g. on Linux, installing udev subsystem rules and restarting your system), and that you have restarted RiverDeck since connecting it.
 
 ### Support forums
@@ -102,10 +128,16 @@ To change other options, open Settings. From here, you can also view information
 > [!TIP]
 > The development guide for agents present in [AGENTS.md](AGENTS.md) also serves as a useful introduction to the codebase for humans.
 
-RiverDeck's UI is a native Rust/egui application. To build/run it you just need a Rust toolchain (and on Linux, `libudev` for Stream Deck access, plus WebKitGTK deps for the `riverdeck-pi` webview helper).
+RiverDeck's UI is a native Rust/egui application. To build/run it you just need a Rust toolchain (and on Linux, `libudev` for Stream Deck access, plus GTK3/WebKitGTK for the `riverdeck-pi` webview helper).
 
-- Run the egui app: `cargo run -p riverdeck-egui`
+- Run the app: `cargo run -p riverdeck-egui`
 - Build binaries: `cargo build -p riverdeck-egui -p riverdeck-pi`
+
+On Debian/Ubuntu, you’ll typically need WebKitGTK + GTK3 development packages:
+
+```bash
+sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libudev-dev xdg-utils
+```
 
 On Linux, the default `riverdeck-egui` build enables tray support, which requires the system library **`libxdo`**:
 - Arch: `sudo pacman -S --needed xdotool`
@@ -122,6 +154,9 @@ When submitting contributions, please adhere to the [Conventional Commits specif
 
 RiverDeck is licensed under the GNU General Public License version 3.0 or later. For more details, see the LICENSE.md file.
 
-## Native plugins
+## RiverDeck-native plugins
 
-RiverDeck is moving to a **RiverDeck-native** plugin ecosystem (Linux-first). See [`docs/plugins.md`](docs/plugins.md).
+RiverDeck is moving to a **RiverDeck-native** plugin ecosystem (Linux-first).
+
+- Template: [`plugins/io.github.sulrwin.riverdeck.template.sdPlugin/README.md`](plugins/io.github.sulrwin.riverdeck.template.sdPlugin/README.md)
+- Built-in plugin sources: [`plugins/`](plugins/)
