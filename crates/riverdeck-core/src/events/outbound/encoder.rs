@@ -4,10 +4,10 @@ use crate::shared::{ActionContext, DEVICES};
 use crate::store::profiles::{acquire_locks_mut, get_instance_mut};
 use crate::ui::{self, UiEvent};
 
+use once_cell::sync::Lazy;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::time::Duration;
-use once_cell::sync::Lazy;
 use tokio::sync::Mutex;
 
 struct PendingDialRotate {

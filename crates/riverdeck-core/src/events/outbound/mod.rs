@@ -111,7 +111,10 @@ async fn send_to_plugin(plugin: &str, data: &impl Serialize) -> Result<(), anyho
     if let Some(mut socket) = socket.take() {
         match socket.send(message).await {
             Ok(()) => {
-                super::PLUGIN_SOCKETS.lock().await.insert(plugin.to_owned(), socket);
+                super::PLUGIN_SOCKETS
+                    .lock()
+                    .await
+                    .insert(plugin.to_owned(), socket);
             }
             Err(e) => {
                 // Drop the socket on error; inbound task cleanup will also remove it if still present.
@@ -173,7 +176,10 @@ async fn send_to_property_inspector(
     if let Some(mut socket) = socket.take() {
         match socket.send(message).await {
             Ok(()) => {
-                super::PROPERTY_INSPECTOR_SOCKETS.lock().await.insert(key, socket);
+                super::PROPERTY_INSPECTOR_SOCKETS
+                    .lock()
+                    .await
+                    .insert(key, socket);
             }
             Err(e) => return Err(e.into()),
         }

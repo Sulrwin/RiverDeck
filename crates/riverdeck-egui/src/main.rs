@@ -3373,7 +3373,7 @@ impl RiverDeckApp {
         ui.horizontal_wrapped(|ui| {
             ui.label("Text size:");
             ui.add(
-                egui::Slider::new(&mut self.button_label_size, 8..=32)
+                egui::Slider::new(&mut self.button_label_size, 8..=64)
                     .clamping(egui::SliderClamping::Always)
                     .show_value(true),
             );

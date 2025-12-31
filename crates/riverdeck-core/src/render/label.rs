@@ -114,9 +114,9 @@ pub fn overlay_label(base: image::DynamicImage, overlay: &LabelOverlay) -> image
     // Slightly more conservative than the old thresholds: label size is now user-adjustable, and
     // we prefer icons to remain dominant by default.
     let max_scale = if min_side >= 144 {
-        3
+        4
     } else if min_side >= 112 {
-        2
+        3
     } else {
         1
     };
@@ -126,7 +126,7 @@ pub fn overlay_label(base: image::DynamicImage, overlay: &LabelOverlay) -> image
     let mut size_factor = (overlay.size as f32) / 16.0;
     // Global tweak: make labels read slightly smaller by default (users can dial it back up).
     size_factor *= 0.92;
-    size_factor = size_factor.clamp(0.5, 2.0);
+    size_factor = size_factor.clamp(0.5, 4.0);
 
     // Padding from the button edge.
     let pad = 4u32;
