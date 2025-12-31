@@ -3,6 +3,7 @@ use crate::events::outbound::{encoder, keypad};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -20,6 +21,9 @@ use crate::render::rounding::round_corners_subtle;
 
 static ELGATO_DEVICES: Lazy<RwLock<HashMap<String, AsyncStreamDeck>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
+
+// Global shutdown flag so per-device reader tasks can exit promptly, releasing HID handles.
+static ELGATO_SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 
 fn env_truthy_any(name: &str) -> bool {
     matches!(
@@ -1085,8 +1089,13 @@ pub async fn reset_devices() {
 /// This is meant for app exit paths. It drops the underlying device handles so other processes
 /// can immediately re-open the devices.
 pub async fn shutdown_devices() {
+    ELGATO_SHUTTING_DOWN.store(true, Ordering::SeqCst);
+
     // Reset visuals first (best effort), then drop handles.
     reset_devices().await;
+
+    // Give reader tasks a moment to observe the shutdown flag and exit.
+    tokio::time::sleep(Duration::from_millis(150)).await;
 
     // Drop all known device handles.
     ELGATO_DEVICES.write().await.clear();
@@ -1097,6 +1106,9 @@ pub async fn shutdown_devices() {
 }
 
 async fn init(device: AsyncStreamDeck, device_id: String) {
+    if ELGATO_SHUTTING_DOWN.load(Ordering::SeqCst) {
+        return;
+    }
     if ELGATO_DEVICES.read().await.contains_key(&device_id) {
         return;
     }
@@ -1155,6 +1167,9 @@ async fn init(device: AsyncStreamDeck, device_id: String) {
     .unwrap();
 
     loop {
+        if ELGATO_SHUTTING_DOWN.load(Ordering::SeqCst) {
+            break;
+        }
         let updates = match reader.read(100.0).await {
             Ok(updates) => updates,
             Err(_) => break,
@@ -1203,16 +1218,19 @@ async fn init(device: AsyncStreamDeck, device_id: String) {
 
     ELGATO_DEVICES.write().await.remove(&device_id);
     PLUS_STATE.write().await.remove(&device_id);
-    crate::events::inbound::devices::deregister_device(
+    // During shutdown, the global device registry may already have been cleared; don't panic.
+    let _ = crate::events::inbound::devices::deregister_device(
         "",
         crate::events::inbound::PayloadEvent { payload: device_id },
     )
-    .await
-    .unwrap();
+    .await;
 }
 
 /// Attempt to initialise all connected devices.
 pub async fn initialise_devices() {
+    if ELGATO_SHUTTING_DOWN.load(Ordering::SeqCst) {
+        return;
+    }
     if spawn_all_test_devices_enabled() {
         register_spawn_all_test_devices().await;
     }

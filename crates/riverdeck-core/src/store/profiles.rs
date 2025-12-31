@@ -214,7 +214,12 @@ fn scheduler() -> Option<&'static SaveScheduler> {
 /// Intended for high-frequency inbound events (e.g. plugin `setTitle` / `setImage`).
 pub fn request_save_profile(device: &str, locks: &mut LocksMut<'_>) -> Result<(), anyhow::Error> {
     let selected_profile = locks.device_stores.get_selected_profile(device)?;
-    let device_info = DEVICES.get(device).unwrap();
+    // Best-effort: devices can disappear mid-flight (disconnect, shutdown races).
+    // Never panic here; this function is called on hot inbound paths.
+    let Some(device_info) = DEVICES.get(device) else {
+        log::warn!("request_save_profile: device not found: {}", device);
+        return Ok(());
+    };
     let store = locks
         .profile_stores
         .get_profile_store(&device_info, &selected_profile)?;

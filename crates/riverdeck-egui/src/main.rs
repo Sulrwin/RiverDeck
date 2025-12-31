@@ -1,5 +1,8 @@
 use riverdeck_core::{application_watcher, elgato, plugins, shared, ui};
 
+#[path = "ui/mod.rs"]
+mod app_ui;
+
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
@@ -156,6 +159,61 @@ fn env_truthy_any(name: &str) -> bool {
     )
 }
 
+fn make_native_options() -> eframe::NativeOptions {
+    log::info!("Preparing native window options");
+    let mut native_options = eframe::NativeOptions {
+        run_and_return: false,
+        ..Default::default()
+    };
+    // On Linux, window button placement (left/right) is usually controlled by the window manager.
+    // If we want "always top-right" regardless of WM settings, we need a custom title bar.
+    //
+    // NOTE: This intentionally only applies to Linux to avoid fighting platform conventions
+    // (macOS uses top-left window controls).
+    #[cfg(target_os = "linux")]
+    {
+        native_options.viewport = native_options.viewport.with_decorations(false);
+    }
+    log::info!("Loading window icon (best-effort)");
+    // SAFETY VALVE: some environments have shown hangs during icon decode in debug builds.
+    // The window icon is non-critical; default to skipping it in debug builds to ensure the UI
+    // always starts. Set `RIVERDECK_ENABLE_WINDOW_ICON=1` to force-enable.
+    let enable_window_icon =
+        env_truthy_any("RIVERDECK_ENABLE_WINDOW_ICON") && !env_truthy_any("RIVERDECK_DISABLE_WINDOW_ICON");
+    let icon = if enable_window_icon {
+        Some(load_window_icon_with_timeout(Duration::from_millis(250)))
+    } else {
+        None
+    }
+    .flatten();
+
+    #[cfg(debug_assertions)]
+    if !enable_window_icon {
+        log::warn!(
+            "Window icon disabled (debug build safety); set RIVERDECK_ENABLE_WINDOW_ICON=1 to enable"
+        );
+    }
+
+    if let Some(icon) = icon {
+        native_options.viewport = native_options.viewport.with_icon(icon);
+    }
+    native_options
+}
+
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+fn is_wayland_session() -> bool {
+    std::env::var("XDG_SESSION_TYPE")
+        .ok()
+        .is_some_and(|v| v.eq_ignore_ascii_case("wayland"))
+        || std::env::var("WAYLAND_DISPLAY").ok().is_some_and(|v| !v.trim().is_empty())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn is_wayland_session() -> bool {
+    false
+}
+
 fn parse_hex_color32(s: &str) -> Option<egui::Color32> {
     let s = s.trim();
     let hex = s.strip_prefix('#').unwrap_or(s);
@@ -197,6 +255,47 @@ fn main() -> anyhow::Result<()> {
     // On Linux in debug builds, request SIGTERM when our parent dies.
     #[cfg(target_os = "linux")]
     set_parent_death_signal();
+
+    // Hyprland/Wayland: winit/Wayland has strict threading constraints and does not reliably
+    // support creating the UI event loop on a background thread. Since RiverDeck uses a tray-driven
+    // background mode, we prefer running the UI over XWayland on these setups.
+    //
+    // Opt out with `RIVERDECK_PREFER_WAYLAND=1`.
+    #[cfg(target_os = "linux")]
+    {
+        let session = std::env::var("XDG_SESSION_TYPE")
+            .unwrap_or_default()
+            .to_lowercase();
+        let on_wayland = session == "wayland" || std::env::var("WAYLAND_DISPLAY").ok().is_some();
+        let has_xwayland = std::env::var("DISPLAY").ok().is_some();
+        let is_hyprland = std::env::var("HYPRLAND_INSTANCE_SIGNATURE").ok().is_some()
+            || std::env::var("XDG_CURRENT_DESKTOP")
+                .unwrap_or_default()
+                .to_lowercase()
+                .contains("hypr");
+        let prefer_wayland = env_truthy_any("RIVERDECK_PREFER_WAYLAND");
+        if on_wayland && has_xwayland && is_hyprland && !prefer_wayland {
+            // Only set if user didn't already choose a backend.
+            if std::env::var("WINIT_UNIX_BACKEND").is_err() {
+                unsafe {
+                    std::env::set_var("WINIT_UNIX_BACKEND", "x11");
+                }
+                log::warn!("Hyprland detected: forcing WINIT_UNIX_BACKEND=x11 for UI reliability (set RIVERDECK_PREFER_WAYLAND=1 to opt out)");
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let backend = std::env::var("WINIT_UNIX_BACKEND").unwrap_or_else(|_| "<unset>".to_owned());
+        let xdg = std::env::var("XDG_SESSION_TYPE").unwrap_or_else(|_| "<unset>".to_owned());
+        let wayland_display =
+            std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "<unset>".to_owned());
+        let display = std::env::var("DISPLAY").unwrap_or_else(|_| "<unset>".to_owned());
+        log::info!(
+            "session: XDG_SESSION_TYPE={xdg} WAYLAND_DISPLAY={wayland_display} DISPLAY={display} WINIT_UNIX_BACKEND={backend}"
+        );
+    }
 
     let args: Vec<String> = std::env::args().collect();
     let start_hidden = args.iter().any(|a| a == "--hide");
@@ -383,46 +482,10 @@ fn main() -> anyhow::Result<()> {
     start_update_check(runtime.clone(), update_info.clone());
     handle_startup_args(runtime.clone(), args.clone());
 
-    // Exit the process when the main window is closed.
-    // This prevents "background instances" that keep running after the window is gone.
-    log::info!("Preparing native window options");
-    let mut native_options = eframe::NativeOptions {
-        run_and_return: false,
-        ..Default::default()
-    };
-    // On Linux, window button placement (left/right) is usually controlled by the window manager.
-    // If we want "always top-right" regardless of WM settings, we need a custom title bar.
-    //
-    // NOTE: This intentionally only applies to Linux to avoid fighting platform conventions
-    // (macOS uses top-left window controls).
-    #[cfg(target_os = "linux")]
-    {
-        native_options.viewport = native_options.viewport.with_decorations(false);
-    }
-    log::info!("Loading window icon (best-effort)");
-    // SAFETY VALVE: some environments have shown hangs during icon decode in debug builds.
-    // The window icon is non-critical; default to skipping it in debug builds to ensure the UI
-    // always starts. Set `RIVERDECK_ENABLE_WINDOW_ICON=1` to force-enable.
-    let enable_window_icon = env_truthy_any("RIVERDECK_ENABLE_WINDOW_ICON")
-        && !env_truthy_any("RIVERDECK_DISABLE_WINDOW_ICON");
-    let icon = if enable_window_icon {
-        Some(load_window_icon_with_timeout(Duration::from_millis(250)))
-    } else {
-        None
-    }
-    .flatten();
-
-    #[cfg(debug_assertions)]
-    if !enable_window_icon {
-        log::warn!(
-            "Window icon disabled (debug build safety); set RIVERDECK_ENABLE_WINDOW_ICON=1 to enable"
-        );
-    }
-
-    if let Some(icon) = icon {
-        native_options.viewport = native_options.viewport.with_icon(icon);
-    }
-    log::info!("Starting UI: entering eframe::run_native()");
+    // UI runs on the main thread. On Hyprland/Wayland we force the X11 backend (XWayland) for
+    // reliability, which allows us to hide-to-tray via `Visible(false)`.
+    let native_options = make_native_options();
+    let runtime_for_ui = runtime.clone();
     eframe::run_native(
         "RiverDeck",
         native_options,
@@ -430,7 +493,7 @@ fn main() -> anyhow::Result<()> {
             log::info!("eframe callback invoked: constructing RiverDeckApp");
             Ok(Box::new(RiverDeckApp::new(
                 cc,
-                runtime,
+                runtime_for_ui,
                 lock_file,
                 start_hidden,
                 update_info,
@@ -438,6 +501,8 @@ fn main() -> anyhow::Result<()> {
         }),
     )
     .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+    runtime.block_on(async { riverdeck_core::lifecycle::shutdown_all().await });
     Ok(())
 }
 
@@ -1467,7 +1532,8 @@ struct RiverDeckApp {
     update_info: Arc<Mutex<Option<UpdateInfo>>>,
     // Track scale changes so we can re-apply our theme only when needed.
     last_pixels_per_point: f32,
-
+    current_theme: riverdeck_core::store::ThemeId,
+    last_applied_theme: Option<riverdeck_core::store::ThemeId>,
     #[cfg(feature = "tray")]
     tray: Option<TrayState>,
     #[cfg(feature = "tray")]
@@ -1568,6 +1634,7 @@ struct RiverDeckApp {
 
     show_update_details: bool,
     show_settings: bool,
+    settings_theme: riverdeck_core::store::ThemeId,
     settings_autostart: bool,
     settings_screensaver: bool,
     settings_error: Option<String>,
@@ -1829,42 +1896,8 @@ impl RiverDeckApp {
     const MAIN_TITLEBAR_HEIGHT: f32 = 24.0;
     const POPUP_TITLEBAR_HEIGHT: f32 = 24.0;
 
-    fn apply_theme(ctx: &egui::Context) {
-        // Professional dark theme pass: aim closer to the Stream Deck dark UI.
-        ctx.style_mut(|s| {
-            s.spacing.item_spacing = egui::vec2(12.0, 12.0);
-            s.spacing.button_padding = egui::vec2(11.0, 9.0);
-            s.spacing.window_margin = egui::Margin::same(14);
-
-            let mut v = egui::Visuals::dark();
-            // Surfaces
-            v.window_fill = egui::Color32::from_rgb(24, 25, 27);
-            v.panel_fill = egui::Color32::from_rgb(28, 29, 31);
-            v.extreme_bg_color = egui::Color32::from_rgb(20, 21, 23);
-            v.faint_bg_color = egui::Color32::from_rgb(34, 35, 38);
-
-            // Widget cards
-            v.widgets.inactive.bg_fill = egui::Color32::from_rgb(33, 34, 37);
-            v.widgets.hovered.bg_fill = egui::Color32::from_rgb(41, 42, 46);
-            v.widgets.active.bg_fill = egui::Color32::from_rgb(48, 50, 55);
-            v.widgets.inactive.bg_stroke =
-                egui::Stroke::new(1.0, egui::Color32::from_rgb(56, 58, 62));
-            v.widgets.hovered.bg_stroke =
-                egui::Stroke::new(1.0, egui::Color32::from_rgb(82, 85, 90));
-            v.widgets.active.bg_stroke =
-                egui::Stroke::new(1.0, egui::Color32::from_rgb(110, 114, 122));
-
-            // Accents
-            // Outline-only selection (avoid overpowering blue overlays on text-heavy widgets).
-            v.selection.bg_fill = egui::Color32::TRANSPARENT;
-            v.selection.stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(0, 145, 255));
-            v.error_fg_color = egui::Color32::from_rgb(255, 95, 95);
-
-            // Rounding
-            v.window_corner_radius = egui::CornerRadius::same(12);
-            v.menu_corner_radius = egui::CornerRadius::same(10);
-            s.visuals = v;
-        });
+    fn apply_theme(ctx: &egui::Context, theme_id: &riverdeck_core::store::ThemeId) {
+        app_ui::theme::apply_theme(ctx, theme_id);
     }
 
     fn draw_popup_titlebar(ui: &mut egui::Ui, title: &str) -> bool {
@@ -1940,15 +1973,7 @@ impl RiverDeckApp {
     ) -> Self {
         log::info!("RiverDeckApp::new(start_hidden={start_hidden})");
         #[cfg(feature = "tray")]
-        let tray = match TrayState::new() {
-            Ok(t) => Some(t),
-            Err(err) => {
-                log::warn!("Tray icon disabled (failed to initialize): {err:#}");
-                // Also write to a file for Wayland/desktop-entry launches where logs aren't visible.
-                log_tray_status_to_file(&format!("tray init failed: {err:#}"));
-                None
-            }
-        };
+        let tray = TrayState::new().ok();
         #[cfg(feature = "tray")]
         if tray.is_some() {
             log_tray_status_to_file("tray init ok");
@@ -1992,7 +2017,10 @@ impl RiverDeckApp {
 
         // Apply theme once up-front (instead of rebuilding it every frame).
         let ppp = cc.egui_ctx.input(|i| i.pixels_per_point);
-        Self::apply_theme(&cc.egui_ctx);
+        let theme = riverdeck_core::store::get_settings()
+            .map(|s| s.value.theme)
+            .unwrap_or_else(|_| riverdeck_core::store::ThemeId::river_dark());
+        Self::apply_theme(&cc.egui_ctx, &theme);
 
         let (texture_jobs_tx, texture_jobs_rx) =
             tokio_mpsc::unbounded_channel::<TextureJobResult>();
@@ -2004,6 +2032,8 @@ impl RiverDeckApp {
             start_hidden,
             update_info,
             last_pixels_per_point: ppp,
+            current_theme: theme.clone(),
+            last_applied_theme: Some(theme.clone()),
             #[cfg(feature = "tray")]
             tray,
             #[cfg(feature = "tray")]
@@ -2081,6 +2111,7 @@ impl RiverDeckApp {
             action_editor_open: false,
             show_update_details: false,
             show_settings: false,
+            settings_theme: theme,
             settings_autostart: false,
             settings_screensaver: false,
             settings_error: None,
@@ -4410,6 +4441,7 @@ impl RiverDeckApp {
         dragging: bool,
         plugin_name: Option<&str>,
     ) -> egui::Response {
+        let tokens = app_ui::tokens::UiTokens::modern_neutral();
         let (rect, resp) = ui.allocate_exact_size(row_size, egui::Sense::click_and_drag());
         let painter = ui.painter_at(rect);
 
@@ -4421,19 +4453,19 @@ impl RiverDeckApp {
             visuals.widgets.inactive.bg_fill
         };
         let stroke = if dragging {
-            egui::Stroke::new(2.0, visuals.selection.stroke.color)
+            egui::Stroke::new(tokens.stroke_width_active, visuals.selection.stroke.color)
         } else if hovered {
             visuals.widgets.hovered.bg_stroke
         } else {
             visuals.widgets.inactive.bg_stroke
         };
 
-        painter.rect(
+        app_ui::widgets::paint_list_row(
+            ui,
             rect,
-            egui::CornerRadius::same(10),
+            egui::CornerRadius::same(tokens.radius_control),
             fill,
             stroke,
-            egui::StrokeKind::Inside,
         );
 
         // Icon on left
@@ -4518,6 +4550,7 @@ impl RiverDeckApp {
         selected: bool,
         drag_payload: Option<&DragPayload>,
     ) -> egui::Response {
+        let tokens = app_ui::tokens::UiTokens::modern_neutral();
         let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
         let painter = ui.painter_at(rect);
 
@@ -4557,9 +4590,9 @@ impl RiverDeckApp {
         }
 
         let stroke = if selected || (drag_payload.is_some() && drop_hovered && drop_valid) {
-            egui::Stroke::new(2.0, ui.visuals().selection.stroke.color)
+            egui::Stroke::new(tokens.stroke_width_active, ui.visuals().selection.stroke.color)
         } else if drag_payload.is_some() && drop_hovered && !drop_valid {
-            egui::Stroke::new(2.0, ui.visuals().error_fg_color)
+            egui::Stroke::new(tokens.stroke_width_active, ui.visuals().error_fg_color)
         } else {
             ui.visuals().widgets.inactive.bg_stroke
         };
@@ -4570,7 +4603,7 @@ impl RiverDeckApp {
         };
         painter.rect(
             rect,
-            egui::CornerRadius::same(10),
+            egui::CornerRadius::same(tokens.radius_control),
             fill,
             stroke,
             egui::StrokeKind::Inside,
@@ -4662,6 +4695,7 @@ impl RiverDeckApp {
         selected: bool,
         drag_payload: Option<&DragPayload>,
     ) -> egui::Response {
+        let tokens = app_ui::tokens::UiTokens::modern_neutral();
         let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
         let painter = ui.painter_at(rect);
 
@@ -4703,9 +4737,9 @@ impl RiverDeckApp {
         let radius = (rect.width().min(rect.height()) * 0.5) - 2.0;
 
         let stroke = if selected || (drag_payload.is_some() && drop_hovered && drop_valid) {
-            egui::Stroke::new(2.0, visuals.selection.stroke.color)
+            egui::Stroke::new(tokens.stroke_width_active, visuals.selection.stroke.color)
         } else if drag_payload.is_some() && drop_hovered && !drop_valid {
-            egui::Stroke::new(2.0, visuals.error_fg_color)
+            egui::Stroke::new(tokens.stroke_width_active, visuals.error_fg_color)
         } else {
             visuals.widgets.inactive.bg_stroke
         };
@@ -4801,7 +4835,7 @@ impl RiverDeckApp {
                 egui::pos2(center.x, notch_y),
                 egui::pos2(center.x, notch_y + notch_len),
             ],
-            egui::Stroke::new(2.0, visuals.widgets.inactive.bg_stroke.color),
+            egui::Stroke::new(tokens.stroke_width, visuals.widgets.inactive.bg_stroke.color),
         );
 
         resp
@@ -5422,24 +5456,11 @@ impl eframe::App for RiverDeckApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let frame_start = std::time::Instant::now();
 
-        // Theme is applied once (in `new`) and only re-applied if the UI scale changes.
-        let ppp = ctx.input(|i| i.pixels_per_point);
-        if (ppp - self.last_pixels_per_point).abs() > 0.0001 {
-            self.last_pixels_per_point = ppp;
-            Self::apply_theme(ctx);
-        }
-
-        // Apply any completed async texture decode/render work before drawing.
-        self.poll_texture_jobs(ctx);
-
         // `tray-icon` on Linux uses GTK/AppIndicator under the hood, which relies on GLib to
         // process DBus registration events. eframe/winit does not run a GTK mainloop, so we
         // pump pending GLib events once per frame when tray support is enabled.
         #[cfg(all(target_os = "linux", feature = "tray"))]
         if self.tray.is_some() {
-            // IMPORTANT: do not drain indefinitely. Some environments can keep the GLib main
-            // context "always ready", which would stall the egui frame and prevent rendering.
-            // A small cap per frame is enough to keep AppIndicator responsive.
             let ctx = gtk::glib::MainContext::default();
             for _ in 0..64 {
                 if !ctx.iteration(false) {
@@ -5448,15 +5469,36 @@ impl eframe::App for RiverDeckApp {
             }
         }
 
-        // If the user tries to close the window, prefer "hide to tray" (when available).
+        // Theme is applied once (in `new`) and re-applied on scale or theme changes.
+        let ppp = ctx.input(|i| i.pixels_per_point);
+        let scale_changed = (ppp - self.last_pixels_per_point).abs() > 0.0001;
+        let theme_changed = self
+            .last_applied_theme
+            .as_ref()
+            .map(|t| t != &self.current_theme)
+            .unwrap_or(true);
+        if scale_changed || theme_changed {
+            self.last_pixels_per_point = ppp;
+            Self::apply_theme(ctx, &self.current_theme);
+            self.last_applied_theme = Some(self.current_theme.clone());
+        }
+
+        // Apply any completed async texture decode/render work before drawing.
+        self.poll_texture_jobs(ctx);
+
+        // If the user tries to close the window, hide to tray (when available).
         // A real exit is done via the tray menu (Quit).
         #[cfg(feature = "tray")]
         if ctx.input(|i| i.viewport().close_requested()) {
             if QUIT_REQUESTED.load(Ordering::SeqCst) {
                 // Allow the close to proceed.
             } else if self.hide_to_tray_available() {
+                log::info!("Close requested: hiding window to tray");
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.hide_to_tray_requested = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                // Some WMs behave better when we also request minimization; harmless where unsupported.
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
             }
         }
 
@@ -5486,15 +5528,12 @@ impl eframe::App for RiverDeckApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         }
 
-        // Apply hide-to-tray requests (we do this after polling the tray menu so that a
-        // "Show" click can't be immediately overridden by a stale request).
         #[cfg(feature = "tray")]
         if self.hide_to_tray_requested {
             self.hide_to_tray_requested = false;
             if self.hide_to_tray_available() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             } else {
-                // Safer fallback: keep a taskbar entry so the user can restore the app.
                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
             }
         }
@@ -5800,11 +5839,12 @@ impl eframe::App for RiverDeckApp {
             .min_width(Self::DEVICES_PANEL_DEFAULT_WIDTH)
             .show(ctx, |ui| {
                 // Top: devices
-                ui.heading("Devices");
+                app_ui::widgets::section_heading(ui, "Devices");
                 ui.add_space(6.0);
 
+                let tokens = app_ui::tokens::UiTokens::modern_neutral();
                 egui::Frame::group(ui.style())
-                    .corner_radius(egui::CornerRadius::same(12))
+                    .corner_radius(egui::CornerRadius::same(tokens.radius_card))
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 6.0;
                         for entry in shared::DEVICES.iter() {
@@ -5818,7 +5858,7 @@ impl eframe::App for RiverDeckApp {
                                 egui::Sense::click(),
                             );
 
-                            let rounding = egui::CornerRadius::same(10);
+                            let rounding = egui::CornerRadius::same(tokens.radius_control);
                             let bg_fill = if resp.hovered() || resp.has_focus() {
                                 ui.visuals().widgets.hovered.bg_fill
                             } else {
@@ -5832,13 +5872,7 @@ impl eframe::App for RiverDeckApp {
                                 egui::Stroke::new(1.0, egui::Color32::TRANSPARENT)
                             };
 
-                            ui.painter().rect(
-                                rect,
-                                rounding,
-                                bg_fill,
-                                stroke,
-                                egui::StrokeKind::Inside,
-                            );
+                            app_ui::widgets::paint_list_row(ui, rect, rounding, bg_fill, stroke);
 
                             // Important: paint text manually so the whole row stays a single hit target.
                             // (Widgets like `Label` can capture pointer input and make the row feel flaky.)
@@ -5997,7 +6031,7 @@ impl eframe::App for RiverDeckApp {
             .default_width(Self::ACTIONS_PANEL_DEFAULT_WIDTH)
             .min_width(Self::ACTIONS_PANEL_DEFAULT_WIDTH)
             .show(ctx, |ui| {
-                ui.heading("Actions");
+                app_ui::widgets::section_heading(ui, "Actions");
 
                 let Some(device) = &selected_device else {
                     ui.label("Select a device.");
@@ -6005,8 +6039,9 @@ impl eframe::App for RiverDeckApp {
                 };
 
                 // Controller filter (Keypad/Encoder) for the action list.
+                let tokens = app_ui::tokens::UiTokens::modern_neutral();
                 egui::Frame::group(ui.style())
-                    .corner_radius(egui::CornerRadius::same(12))
+                    .corner_radius(egui::CornerRadius::same(tokens.radius_card))
                     .show(ui, |ui| {
                         ui.vertical(|ui| {
                             ui.horizontal(|ui| {
@@ -6026,9 +6061,10 @@ impl eframe::App for RiverDeckApp {
                                 }
                             });
                             ui.add_space(6.0);
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.action_search)
-                                    .hint_text("Search actions…"),
+                            app_ui::widgets::search_field(
+                                ui,
+                                &mut self.action_search,
+                                "Search actions…",
                             );
                         });
                     });
@@ -6512,6 +6548,33 @@ impl eframe::App for RiverDeckApp {
                                 }
 
                                 let mut changed = false;
+                                // Theme
+                                ui.horizontal(|ui| {
+                                    ui.label("Theme");
+                                    let before = self.settings_theme.clone();
+                                    egui::ComboBox::from_id_salt("settings_theme")
+                                        .selected_text(match self.settings_theme.0.as_str() {
+                                            riverdeck_core::store::ThemeId::RIVER_LIGHT_ID => {
+                                                "River Light"
+                                            }
+                                            _ => "River Dark",
+                                        })
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(
+                                                &mut self.settings_theme,
+                                                riverdeck_core::store::ThemeId::river_dark(),
+                                                "River Dark",
+                                            );
+                                            ui.selectable_value(
+                                                &mut self.settings_theme,
+                                                riverdeck_core::store::ThemeId::river_light(),
+                                                "River Light",
+                                            );
+                                        });
+                                    changed |= self.settings_theme != before;
+                                });
+                                ui.add_space(6.0);
+
                                 changed |= ui
                                     .checkbox(&mut self.settings_autostart, "Autostart")
                                     .changed();
@@ -6527,10 +6590,15 @@ impl eframe::App for RiverDeckApp {
                                         Ok(mut store) => {
                                             store.value.autolaunch = self.settings_autostart;
                                             store.value.screensaver = self.settings_screensaver;
+                                            store.value.theme = self.settings_theme.clone();
                                             if let Err(err) = store.save() {
                                                 self.settings_error = Some(err.to_string());
                                             } else {
                                                 self.settings_error = None;
+                                                self.current_theme = self.settings_theme.clone();
+                                                Self::apply_theme(ctx, &self.current_theme);
+                                                self.last_applied_theme =
+                                                    Some(self.current_theme.clone());
                                                 // Apply autostart immediately.
                                                 configure_autostart();
                                             }
@@ -7971,10 +8039,13 @@ impl Drop for RiverDeckApp {
     fn drop(&mut self) {
         self.close_marketplace();
         self.close_property_inspector();
-        // Ensure we don't orphan plugin subprocesses (native/node/wine) on window close or tray quit.
-        // This is synchronous so it runs even if the UI is exiting.
-        self.runtime
-            .block_on(async { riverdeck_core::lifecycle::shutdown_all().await });
+        // On tray builds, shutdown is handled by the outer host loop / signal handlers.
+        // Dropping the UI window must not stop the backend.
+        #[cfg(not(feature = "tray"))]
+        {
+            self.runtime
+                .block_on(async { riverdeck_core::lifecycle::shutdown_all().await });
+        }
     }
 }
 
@@ -7985,7 +8056,9 @@ impl RiverDeckApp {
         let height = Self::MAIN_TITLEBAR_HEIGHT;
         let (_size, resp) = ui.allocate_exact_size(
             egui::vec2(ui.available_width(), height),
-            egui::Sense::click_and_drag(),
+            // IMPORTANT: only capture drags on the background. If we use `click_and_drag` here,
+            // it can steal pointer input from the window buttons, making the "X" appear to do nothing.
+            egui::Sense::drag(),
         );
         let rect = resp.rect;
 
@@ -8051,17 +8124,14 @@ impl RiverDeckApp {
                             ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                         }
 
-                        let cog = ui
-                            .add(
-                                egui::Button::new(egui::RichText::new("⚙").size(13.0)).frame(false),
-                            )
-                            .on_hover_text("Settings");
+                        let cog = app_ui::widgets::icon_button(ui, "⚙").on_hover_text("Settings");
                         if cog.clicked() {
                             self.show_settings = true;
                             self.settings_error = None;
                             // Load current settings into the local UI state (best effort).
                             match riverdeck_core::store::get_settings() {
                                 Ok(store) => {
+                                    self.settings_theme = store.value.theme.clone();
                                     self.settings_autostart = store.value.autolaunch;
                                     self.settings_screensaver = store.value.screensaver;
                                 }
@@ -8084,8 +8154,17 @@ impl RiverDeckApp {
                     // Use plain ASCII so it renders reliably even when the active font lacks the ✕ glyph.
                     let close = ui.add(egui::Button::new("X").min_size(btn_size));
                     if close.clicked() {
-                        // Always request a real close; the `close_requested` handler above will
-                        // decide whether to hide-to-tray (only when explicitly enabled).
+                        #[cfg(feature = "tray")]
+                        if !QUIT_REQUESTED.load(Ordering::SeqCst) && self.hide_to_tray_available() {
+                            log::info!("Titlebar X clicked: hiding window to tray");
+                            self.hide_to_tray_requested = true;
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                            ctx.request_repaint();
+                        } else {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                        #[cfg(not(feature = "tray"))]
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
 
@@ -8184,8 +8263,11 @@ fn start_update_check(runtime: Arc<Runtime>, update_info: Arc<Mutex<Option<Updat
 struct TrayState {
     #[allow(dead_code)]
     _tray: TrayIcon,
+    #[allow(dead_code)]
     show: MenuItem,
+    #[allow(dead_code)]
     hide: MenuItem,
+    #[allow(dead_code)]
     quit: MenuItem,
 }
 
@@ -8237,8 +8319,7 @@ impl TrayState {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             } else if ev.id == self.quit.id() {
                 QUIT_REQUESTED.store(true, Ordering::SeqCst);
-                // Make sure the close isn't intercepted by hide-to-tray logic.
-                // We rely on the normal shutdown path (signal handlers / Drop) to clean up.
+                // Allow the close to proceed; shutdown is handled by the normal exit path.
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }

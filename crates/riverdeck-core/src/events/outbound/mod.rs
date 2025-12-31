@@ -38,17 +38,17 @@ fn retain_newest_within_limits(queue: &mut Vec<Message>, max_msgs: usize, max_by
     }
 
     let mut bytes = 0usize;
-    let mut count = 0usize;
     let mut start = queue.len();
 
     // Walk from newest to oldest; keep the largest suffix within caps.
-    for idx in (0..queue.len()).rev() {
+    for (count, idx) in (0..queue.len()).rev().enumerate() {
         let sz = message_size_bytes(&queue[idx]);
-        if count > 0 && (count + 1 > max_msgs || bytes + sz > max_bytes) {
+        // `count` is a 0-based counter from `enumerate()`.
+        let next_count = count + 1;
+        if count > 0 && (next_count > max_msgs || bytes + sz > max_bytes) {
             break;
         }
         bytes += sz;
-        count += 1;
         start = idx;
     }
 

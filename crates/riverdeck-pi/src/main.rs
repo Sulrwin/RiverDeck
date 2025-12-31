@@ -798,6 +798,7 @@ impl FetchPool {
         }
     }
 
+    #[allow(clippy::result_large_err)]
     fn try_submit(&self, mut job: FetchJob) -> Result<(), FetchJob> {
         if self.workers.is_empty() {
             return Err(job);

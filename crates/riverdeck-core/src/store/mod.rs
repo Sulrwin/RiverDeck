@@ -163,11 +163,16 @@ where
 }
 
 #[derive(Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, from = "SettingsSerde")]
 pub struct Settings {
     pub version: String,
     pub language: String,
     pub brightness: u8,
+    /// UI theme identifier (host UI only). Uses stable string IDs so new themes can be added later
+    /// without breaking old configs.
+    pub theme: ThemeId,
+    /// Legacy: used by older configs. Migrated into `theme` on load and not written back out.
+    #[serde(skip_serializing)]
     pub darktheme: bool,
     pub background: bool,
     pub autolaunch: bool,
@@ -188,6 +193,7 @@ impl Default for Settings {
             version: "0.0.0".to_owned(),
             language: "en".to_owned(),
             brightness: 50,
+            theme: ThemeId::river_dark(),
             darktheme: true,
             background: !is_flatpak(),
             autolaunch: false,
@@ -204,6 +210,72 @@ impl Default for Settings {
 }
 
 impl NotProfile for Settings {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ThemeId(pub String);
+
+impl ThemeId {
+    pub const RIVER_DARK_ID: &'static str = "river-dark";
+    pub const RIVER_LIGHT_ID: &'static str = "river-light";
+
+    pub fn river_dark() -> Self {
+        Self(Self::RIVER_DARK_ID.to_owned())
+    }
+
+    pub fn river_light() -> Self {
+        Self(Self::RIVER_LIGHT_ID.to_owned())
+    }
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct SettingsSerde {
+    version: String,
+    language: String,
+    brightness: u8,
+    theme: Option<ThemeId>,
+    darktheme: Option<bool>,
+    background: bool,
+    autolaunch: bool,
+    screensaver: bool,
+    updatecheck: bool,
+    statistics: bool,
+    separatewine: bool,
+    developer: bool,
+    disableelgato: bool,
+    disabled_plugins: Vec<String>,
+}
+
+impl From<SettingsSerde> for Settings {
+    fn from(s: SettingsSerde) -> Self {
+        let theme = s.theme.unwrap_or_else(|| {
+            if s.darktheme == Some(false) {
+                ThemeId::river_light()
+            } else {
+                ThemeId::river_dark()
+            }
+        });
+        let darktheme = theme.0 == ThemeId::RIVER_DARK_ID;
+
+        Self {
+            version: s.version,
+            language: s.language,
+            brightness: s.brightness,
+            theme,
+            darktheme,
+            background: s.background,
+            autolaunch: s.autolaunch,
+            screensaver: s.screensaver,
+            updatecheck: s.updatecheck,
+            statistics: s.statistics,
+            separatewine: s.separatewine,
+            developer: s.developer,
+            disableelgato: s.disableelgato,
+            disabled_plugins: s.disabled_plugins,
+        }
+    }
+}
 
 pub fn get_settings() -> Result<Store<Settings>, anyhow::Error> {
     Store::new(
