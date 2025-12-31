@@ -18,6 +18,7 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
+use crate::render::label::overlay_label;
 use crate::render::rounding::round_corners_subtle;
 
 static ELGATO_DEVICES: Lazy<RwLock<HashMap<String, AsyncStreamDeck>>> =
@@ -32,6 +33,29 @@ static ELGATO_TASKS: Lazy<RwLock<HashMap<String, JoinHandle<()>>>> =
 
 // Global shutdown flag so per-device reader tasks can exit promptly, releasing HID handles.
 static ELGATO_SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+
+fn blend_pixel(dst: &mut Rgba<u8>, src: Rgba<u8>) {
+    let sa = src[3] as f32 / 255.0;
+    if sa <= 0.0 {
+        return;
+    }
+    let da = dst[3] as f32 / 255.0;
+    let out_a = sa + da * (1.0 - sa);
+    if out_a <= 0.0 {
+        *dst = Rgba([0, 0, 0, 0]);
+        return;
+    }
+    let blend = |sc: u8, dc: u8| -> u8 {
+        let sc = sc as f32 / 255.0;
+        let dc = dc as f32 / 255.0;
+        let out_c = (sc * sa + dc * da * (1.0 - sa)) / out_a;
+        (out_c * 255.0).round().clamp(0.0, 255.0) as u8
+    };
+    dst[0] = blend(src[0], dst[0]);
+    dst[1] = blend(src[1], dst[1]);
+    dst[2] = blend(src[2], dst[2]);
+    dst[3] = (out_a * 255.0).round().clamp(0.0, 255.0) as u8;
+}
 
 fn env_truthy_any(name: &str) -> bool {
     matches!(
@@ -103,29 +127,6 @@ async fn register_spawn_all_test_devices() {
             crate::events::inbound::devices::register_device("", PayloadEvent { payload: info })
                 .await;
     }
-}
-
-fn blend_pixel(dst: &mut Rgba<u8>, src: Rgba<u8>) {
-    let sa = src[3] as f32 / 255.0;
-    if sa <= 0.0 {
-        return;
-    }
-    let da = dst[3] as f32 / 255.0;
-    let out_a = sa + da * (1.0 - sa);
-    if out_a <= 0.0 {
-        *dst = Rgba([0, 0, 0, 0]);
-        return;
-    }
-    let blend = |sc: u8, dc: u8| -> u8 {
-        let sc = sc as f32 / 255.0;
-        let dc = dc as f32 / 255.0;
-        let out_c = (sc * sa + dc * da * (1.0 - sa)) / out_a;
-        (out_c * 255.0).round().clamp(0.0, 255.0) as u8
-    };
-    dst[0] = blend(src[0], dst[0]);
-    dst[1] = blend(src[1], dst[1]);
-    dst[2] = blend(src[2], dst[2]);
-    dst[3] = (out_a * 255.0).round().clamp(0.0, 255.0) as u8;
 }
 
 fn sanitize_encoder_screen_crop(
@@ -430,48 +431,6 @@ async fn plus_ensure_task(device_id: String, state: Arc<Mutex<PlusDeviceState>>,
     });
 }
 
-use crate::render::label::overlay_label;
-
-fn plus_make_segment_overlay(
-    icon: Option<image::DynamicImage>,
-    overlays: Option<&[crate::shared::LabelOverlay]>,
-) -> image::DynamicImage {
-    // Transparent overlay so the background can show through.
-    let mut base = RgbaImage::from_pixel(200, 100, Rgba([0, 0, 0, 0]));
-
-    // Icon is a 72x72 square placed in the segment (matches previous icon placement).
-    if let Some(icon) = icon {
-        let icon = icon
-            .resize_exact(72, 72, image::imageops::FilterType::Nearest)
-            .to_rgba8();
-        let ox = 64u32;
-        let oy = 14u32;
-        for y in 0..icon.height() {
-            for x in 0..icon.width() {
-                let dst_x = ox + x;
-                let dst_y = oy + y;
-                if dst_x < base.width() && dst_y < base.height() {
-                    let src = *icon.get_pixel(x, y);
-                    if src[3] != 0 {
-                        let dst = base.get_pixel_mut(dst_x, dst_y);
-                        blend_pixel(dst, src);
-                    }
-                }
-            }
-        }
-    }
-
-    let mut out = image::DynamicImage::ImageRgba8(base);
-    if let Some(ov) = overlays {
-        for o in ov {
-            if !o.text.trim().is_empty() {
-                out = overlay_label(out, o);
-            }
-        }
-    }
-    out
-}
-
 async fn load_dynamic_image(image: &str) -> Result<image::DynamicImage, anyhow::Error> {
     if image.trim().starts_with("data:") {
         // Stream Deck SDK commonly uses data URLs.
@@ -676,8 +635,10 @@ pub async fn update_image(
                                     .first()
                                     .map(|f| f.image.clone())
                                     .unwrap_or_else(|| image::DynamicImage::new_rgba8(72, 72));
-                                let seg =
-                                    plus_make_segment_overlay(Some(icon), overlays.as_deref());
+                                let seg = crate::render::plus_strip::make_segment_overlay(
+                                    Some(icon),
+                                    overlays.as_deref(),
+                                );
                                 st.dials[context.position as usize] = PlusLayer::Static(seg);
                             } else {
                                 // Prepare icon frames (72x72), then wrap each into a 200x100 segment overlay
@@ -697,7 +658,7 @@ pub async fn update_image(
                                     .into_iter()
                                     .map(|f| crate::animation::PreparedFrame {
                                         delay: f.delay,
-                                        image: plus_make_segment_overlay(
+                                        image: crate::render::plus_strip::make_segment_overlay(
                                             Some(f.image),
                                             overlays.as_deref(),
                                         ),
@@ -858,9 +819,11 @@ pub async fn update_image(
                             st.dials
                                 .resize(device.kind().encoder_count() as usize, PlusLayer::None);
                         }
-                        st.dials[context.position as usize] = PlusLayer::Static(
-                            plus_make_segment_overlay(Some(dyn_img.clone()), overlays.as_deref()),
-                        );
+                        st.dials[context.position as usize] =
+                            PlusLayer::Static(crate::render::plus_strip::make_segment_overlay(
+                                Some(dyn_img.clone()),
+                                overlays.as_deref(),
+                            ));
                         plus_bump_generation(&mut st)
                     };
                     plus_render_once(&context.device, state.clone()).await;
@@ -929,7 +892,10 @@ pub async fn update_image(
                     if has_overlays {
                         // Important: encoder segments can still show text even when there's no icon.
                         st.dials[context.position as usize] =
-                            PlusLayer::Static(plus_make_segment_overlay(None, overlays.as_deref()));
+                            PlusLayer::Static(crate::render::plus_strip::make_segment_overlay(
+                                None,
+                                overlays.as_deref(),
+                            ));
                     } else {
                         st.dials[context.position as usize] = PlusLayer::None;
                     }

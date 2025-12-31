@@ -59,7 +59,9 @@ pub fn preferred_package_kind() -> Option<PackageKind> {
     }
 }
 
-pub async fn fetch_latest_release(current: Option<Version>) -> anyhow::Result<Option<LatestRelease>> {
+pub async fn fetch_latest_release(
+    current: Option<Version>,
+) -> anyhow::Result<Option<LatestRelease>> {
     let res = reqwest::Client::new()
         .get("https://api.github.com/repos/sulrwin/RiverDeck/releases/latest")
         .header("Accept", "application/vnd.github+json")
@@ -108,9 +110,9 @@ pub async fn fetch_latest_release(current: Option<Version>) -> anyhow::Result<Op
             // If the system prefers deb but no deb asset is present, fall back to rpm.
             select_asset(&json, PackageKind::Rpm)
         }),
-        Some(PackageKind::Rpm) => select_asset(&json, PackageKind::Rpm).or_else(|| {
-            select_asset(&json, PackageKind::Deb)
-        }),
+        Some(PackageKind::Rpm) => {
+            select_asset(&json, PackageKind::Rpm).or_else(|| select_asset(&json, PackageKind::Deb))
+        }
         None => None,
     };
 
@@ -257,9 +259,7 @@ pub async fn download_asset_to(
 
     let tmp = dest.with_extension(format!(
         "{}.part",
-        dest.extension()
-            .and_then(|s| s.to_str())
-            .unwrap_or("bin")
+        dest.extension().and_then(|s| s.to_str()).unwrap_or("bin")
     ));
     let mut file = tokio::fs::File::create(&tmp)
         .await
@@ -272,7 +272,9 @@ pub async fn download_asset_to(
     let mut stream = res.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.context("download stream error")?;
-        file.write_all(&chunk).await.context("failed to write chunk")?;
+        file.write_all(&chunk)
+            .await
+            .context("failed to write chunk")?;
         downloaded = downloaded.saturating_add(chunk.len() as u64);
         on_progress(DownloadProgress {
             downloaded_bytes: downloaded,
@@ -325,17 +327,13 @@ pub async fn install_package_with_pkexec(path: &Path, kind: PackageKind) -> anyh
                 cmd.arg("dpkg").arg("-i").arg(path);
             }
             PackageKind::Rpm => {
-                cmd.arg("rpm")
-                    .arg("-Uvh")
-                    .arg("--replacepkgs")
-                    .arg(path);
+                cmd.arg("rpm").arg("-Uvh").arg("--replacepkgs").arg(path);
             }
         }
         // Best-effort: capture output for error messages, but don't spam logs on success.
-        let out = cmd
-            .output()
-            .await
-            .with_context(|| format!("failed to run installer via pkexec for {}", path.display()))?;
+        let out = cmd.output().await.with_context(|| {
+            format!("failed to run installer via pkexec for {}", path.display())
+        })?;
         if !out.status.success() {
             let stdout = String::from_utf8_lossy(&out.stdout);
             let stderr = String::from_utf8_lossy(&out.stderr);
@@ -349,5 +347,3 @@ pub async fn install_package_with_pkexec(path: &Path, kind: PackageKind) -> anyh
         Ok(())
     }
 }
-
-

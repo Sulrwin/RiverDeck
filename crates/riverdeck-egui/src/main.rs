@@ -1933,6 +1933,11 @@ enum TextureJobKind {
         round_corners: bool,
         options: TextureOptionsKind,
     },
+    PlusSegmentOverlay {
+        icon: TextureJobInput,
+        overlays: Vec<shared::LabelOverlay>,
+        options: TextureOptionsKind,
+    },
 }
 
 #[derive(Debug)]
@@ -2442,22 +2447,23 @@ impl RiverDeckApp {
         }
 
         // Encoder dial previews (Stream Deck+ today).
-        let (iw, ih) = (72u32, 72u32);
-        for inst in snapshot.sliders.iter().filter_map(|v| v.as_ref()) {
-            let st = inst
-                .states
-                .get(inst.current_state as usize)
-                .or_else(|| inst.states.first());
-            let mut state_img = st
-                .map(|s| s.image.trim())
-                .filter(|s| !s.is_empty())
-                .unwrap_or(inst.action.icon.trim());
-            if state_img == "actionDefaultImage" {
-                state_img = inst.action.icon.trim();
+        if device.r#type == 7 && device.screen.is_some() {
+            for inst in snapshot.sliders.iter().filter_map(|v| v.as_ref()) {
+                let st = inst
+                    .states
+                    .get(inst.current_state as usize)
+                    .or_else(|| inst.states.first());
+                let mut state_img = st
+                    .map(|s| s.image.trim())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(inst.action.icon.trim());
+                if state_img == "actionDefaultImage" {
+                    state_img = inst.action.icon.trim();
+                }
+                let overlays = riverdeck_core::events::outbound::devices::overlays_for_instance(inst)
+                    .unwrap_or_default();
+                let _ = self.rendered_plus_segment_overlay(ctx, state_img, &overlays);
             }
-            let overlays = riverdeck_core::events::outbound::devices::overlays_for_instance(inst)
-                .unwrap_or_default();
-            let _ = self.rendered_texture_for_size(ctx, "encoder", iw, ih, state_img, &overlays);
         }
 
         // Stream Deck+ strip background.
@@ -4115,6 +4121,114 @@ impl RiverDeckApp {
         None
     }
 
+    fn rendered_plus_segment_overlay(
+        &mut self,
+        ctx: &egui::Context,
+        icon: &str,
+        overlays: &[shared::LabelOverlay],
+    ) -> Option<egui::TextureHandle> {
+        use std::hash::{Hash, Hasher};
+        use std::time::UNIX_EPOCH;
+
+        let icon = icon.trim();
+        if icon.is_empty() && overlays.is_empty() {
+            return None;
+        }
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        "plus_segment_overlay".hash(&mut hasher);
+
+        let input = if icon.is_empty() {
+            TextureJobInput::Empty
+        } else if icon.starts_with("data:") {
+            TextureJobInput::DataUrl(icon.to_owned())
+        } else {
+            // Use the same SVG fallback strategy as `texture_for_path`.
+            let (alt1, alt2) = if icon.ends_with(".svg") {
+                let base = icon.trim_end_matches(".svg");
+                (Some(format!("{base}@2x.png")), Some(format!("{base}.png")))
+            } else {
+                (None, None)
+            };
+            let mut candidates: Vec<&str> = Vec::with_capacity(3);
+            candidates.push(icon);
+            if let Some(a) = alt1.as_deref() {
+                candidates.push(a);
+            }
+            if let Some(a) = alt2.as_deref() {
+                candidates.push(a);
+            }
+            let mut resolved: Option<(PathBuf, bool)> = None;
+            for cand in candidates {
+                let is_svg = cand.ends_with(".svg");
+                let Some(p) = self.resolve_icon_path(cand) else {
+                    continue;
+                };
+                resolved = Some((p, is_svg));
+                break;
+            }
+            let (path, is_svg) = resolved?;
+            TextureJobInput::File { path, is_svg }
+        };
+
+        // Hash the input with a file mtime fingerprint so overwriting a path refreshes the rendered texture too.
+        match &input {
+            TextureJobInput::Empty => {
+                0u8.hash(&mut hasher);
+            }
+            TextureJobInput::DataUrl(s) => {
+                1u8.hash(&mut hasher);
+                s.hash(&mut hasher);
+            }
+            TextureJobInput::Bytes(bytes) => {
+                2u8.hash(&mut hasher);
+                bytes.hash(&mut hasher);
+            }
+            TextureJobInput::File { path, is_svg } => {
+                3u8.hash(&mut hasher);
+                path.as_os_str().hash(&mut hasher);
+                is_svg.hash(&mut hasher);
+                let modified_nanos: u128 = std::fs::metadata(path)
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                modified_nanos.hash(&mut hasher);
+            }
+        }
+
+        for o in overlays {
+            o.text.hash(&mut hasher);
+            o.colour.hash(&mut hasher);
+            o.size.hash(&mut hasher);
+            let p = match o.placement {
+                shared::TextPlacement::Top => 0u8,
+                shared::TextPlacement::Bottom => 1u8,
+                shared::TextPlacement::Left => 2u8,
+                shared::TextPlacement::Right => 3u8,
+                shared::TextPlacement::Center => 4u8,
+            };
+            p.hash(&mut hasher);
+        }
+
+        let key = format!("riverdeck_plus_seg:{:x}", hasher.finish());
+        if let Some(tex) = self.touch_cached_texture(&key) {
+            return Some(tex);
+        }
+
+        self.ensure_texture_job(
+            ctx,
+            key.clone(),
+            TextureJobKind::PlusSegmentOverlay {
+                icon: input,
+                overlays: overlays.to_vec(),
+                options: TextureOptionsKind::Nearest,
+            },
+        );
+        None
+    }
+
     fn embedded_logo_texture(&mut self, ctx: &egui::Context) -> Option<egui::TextureHandle> {
         let cache_key = "riverdeck_embedded_logo".to_owned();
         if let Some(tex) = self.touch_cached_texture(&cache_key) {
@@ -4307,7 +4421,8 @@ impl RiverDeckApp {
                 let instance = snapshot.sliders.get(i).and_then(|v| v.as_ref());
                 if let Some(instance) = instance {
                     // Stream Deck+ reality check: the dials have no displays; the LCD strip above them does.
-                    // Render the dial's icon + title/action name onto the strip segment preview.
+                    // Render the dial's icon + labels onto the strip segment preview using the same
+                    // compositor as the hardware output.
                     let state_img = instance
                         .states
                         .get(instance.current_state as usize)
@@ -4320,56 +4435,16 @@ impl RiverDeckApp {
                         img
                     };
 
-                    if let Some(tex) = self.texture_for_path(ctx, img) {
-                        // Keep dial LCD icons square (don't stretch to the segment's wide aspect).
-                        // The strip segments are wide+short; we inscribe a centered square and draw
-                        // the image into that square.
-                        let max_rect = seg_rect.shrink(8.0);
-                        let side = max_rect.width().min(max_rect.height());
-                        let square_rect =
-                            egui::Rect::from_center_size(max_rect.center(), egui::vec2(side, side));
+                    let overlays =
+                        riverdeck_core::events::outbound::devices::overlays_for_instance(instance)
+                            .unwrap_or_default();
+                    if let Some(seg) = self.rendered_plus_segment_overlay(ctx, img, &overlays) {
                         painter.image(
-                            tex.id(),
-                            square_rect,
+                            seg.id(),
+                            seg_rect,
                             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                             egui::Color32::WHITE,
                         );
-                    }
-
-                    if let Some(overlays) =
-                        riverdeck_core::events::outbound::devices::overlays_for_instance(instance)
-                    {
-                        let font = egui::FontId::proportional(10.0);
-                        let color = ui.visuals().weak_text_color();
-                        for o in overlays {
-                            let text = o.text.trim();
-                            if text.is_empty() {
-                                continue;
-                            }
-                            // Placement mapping: keep it simple for this small preview.
-                            let (pos, align) = match o.placement {
-                                shared::TextPlacement::Top => (
-                                    egui::pos2(seg_rect.center().x, seg_rect.top() + 2.0),
-                                    egui::Align2::CENTER_TOP,
-                                ),
-                                shared::TextPlacement::Bottom => (
-                                    egui::pos2(seg_rect.center().x, seg_rect.bottom() - 2.0),
-                                    egui::Align2::CENTER_BOTTOM,
-                                ),
-                                shared::TextPlacement::Left => (
-                                    egui::pos2(seg_rect.left() + 2.0, seg_rect.center().y),
-                                    egui::Align2::LEFT_CENTER,
-                                ),
-                                shared::TextPlacement::Right => (
-                                    egui::pos2(seg_rect.right() - 2.0, seg_rect.center().y),
-                                    egui::Align2::RIGHT_CENTER,
-                                ),
-                                shared::TextPlacement::Center => {
-                                    (seg_rect.center(), egui::Align2::CENTER_CENTER)
-                                }
-                            };
-                            painter.text(pos, align, text, font.clone(), color);
-                        }
                     }
                 } else {
                     painter.text(
@@ -4852,7 +4927,7 @@ impl RiverDeckApp {
         ui: &mut egui::Ui,
         ctx: &egui::Context,
         size: egui::Vec2,
-        device: &shared::DeviceInfo,
+        _device: &shared::DeviceInfo,
         slot: &SelectedSlot,
         instance: Option<&shared::ActionInstance>,
         selected: bool,
@@ -4916,71 +4991,9 @@ impl RiverDeckApp {
         painter.circle_filled(center, radius, fill);
         painter.circle_stroke(center, radius, stroke);
 
-        // Optional: render action image/icon in an inscribed square.
-        if let Some(instance) = instance {
-            let slot_key = format!("preview_slot:{}", instance.context);
-
-            let st = instance
-                .states
-                .get(instance.current_state as usize)
-                .or_else(|| instance.states.first());
-            let mut state_img = st
-                .map(|s| s.image.trim())
-                .filter(|s| !s.is_empty())
-                .unwrap_or(instance.action.icon.trim());
-            if state_img == "actionDefaultImage" {
-                state_img = instance.action.icon.trim();
-            }
-
-            let overlays =
-                riverdeck_core::events::outbound::devices::overlays_for_instance(instance)
-                    .unwrap_or_default();
-            // Encoder icons are rendered at 72x72 on Stream Deck+ (the only encoder device today).
-            let (iw, ih) = if device.r#type == 7 {
-                (72u32, 72u32)
-            } else {
-                riverdeck_core::render::device::key_image_size_for_device_type(device.r#type)
-            };
-            if let Some(tex) =
-                self.rendered_texture_for_size(ctx, "encoder", iw, ih, state_img, &overlays)
-            {
-                self.preview_last_slot_texture
-                    .insert(slot_key.clone(), tex.clone());
-                // Inscribed square inside circle (with padding) so it visually reads as a dial.
-                let inner = rect.shrink(rect.width().min(rect.height()) * 0.22);
-                painter.image(
-                    tex.id(),
-                    inner,
-                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                    egui::Color32::WHITE,
-                );
-            } else if let Some(prev) = self.preview_last_slot_texture.get(&slot_key) {
-                let inner = rect.shrink(rect.width().min(rect.height()) * 0.22);
-                painter.image(
-                    prev.id(),
-                    inner,
-                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                    egui::Color32::WHITE,
-                );
-            } else if let Some(tex) = self.texture_for_path(ctx, state_img) {
-                // Inscribed square inside circle (with padding) so it visually reads as a dial.
-                let inner = rect.shrink(rect.width().min(rect.height()) * 0.22);
-                painter.image(
-                    tex.id(),
-                    inner,
-                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                    egui::Color32::WHITE,
-                );
-            } else {
-                painter.text(
-                    center,
-                    egui::Align2::CENTER_CENTER,
-                    &instance.action.name,
-                    egui::FontId::proportional(12.0),
-                    visuals.text_color(),
-                );
-            }
-        } else {
+        // Stream Deck+ reality check: the dials have no displays; the LCD strip above them does.
+        // Keep the dial UI generic (no icon) so it doesn't suggest the dial itself is a display.
+        if instance.is_none() {
             painter.text(
                 center,
                 egui::Align2::CENTER_CENTER,
@@ -5649,6 +5662,31 @@ fn run_texture_job(key: &str, job: TextureJobKind) -> anyhow::Result<TextureJobR
                 img = riverdeck_core::render::rounding::round_corners_subtle(img);
             }
 
+            let rgba = img.into_rgba8();
+            let (w, h) = (rgba.width(), rgba.height());
+            Ok(TextureJobResult::Ready {
+                key: key.to_owned(),
+                rgba: rgba.into_raw(),
+                width: w,
+                height: h,
+                options,
+            })
+        }
+        TextureJobKind::PlusSegmentOverlay {
+            icon,
+            overlays,
+            options,
+        } => {
+            let icon_img = if matches!(icon, TextureJobInput::Empty) {
+                None
+            } else {
+                decode_input_to_image(&icon).map(|(img, _)| img)
+            };
+
+            let img = riverdeck_core::render::plus_strip::make_segment_overlay(
+                icon_img,
+                Some(overlays.as_slice()),
+            );
             let rgba = img.into_rgba8();
             let (w, h) = (rgba.width(), rgba.height());
             Ok(TextureJobResult::Ready {
@@ -8776,6 +8814,7 @@ fn log_tray_status_to_file(msg: &str) {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Clone)]
 struct UpdateInfo {
     tag: String,
