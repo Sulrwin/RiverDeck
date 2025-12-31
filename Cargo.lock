@@ -5077,6 +5077,7 @@ dependencies = [
  "libc",
  "log",
  "open",
+ "raw-window-handle",
  "reqwest",
  "rfd",
  "riverdeck-core",
@@ -5086,6 +5087,7 @@ dependencies = [
  "tokio",
  "tray-icon",
  "urlencoding",
+ "winit",
 ]
 
 [[package]]

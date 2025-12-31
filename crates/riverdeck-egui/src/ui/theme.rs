@@ -47,7 +47,8 @@ pub fn apply_theme(ctx: &egui::Context, theme_id: &riverdeck_core::store::ThemeI
         s.spacing.window_margin = egui::Margin::same(tokens.window_margin);
 
         // Typography scale: egui defaults skew small; bump slightly for a “designed” feel.
-        s.text_styles.insert(egui::TextStyle::Heading, FontId::proportional(20.0));
+        s.text_styles
+            .insert(egui::TextStyle::Heading, FontId::proportional(20.0));
         s.text_styles
             .insert(egui::TextStyle::Body, FontId::proportional(14.0));
         s.text_styles
@@ -108,5 +109,3 @@ pub fn apply_theme(ctx: &egui::Context, theme_id: &riverdeck_core::store::ThemeI
         s.visuals = v;
     });
 }
-
-

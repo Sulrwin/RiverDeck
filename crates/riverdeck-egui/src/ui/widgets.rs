@@ -28,7 +28,6 @@ pub fn paint_list_row(
     fill: egui::Color32,
     stroke: egui::Stroke,
 ) {
-    ui.painter().rect(rect, radius, fill, stroke, egui::StrokeKind::Inside);
+    ui.painter()
+        .rect(rect, radius, fill, stroke, egui::StrokeKind::Inside);
 }
-
-

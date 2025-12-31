@@ -174,6 +174,28 @@ fn make_native_options() -> eframe::NativeOptions {
     {
         native_options.viewport = native_options.viewport.with_decorations(false);
     }
+
+    // Force X11 (XWayland) for tray builds on Wayland sessions.
+    //
+    // This is the definitive fix for "close-to-tray logs but does nothing":
+    // on winit 0.30's Wayland backend, hiding (`Window::set_visible(false)`) is not implemented,
+    // so no amount of egui viewport commands can hide the window on native Wayland.
+    //
+    // We prefer to enforce this at the EventLoopBuilder level (not via environment variables),
+    // because the env var approach is not reliably honored in all setups.
+    #[cfg(all(target_os = "linux", feature = "tray"))]
+    {
+        let on_wayland = is_wayland_session();
+        let has_xwayland = std::env::var("DISPLAY").ok().is_some();
+        let prefer_wayland = env_truthy_any("RIVERDECK_PREFER_WAYLAND");
+
+        if on_wayland && has_xwayland && !prefer_wayland {
+            native_options.event_loop_builder = Some(Box::new(|builder| {
+                use winit::platform::x11::EventLoopBuilderExtX11 as _;
+                builder.with_x11();
+            }));
+        }
+    }
     log::info!("Loading window icon (best-effort)");
     // SAFETY VALVE: some environments have shown hangs during icon decode in debug builds.
     // The window icon is non-critical; default to skipping it in debug builds to ensure the UI
@@ -274,14 +296,49 @@ fn main() -> anyhow::Result<()> {
                 .to_lowercase()
                 .contains("hypr");
         let prefer_wayland = env_truthy_any("RIVERDECK_PREFER_WAYLAND");
-        if on_wayland && has_xwayland && is_hyprland && !prefer_wayland {
-            // Only set if user didn't already choose a backend.
-            if std::env::var("WINIT_UNIX_BACKEND").is_err() {
+        let backend_before = std::env::var("WINIT_UNIX_BACKEND").unwrap_or_else(|_| "<unset>".to_owned());
+        let backend_is_unset = backend_before == "<unset>";
+
+        // Tray builds rely on "hide window" semantics for close-to-tray. On Linux/Wayland,
+        // winit/eframe does not consistently support hiding/removing the window from the taskbar
+        // across compositors, even when close is cancelled. XWayland is the most reliable mode
+        // for tray-style background apps today.
+        //
+        // This is especially important when the tray icon is visible (user confirmed) but the UI
+        // never actually hides: the user experiences "X does nothing".
+        #[cfg(feature = "tray")]
+        if on_wayland && has_xwayland && !prefer_wayland {
+            // Definitive behavior note:
+            // winit's Wayland backend currently does not implement `Window::set_visible(false)`
+            // (it's a no-op), which breaks hide-to-tray. Therefore, for tray builds we force the
+            // X11 backend (XWayland) whenever possible.
+            //
+            // We intentionally override even if the user/system exported `WINIT_UNIX_BACKEND=wayland`,
+            // because otherwise the close button will be intercepted (CancelClose) but the window
+            // will never actually hide.
+            if backend_before.to_lowercase() != "x11" {
                 unsafe {
                     std::env::set_var("WINIT_UNIX_BACKEND", "x11");
                 }
-                log::warn!("Hyprland detected: forcing WINIT_UNIX_BACKEND=x11 for UI reliability (set RIVERDECK_PREFER_WAYLAND=1 to opt out)");
+                if backend_is_unset {
+                    log::warn!(
+                        "Wayland session detected: forcing WINIT_UNIX_BACKEND=x11 for tray reliability (set RIVERDECK_PREFER_WAYLAND=1 to opt out)"
+                    );
+                } else {
+                    log::warn!(
+                        "Wayland session detected: overriding WINIT_UNIX_BACKEND={backend_before} -> x11 for tray reliability (set RIVERDECK_PREFER_WAYLAND=1 to opt out)"
+                    );
+                }
             }
+        }
+
+        // Additional hardening for Hyprland (even on non-tray builds) where we have seen
+        // cross-thread event loop issues.
+        if on_wayland && has_xwayland && is_hyprland && backend_is_unset && !prefer_wayland {
+            unsafe {
+                std::env::set_var("WINIT_UNIX_BACKEND", "x11");
+            }
+            log::warn!("Hyprland detected: forcing WINIT_UNIX_BACKEND=x11 for UI reliability (set RIVERDECK_PREFER_WAYLAND=1 to opt out)");
         }
     }
 
@@ -1540,6 +1597,10 @@ struct RiverDeckApp {
     tray_hide_ok: bool,
     #[cfg(feature = "tray")]
     hide_to_tray_requested: bool,
+    #[cfg(feature = "tray")]
+    hidden_to_tray: bool,
+    #[cfg(feature = "tray")]
+    logged_display_backend: bool,
     selected_device: Option<String>,
     // Cached selected profile for the currently-selected device (kept in sync asynchronously).
     selected_profile_device: Option<String>,
@@ -1982,6 +2043,17 @@ impl RiverDeckApp {
         // keep driving the Stream Deck without staying on-screen.
         #[cfg(feature = "tray")]
         let tray_hide_ok = tray.is_some();
+        #[cfg(feature = "tray")]
+        if tray.is_some() {
+            let backend = std::env::var("WINIT_UNIX_BACKEND").unwrap_or_else(|_| "<unset>".to_owned());
+            let xdg = std::env::var("XDG_SESSION_TYPE").unwrap_or_else(|_| "<unset>".to_owned());
+            let wayland_display =
+                std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "<unset>".to_owned());
+            let display = std::env::var("DISPLAY").unwrap_or_else(|_| "<unset>".to_owned());
+            log_tray_status_to_file(&format!(
+                "tray env: XDG_SESSION_TYPE={xdg} WAYLAND_DISPLAY={wayland_display} DISPLAY={display} WINIT_UNIX_BACKEND={backend}"
+            ));
+        }
 
         let ui_events = ui::subscribe().map(|mut rx| {
             // Bounded channel to avoid unbounded memory growth if the UI falls behind.
@@ -2040,6 +2112,10 @@ impl RiverDeckApp {
             tray_hide_ok,
             #[cfg(feature = "tray")]
             hide_to_tray_requested: false,
+            #[cfg(feature = "tray")]
+            hidden_to_tray: false,
+            #[cfg(feature = "tray")]
+            logged_display_backend: false,
             selected_device: None,
             selected_profile_device: None,
             selected_profile: "Default".to_owned(),
@@ -2151,6 +2227,24 @@ impl RiverDeckApp {
     #[cfg(feature = "tray")]
     fn hide_to_tray_available(&self) -> bool {
         self.tray.is_some() && self.tray_hide_ok
+    }
+
+    #[cfg(feature = "tray")]
+    fn request_hide_to_tray(&mut self, ctx: &egui::Context, cancel_close: bool, reason: &str) {
+        if QUIT_REQUESTED.load(Ordering::SeqCst) || !self.hide_to_tray_available() {
+            return;
+        }
+        log::info!("{reason}: hiding window to tray");
+        log_tray_status_to_file(&format!("{reason}: hide requested"));
+        if cancel_close {
+            ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::CancelClose);
+        }
+        self.hide_to_tray_requested = true;
+        self.hidden_to_tray = true;
+        ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Visible(false));
+        // Some WMs behave better when we also request minimization; harmless where unsupported.
+        ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Minimized(true));
+        ctx.request_repaint();
     }
 
     fn native_options_kind(action_uuid: &str) -> Option<&'static str> {
@@ -5453,8 +5547,25 @@ fn run_texture_job(key: &str, job: TextureJobKind) -> anyhow::Result<TextureJobR
 }
 
 impl eframe::App for RiverDeckApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         let frame_start = std::time::Instant::now();
+
+        // Log the *actual* runtime windowing backend once (Wayland vs X11/Xcb/Xlib).
+        // This is definitive: on winit's Wayland backend, `Window::set_visible(false)` is a no-op,
+        // so close-to-tray cannot work there regardless of our viewport commands.
+        #[cfg(feature = "tray")]
+        if !self.logged_display_backend {
+            self.logged_display_backend = true;
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                use raw_window_handle::HasDisplayHandle as _;
+                let backend = frame
+                    .display_handle()
+                    .map(|h| format!("{:?}", h.as_raw()))
+                    .unwrap_or_else(|e| format!("display_handle error: {e:?}"));
+                log_tray_status_to_file(&format!("runtime display backend: {backend}"));
+            }
+        }
 
         // `tray-icon` on Linux uses GTK/AppIndicator under the hood, which relies on GLib to
         // process DBus registration events. eframe/winit does not run a GTK mainloop, so we
@@ -5490,16 +5601,8 @@ impl eframe::App for RiverDeckApp {
         // A real exit is done via the tray menu (Quit).
         #[cfg(feature = "tray")]
         if ctx.input(|i| i.viewport().close_requested()) {
-            if QUIT_REQUESTED.load(Ordering::SeqCst) {
-                // Allow the close to proceed.
-            } else if self.hide_to_tray_available() {
-                log::info!("Close requested: hiding window to tray");
-                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                self.hide_to_tray_requested = true;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-                // Some WMs behave better when we also request minimization; harmless where unsupported.
-                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-            }
+            // Allow close to proceed only when we're actually quitting.
+            self.request_hide_to_tray(ctx, true, "Close requested");
         }
 
         if self.start_hidden {
@@ -5508,7 +5611,9 @@ impl eframe::App for RiverDeckApp {
             // Otherwise, fall back to minimizing so the user can still find the app.
             #[cfg(feature = "tray")]
             if self.hide_to_tray_available() {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                self.hidden_to_tray = true;
+                log_tray_status_to_file("startup: start hidden-to-tray");
+                ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Visible(false));
             } else {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
             }
@@ -5518,24 +5623,58 @@ impl eframe::App for RiverDeckApp {
 
         #[cfg(feature = "tray")]
         if let Some(tray) = &mut self.tray {
-            tray.poll(ctx);
+            let cmds = tray.poll(ctx);
+            for c in cmds {
+                match c {
+                    TrayCommand::Show => {
+                        self.hidden_to_tray = false;
+                        log_tray_status_to_file("tray: show");
+                        ctx.request_repaint();
+                    }
+                    TrayCommand::Hide => {
+                        self.hidden_to_tray = true;
+                        log_tray_status_to_file("tray: hide");
+                        ctx.request_repaint();
+                    }
+                    TrayCommand::Quit => {
+                        self.hidden_to_tray = false;
+                        log_tray_status_to_file("tray: quit");
+                        ctx.request_repaint();
+                    }
+                }
+            }
         }
 
         // Allow external show requests (e.g. second instance wants to bring the window back).
         #[cfg(unix)]
         if SHOW_REQUESTED.swap(false, Ordering::SeqCst) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            #[cfg(feature = "tray")]
+            {
+                self.hidden_to_tray = false;
+                log_tray_status_to_file("show requested: making window visible");
+            }
+            ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Minimized(false));
         }
 
         #[cfg(feature = "tray")]
         if self.hide_to_tray_requested {
             self.hide_to_tray_requested = false;
             if self.hide_to_tray_available() {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                self.hidden_to_tray = true;
+                ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Visible(false));
             } else {
+                self.hidden_to_tray = false;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
             }
+        }
+
+        // While hidden-to-tray, keep a gentle repaint pulse so the tray menu stays responsive.
+        // `TrayState::poll()` runs from this update loop; without frames, menu clicks may not be
+        // observed in a timely manner on some platforms/backends.
+        #[cfg(feature = "tray")]
+        if self.hidden_to_tray && self.hide_to_tray_available() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
 
         self.poll_ui_events();
@@ -8155,13 +8294,9 @@ impl RiverDeckApp {
                     let close = ui.add(egui::Button::new("X").min_size(btn_size));
                     if close.clicked() {
                         #[cfg(feature = "tray")]
-                        if !QUIT_REQUESTED.load(Ordering::SeqCst) && self.hide_to_tray_available() {
-                            log::info!("Titlebar X clicked: hiding window to tray");
-                            self.hide_to_tray_requested = true;
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-                            ctx.request_repaint();
-                        } else {
+                        self.request_hide_to_tray(ctx, false, "Titlebar X clicked");
+                        #[cfg(feature = "tray")]
+                        if QUIT_REQUESTED.load(Ordering::SeqCst) || !self.hide_to_tray_available() {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
                         #[cfg(not(feature = "tray"))]
@@ -8272,6 +8407,14 @@ struct TrayState {
 }
 
 #[cfg(feature = "tray")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrayCommand {
+    Show,
+    Hide,
+    Quit,
+}
+
+#[cfg(feature = "tray")]
 impl TrayState {
     fn new() -> anyhow::Result<Self> {
         // `tray-icon` on Linux uses GTK menus and will panic if GTK is not initialized.
@@ -8309,20 +8452,25 @@ impl TrayState {
         })
     }
 
-    fn poll(&mut self, ctx: &egui::Context) {
+    fn poll(&mut self, ctx: &egui::Context) -> Vec<TrayCommand> {
+        let mut out = Vec::new();
         while let Ok(ev) = MenuEvent::receiver().try_recv() {
             if ev.id == self.show.id() {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Minimized(false));
+                out.push(TrayCommand::Show);
             } else if ev.id == self.hide.id() {
                 // Hide to tray (no taskbar entry).
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Visible(false));
+                out.push(TrayCommand::Hide);
             } else if ev.id == self.quit.id() {
                 QUIT_REQUESTED.store(true, Ordering::SeqCst);
                 // Allow the close to proceed; shutdown is handled by the normal exit path.
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
+                out.push(TrayCommand::Quit);
             }
         }
+        out
     }
 }
 
