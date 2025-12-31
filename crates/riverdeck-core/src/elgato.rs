@@ -15,11 +15,19 @@ use elgato_streamdeck::{
 use image::{Rgba, RgbaImage};
 use once_cell::sync::Lazy;
 use tokio::sync::{Mutex, RwLock};
+use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
 use crate::render::rounding::round_corners_subtle;
 
 static ELGATO_DEVICES: Lazy<RwLock<HashMap<String, AsyncStreamDeck>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+
+/// Per-device reader tasks (spawned from `initialise_devices`).
+///
+/// We keep join handles so we can `abort()` promptly during shutdown, ensuring we drop all
+/// `AsyncStreamDeck` clones that would otherwise keep HID handles open.
+static ELGATO_TASKS: Lazy<RwLock<HashMap<String, JoinHandle<()>>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 
 // Global shutdown flag so per-device reader tasks can exit promptly, releasing HID handles.
@@ -1091,11 +1099,20 @@ pub async fn reset_devices() {
 pub async fn shutdown_devices() {
     ELGATO_SHUTTING_DOWN.store(true, Ordering::SeqCst);
 
-    // Reset visuals first (best effort), then drop handles.
-    reset_devices().await;
+    // Abort reader tasks first to ensure we drop any `AsyncStreamDeck` clones held by the readers.
+    // This is important: even if we clear `ELGATO_DEVICES`, a still-running reader task can keep
+    // the HID handle open via its internal `AsyncStreamDeck` clone.
+    let tasks = {
+        let mut map = ELGATO_TASKS.write().await;
+        map.drain().collect::<Vec<(String, JoinHandle<()>)>>()
+    };
+    for (_id, handle) in tasks {
+        handle.abort();
+    }
 
-    // Give reader tasks a moment to observe the shutdown flag and exit.
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // Best-effort: reset visuals. This should never block handle dropping.
+    // (If a device is unresponsive on shutdown, we still want to release it promptly.)
+    let _ = tokio::time::timeout(Duration::from_millis(300), reset_devices()).await;
 
     // Drop all known device handles.
     ELGATO_DEVICES.write().await.clear();
@@ -1218,6 +1235,7 @@ async fn init(device: AsyncStreamDeck, device_id: String) {
 
     ELGATO_DEVICES.write().await.remove(&device_id);
     PLUS_STATE.write().await.remove(&device_id);
+    ELGATO_TASKS.write().await.remove(&device_id);
     // During shutdown, the global device registry may already have been cleared; don't panic.
     let _ = crate::events::inbound::devices::deregister_device(
         "",
@@ -1255,9 +1273,15 @@ pub async fn initialise_devices() {
                 if ELGATO_DEVICES.read().await.contains_key(&device_id) {
                     continue;
                 }
+                if ELGATO_TASKS.read().await.contains_key(&device_id) {
+                    continue;
+                }
                 match elgato_streamdeck::AsyncStreamDeck::connect(&hid, kind, &serial) {
                     Ok(device) => {
-                        tokio::spawn(init(device, device_id));
+                        // Track the task so shutdown can abort it promptly.
+                        let id = device_id.clone();
+                        let handle = tokio::spawn(init(device, device_id));
+                        ELGATO_TASKS.write().await.insert(id, handle);
                     }
                     Err(error) => log::warn!("Failed to connect to Elgato device: {error}"),
                 }

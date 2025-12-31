@@ -1601,6 +1601,9 @@ struct RiverDeckApp {
     hidden_to_tray: bool,
     #[cfg(feature = "tray")]
     logged_display_backend: bool,
+    /// Ensures we only run the quit/shutdown sequence once (tray builds).
+    #[cfg(feature = "tray")]
+    quit_initiated: bool,
     selected_device: Option<String>,
     // Cached selected profile for the currently-selected device (kept in sync asynchronously).
     selected_profile_device: Option<String>,
@@ -2116,6 +2119,8 @@ impl RiverDeckApp {
             hidden_to_tray: false,
             #[cfg(feature = "tray")]
             logged_display_backend: false,
+            #[cfg(feature = "tray")]
+            quit_initiated: false,
             selected_device: None,
             selected_profile_device: None,
             selected_profile: "Default".to_owned(),
@@ -3484,7 +3489,9 @@ impl RiverDeckApp {
             // No PI button: native editors live in the Action Editor.
             let has_native_options =
                 Self::native_options_kind(instance.action.uuid.as_str()).is_some();
-            if has_native_options {
+            let has_schema =
+                riverdeck_core::options_schema::get_schema(instance.action.uuid.as_str()).is_some();
+            if has_native_options || has_schema {
                 ui.label(
                     egui::RichText::new("Options are shown on the right.")
                         .small()
@@ -5103,6 +5110,27 @@ impl RiverDeckApp {
                         // Device list / selected device state may have changed.
                         self.schedule_profile_snapshot_refresh();
                     }
+                    ui::UiEvent::DeviceBrightness { action, value } => {
+                        // Starterpack plugin (and potentially others) request a brightness change.
+                        // Apply it to the host settings (so it persists) and push to hardware.
+                        self.runtime.spawn(async move {
+                            let Ok(store) = riverdeck_core::store::get_settings() else {
+                                return;
+                            };
+                            let mut settings = store.value;
+                            let cur = settings.brightness.clamp(0, 100);
+                            let delta = value.clamp(0, 100);
+                            let new = match action.trim() {
+                                "set" => delta,
+                                "increase" => cur.saturating_add(delta).min(100),
+                                "decrease" => cur.saturating_sub(delta),
+                                _ => return,
+                            };
+                            settings.brightness = new.clamp(0, 100);
+                            // Use the API so brightness is pushed to devices and then persisted.
+                            let _ = riverdeck_core::api::settings::set_settings(settings).await;
+                        });
+                    }
                     _ => {}
                 },
                 Err(tokio_mpsc::error::TryRecvError::Empty) => break,
@@ -5413,6 +5441,28 @@ impl RiverDeckApp {
         // Force draft reset on next frame.
         self.step_button_label_context = None;
     }
+
+    #[cfg(feature = "tray")]
+    fn initiate_quit(&mut self, ctx: &egui::Context) {
+        if self.quit_initiated {
+            return;
+        }
+        self.quit_initiated = true;
+
+        // Ensure any close-to-tray logic is bypassed.
+        QUIT_REQUESTED.store(true, Ordering::SeqCst);
+
+        // Try to close the window for a clean UX, but don't rely on it for shutdown.
+        ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
+
+        // Hard guarantee: run shutdown and then exit the process so HID handles are released
+        // even if the GUI event loop doesn't terminate promptly (tray integration can keep it alive).
+        let runtime = self.runtime.clone();
+        runtime.spawn(async move {
+            riverdeck_core::lifecycle::shutdown_all().await;
+            std::process::exit(0);
+        });
+    }
 }
 
 fn open_url_in_browser(url: &str) {
@@ -5639,7 +5689,7 @@ impl eframe::App for RiverDeckApp {
                     TrayCommand::Quit => {
                         self.hidden_to_tray = false;
                         log_tray_status_to_file("tray: quit");
-                        ctx.request_repaint();
+                        self.initiate_quit(ctx);
                     }
                 }
             }

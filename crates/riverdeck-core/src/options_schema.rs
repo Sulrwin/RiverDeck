@@ -68,6 +68,27 @@ pub struct Field {
 pub fn get_schema(action_uuid: &str) -> Option<&'static OptionsSchema> {
     let u = action_uuid.trim();
 
+    // OpenAction Counter plugin (me.amankhanna.oacounter)
+    // PI only exposes "step" while preserving "value" (managed by the plugin). We mirror that:
+    // allow editing step, but leave value untouched.
+    static OA_COUNTER_FIELDS: &[Field] = &[Field {
+        label: "Step",
+        key_path: "step",
+        help: Some("Amount to add/subtract per press/turn."),
+        kind: FieldKind::Int,
+        default: DefaultValue::Int(1),
+        min: Some(1.0),
+        max: None,
+    }];
+    static OA_COUNTER_TEMP_SCHEMA: OptionsSchema = OptionsSchema {
+        title: "Temporary Counter",
+        fields: OA_COUNTER_FIELDS,
+    };
+    static OA_COUNTER_PERSIST_SCHEMA: OptionsSchema = OptionsSchema {
+        title: "Persisted Counter",
+        fields: OA_COUNTER_FIELDS,
+    };
+
     // Starterpack: Run Command
     static RUN_COMMAND_FIELDS: &[Field] = &[
         Field {
@@ -194,6 +215,10 @@ pub fn get_schema(action_uuid: &str) -> Option<&'static OptionsSchema> {
     // Starterpack: Device Brightness
     static BRIGHTNESS_ACTION_OPTS: &[EnumOption] = &[
         EnumOption {
+            label: "None",
+            value: "none",
+        },
+        EnumOption {
             label: "Set",
             value: "set",
         },
@@ -208,21 +233,48 @@ pub fn get_schema(action_uuid: &str) -> Option<&'static OptionsSchema> {
     ];
     static DEVICE_BRIGHTNESS_FIELDS: &[Field] = &[
         Field {
-            label: "Action",
-            key_path: "action",
-            help: None,
+            label: "Press action",
+            key_path: "pressAction",
+            help: Some("What happens when you press the key / dial."),
             kind: FieldKind::Enum(BRIGHTNESS_ACTION_OPTS),
             default: DefaultValue::Text("set"),
             min: None,
             max: None,
         },
         Field {
-            label: "Value (%)",
-            key_path: "value",
-            help: None,
+            label: "Dial clockwise action",
+            key_path: "clockwiseAction",
+            help: Some("What happens when you rotate the dial clockwise (right)."),
+            kind: FieldKind::Enum(BRIGHTNESS_ACTION_OPTS),
+            default: DefaultValue::Text("increase"),
+            min: None,
+            max: None,
+        },
+        Field {
+            label: "Dial anticlockwise action",
+            key_path: "anticlockwiseAction",
+            help: Some("What happens when you rotate the dial anticlockwise (left)."),
+            kind: FieldKind::Enum(BRIGHTNESS_ACTION_OPTS),
+            default: DefaultValue::Text("decrease"),
+            min: None,
+            max: None,
+        },
+        Field {
+            label: "Set value (%)",
+            key_path: "setValue",
+            help: Some("Only used when the selected action is Set."),
             kind: FieldKind::Int,
             default: DefaultValue::Int(50),
             min: Some(0.0),
+            max: Some(100.0),
+        },
+        Field {
+            label: "Step (%)",
+            key_path: "step",
+            help: Some("Only used when the selected action is Increase/Decrease."),
+            kind: FieldKind::Int,
+            default: DefaultValue::Int(1),
+            min: Some(1.0),
             max: Some(100.0),
         },
     ];
@@ -239,6 +291,8 @@ pub fn get_schema(action_uuid: &str) -> Option<&'static OptionsSchema> {
     };
 
     match u {
+        "me.amankhanna.oacounter.temporary" => Some(&OA_COUNTER_TEMP_SCHEMA),
+        "me.amankhanna.oacounter.persisted" => Some(&OA_COUNTER_PERSIST_SCHEMA),
         "io.github.sulrwin.riverdeck.starterpack.runcommand" => Some(&RUN_COMMAND_SCHEMA),
         "io.github.sulrwin.riverdeck.starterpack.inputsimulation" => Some(&INPUT_SIM_SCHEMA),
         "io.github.sulrwin.riverdeck.starterpack.switchprofile" => Some(&SWITCH_PROFILE_SCHEMA),
