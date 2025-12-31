@@ -104,10 +104,20 @@ impl GenericInstancePayload {
 
 async fn send_to_plugin(plugin: &str, data: &impl Serialize) -> Result<(), anyhow::Error> {
     let message = Message::Text(serde_json::to_string(data)?.into());
-    let mut sockets = super::PLUGIN_SOCKETS.lock().await;
-
-    if let Some(socket) = sockets.get_mut(plugin) {
-        socket.send(message).await?;
+    // IMPORTANT: do not hold the global socket map lock while awaiting I/O.
+    // Otherwise, a slow plugin (or socket backpressure) can stall all outbound events,
+    // which shows up as laggy/missed dial rotations and other input.
+    let mut socket = { super::PLUGIN_SOCKETS.lock().await.remove(plugin) };
+    if let Some(mut socket) = socket.take() {
+        match socket.send(message).await {
+            Ok(()) => {
+                super::PLUGIN_SOCKETS.lock().await.insert(plugin.to_owned(), socket);
+            }
+            Err(e) => {
+                // Drop the socket on error; inbound task cleanup will also remove it if still present.
+                return Err(e.into());
+            }
+        }
     } else {
         let mut queues = super::PLUGIN_QUEUES.write().await;
         let q = queues.entry(plugin.to_owned()).or_default();
@@ -157,13 +167,18 @@ async fn send_to_property_inspector(
     data: &impl Serialize,
 ) -> Result<(), anyhow::Error> {
     let message = Message::Text(serde_json::to_string(data)?.into());
-    let mut sockets = super::PROPERTY_INSPECTOR_SOCKETS.lock().await;
-
-    if let Some(socket) = sockets.get_mut(&context.to_string()) {
-        socket.send(message).await?;
+    // Same as `send_to_plugin`: don't hold the global PI socket map lock across await.
+    let key = context.to_string();
+    let mut socket = { super::PROPERTY_INSPECTOR_SOCKETS.lock().await.remove(&key) };
+    if let Some(mut socket) = socket.take() {
+        match socket.send(message).await {
+            Ok(()) => {
+                super::PROPERTY_INSPECTOR_SOCKETS.lock().await.insert(key, socket);
+            }
+            Err(e) => return Err(e.into()),
+        }
     } else {
         let mut queues = super::PROPERTY_INSPECTOR_QUEUES.write().await;
-        let key = context.to_string();
         let q = queues.entry(key).or_default();
         q.push(message);
         retain_newest_within_limits(

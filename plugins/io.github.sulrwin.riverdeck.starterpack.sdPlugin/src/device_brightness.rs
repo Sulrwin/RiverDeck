@@ -9,6 +9,36 @@ struct DeviceBrightnessEvent {
 	value: u8,
 }
 
+pub fn title_for_settings(settings: &SettingsValue) -> Option<String> {
+	let obj = settings.as_object()?;
+
+	// New mapping (Action Editor schema). Fall back to legacy `action`/`value`.
+	let primary_action = get_str(obj, "pressAction")
+		.and_then(normalize_action)
+		.or_else(|| get_str(obj, "action").and_then(normalize_action))
+		.unwrap_or("set");
+
+	let set_value = get_u8(obj, "setValue")
+		.or_else(|| get_u8(obj, "value"))
+		.unwrap_or(50)
+		.clamp(0, 100);
+
+	// For increase/decrease actions, display the step/value as a percentage too.
+	// Legacy PI uses `value` for both set and step semantics.
+	let step_or_value = get_u8(obj, "step")
+		.or_else(|| get_u8(obj, "value"))
+		.unwrap_or(1)
+		.clamp(0, 100);
+
+	let display = match primary_action {
+		"set" => set_value,
+		"increase" | "decrease" => step_or_value,
+		_ => set_value,
+	};
+
+	Some(format!("{display}%"))
+}
+
 fn get_str<'a>(obj: &'a serde_json::Map<String, serde_json::Value>, key: &str) -> Option<&'a str> {
 	obj.get(key).and_then(|v| v.as_str()).map(|s| s.trim())
 }

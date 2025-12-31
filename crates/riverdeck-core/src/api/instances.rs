@@ -2,6 +2,7 @@ use crate::shared::{
     Action, ActionContext, ActionInstance, ActionState, Context, DEVICES, FontSize, TextPlacement,
     config_dir,
 };
+use crate::store::profiles::request_save_profile;
 use crate::store::profiles::{acquire_locks_mut, get_slot_mut, save_profile};
 use crate::ui::{self, UiEvent};
 
@@ -89,6 +90,64 @@ fn apply_context_for_visuals(ctx: &ActionContext) -> ActionContext {
     ActionContext::from_context(base, 0)
 }
 
+fn is_starterpack_device_brightness_uuid(uuid: &str) -> bool {
+    matches!(
+        uuid,
+        "io.github.sulrwin.riverdeck.starterpack.devicebrightness"
+            | "com.amansprojects.starterpack.devicebrightness"
+    )
+}
+
+fn normalize_device_brightness_action(s: &str) -> Option<&'static str> {
+    match s.trim() {
+        "" | "none" => None,
+        "set" => Some("set"),
+        "increase" => Some("increase"),
+        "decrease" => Some("decrease"),
+        _ => None,
+    }
+}
+
+fn device_brightness_title_for_settings(settings: &serde_json::Value) -> String {
+    let obj = settings.as_object();
+
+    let get_str = |key: &str| -> Option<&str> {
+        obj.and_then(|o| o.get(key))
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim())
+    };
+    let get_u8 = |key: &str| -> Option<u8> {
+        obj.and_then(|o| o.get(key))
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u8)
+    };
+
+    // Prefer schema keys; fall back to legacy PI keys.
+    let press_action = get_str("pressAction")
+        .and_then(normalize_device_brightness_action)
+        .or_else(|| get_str("action").and_then(normalize_device_brightness_action))
+        .unwrap_or("set");
+
+    let set_value = get_u8("setValue")
+        .or_else(|| get_u8("value"))
+        .unwrap_or(50)
+        .clamp(0, 100);
+
+    // For increase/decrease actions, show the configured step/value as a percentage too.
+    let step_or_value = get_u8("step")
+        .or_else(|| get_u8("value"))
+        .unwrap_or(1)
+        .clamp(0, 100);
+
+    let display = match press_action {
+        "set" => set_value,
+        "increase" | "decrease" => step_or_value,
+        _ => set_value,
+    };
+
+    format!("{display}%")
+}
+
 pub async fn create_instance(
     action: Action,
     context: Context,
@@ -141,6 +200,15 @@ pub async fn create_instance(
             children: None,
         };
         children.push(instance.clone());
+        if let Some(last) = children.last_mut()
+            && is_starterpack_device_brightness_uuid(last.action.uuid.as_str())
+        {
+            let title = device_brightness_title_for_settings(&last.settings);
+            for st in last.states.iter_mut() {
+                st.text = title.clone();
+                st.show = true;
+            }
+        }
 
         if crate::shared::is_toggle_action_uuid(parent.action.uuid.as_str()) {
             // Maintain state count (legacy), then sync state images from children.
@@ -158,7 +226,7 @@ pub async fn create_instance(
 
         Ok(Some(instance))
     } else {
-        let instance = ActionInstance {
+        let mut instance = ActionInstance {
             action: action.clone(),
             context: ActionContext::from_context(context.clone(), 0),
             states: init_states(action.states.clone()),
@@ -172,6 +240,13 @@ pub async fn create_instance(
                 None
             },
         };
+        if is_starterpack_device_brightness_uuid(instance.action.uuid.as_str()) {
+            let title = device_brightness_title_for_settings(&instance.settings);
+            for st in instance.states.iter_mut() {
+                st.text = title.clone();
+                st.show = true;
+            }
+        }
 
         *slot = Some(instance.clone());
         let slot = slot.clone();
@@ -236,15 +311,57 @@ pub async fn set_instance_settings(
 ) -> Result<(), anyhow::Error> {
     let mut locks = acquire_locks_mut().await;
 
+    // Compute visibility before borrowing the instance mutably from the profile stores.
+    let active_profile = locks
+        .device_stores
+        .get_selected_profile(&context.device)
+        .ok()
+        .is_some_and(|p| p == context.profile);
+    let active_page = if active_profile {
+        if let Some(dev) = DEVICES.get(&context.device) {
+            locks
+                .profile_stores
+                .get_profile_store_mut(&dev, &context.profile)
+                .await?
+                .value
+                .selected_page
+                .clone()
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
     if let Some(instance) = crate::store::profiles::get_instance_mut(&context, &mut locks).await? {
         instance.settings = settings;
+
+        // Host-side title convenience: keep Starterpack Device Brightness title as `NN%`.
+        // (This is intentionally host-side so it works even if the plugin bundle is older.)
+        if is_starterpack_device_brightness_uuid(instance.action.uuid.as_str()) {
+            let title = device_brightness_title_for_settings(&instance.settings);
+            for st in instance.states.iter_mut() {
+                st.text = title.clone();
+                st.show = true;
+            }
+        }
         // Notify the plugin (not the PI).
         crate::events::outbound::settings::did_receive_settings(instance, false).await?;
         // Best-effort UI refresh for hosts that cache snapshots.
         ui::emit(UiEvent::ActionStateChanged {
             context: instance.context.clone(),
         });
-        save_profile(&context.device, &mut locks).await?;
+
+        // If visible, repaint hardware immediately so the new title is shown without requiring
+        // an explicit `setImage`.
+        if active_profile && active_page == instance.context.page {
+            let img = crate::events::outbound::devices::effective_image_for_instance(instance);
+            let _ =
+                crate::events::outbound::devices::update_image_for_instance(instance, img).await;
+        }
+
+        // Settings edits can be frequent; use debounced persistence.
+        request_save_profile(&context.device, &mut locks)?;
     }
 
     Ok(())

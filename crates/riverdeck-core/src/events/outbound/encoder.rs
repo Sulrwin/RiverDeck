@@ -6,6 +6,21 @@ use crate::ui::{self, UiEvent};
 
 use serde::Serialize;
 use std::collections::HashMap;
+use std::time::Duration;
+use once_cell::sync::Lazy;
+use tokio::sync::Mutex;
+
+struct PendingDialRotate {
+    plugin: String,
+    action_uuid: String,
+    ctx: ActionContext,
+    settings: serde_json::Value,
+    coords: Coordinates,
+    ticks: i16,
+}
+
+static PENDING_DIAL_ROTATE: Lazy<Mutex<HashMap<String, PendingDialRotate>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Serialize)]
 struct DialRotatePayload {
@@ -25,46 +40,106 @@ struct DialRotateEvent {
 }
 
 pub async fn dial_rotate(device: &str, index: u8, ticks: i16) -> Result<(), anyhow::Error> {
-    let mut locks = acquire_locks_mut().await;
-    let selected_profile = locks.device_stores.get_selected_profile(device)?;
-    let page = locks
-        .profile_stores
-        .get_profile_store_mut(&DEVICES.get(device).unwrap(), &selected_profile)
-        .await?
-        .value
-        .selected_page
-        .clone();
-    let context = ActionContext {
-        device: device.to_owned(),
-        profile: selected_profile.to_owned(),
-        page,
-        controller: "Encoder".to_owned(),
-        position: index,
-        index: 0,
-    };
-    let Some(instance) = get_instance_mut(&context, &mut locks).await? else {
-        return Ok(());
+    // IMPORTANT: do not hold profile locks while awaiting network IO to the plugin.
+    // Dial rotations can be high-frequency; backpressure should not stall the entire input pipeline.
+    let (plugin, action_uuid, ctx, settings, coords) = {
+        let mut locks = acquire_locks_mut().await;
+        let selected_profile = locks.device_stores.get_selected_profile(device)?;
+        let page = locks
+            .profile_stores
+            .get_profile_store_mut(&DEVICES.get(device).unwrap(), &selected_profile)
+            .await?
+            .value
+            .selected_page
+            .clone();
+        let context = ActionContext {
+            device: device.to_owned(),
+            profile: selected_profile.to_owned(),
+            page,
+            controller: "Encoder".to_owned(),
+            position: index,
+            index: 0,
+        };
+        let Some(instance) = get_instance_mut(&context, &mut locks).await? else {
+            return Ok(());
+        };
+        (
+            instance.action.plugin.clone(),
+            instance.action.uuid.clone(),
+            instance.context.clone(),
+            instance.settings.clone(),
+            Coordinates {
+                row: instance.context.position / 3,
+                column: instance.context.position % 3,
+            },
+        )
     };
 
-    send_to_plugin(
-        &instance.action.plugin,
-        &DialRotateEvent {
-            event: "dialRotate",
-            action: instance.action.uuid.clone(),
-            context: instance.context.clone(),
-            device: instance.context.device.clone(),
-            payload: DialRotatePayload {
-                settings: instance.settings.clone(),
-                coordinates: Coordinates {
-                    row: instance.context.position / 3,
-                    column: instance.context.position % 3,
+    // If there's no plugin process (host-side/built-in), nothing to send.
+    if plugin.trim().is_empty() {
+        return Ok(());
+    }
+
+    // Coalesce rapid dial ticks into a short (~16ms) batch per encoder context.
+    // This keeps fast spins responsive even when the plugin/UI can't process hundreds of
+    // websocket messages per second.
+    let key = ctx.to_string();
+    let should_spawn = {
+        let mut map = PENDING_DIAL_ROTATE.lock().await;
+        if let Some(p) = map.get_mut(&key) {
+            p.ticks = p.ticks.saturating_add(ticks);
+            // Keep most recent metadata (settings can change).
+            p.plugin = plugin;
+            p.action_uuid = action_uuid;
+            p.ctx = ctx;
+            p.settings = settings;
+            p.coords = coords;
+            false
+        } else {
+            map.insert(
+                key.clone(),
+                PendingDialRotate {
+                    plugin,
+                    action_uuid,
+                    ctx,
+                    settings,
+                    coords,
+                    ticks,
                 },
-                ticks,
-                pressed: false,
-            },
-        },
-    )
-    .await
+            );
+            true
+        }
+    };
+
+    if should_spawn {
+        tokio::spawn(async move {
+            // One frame-ish delay to gather bursts.
+            tokio::time::sleep(Duration::from_millis(16)).await;
+            let pending = { PENDING_DIAL_ROTATE.lock().await.remove(&key) };
+            let Some(p) = pending else { return };
+            if p.ticks == 0 {
+                return;
+            }
+            let _ = send_to_plugin(
+                &p.plugin,
+                &DialRotateEvent {
+                    event: "dialRotate",
+                    action: p.action_uuid,
+                    context: p.ctx.clone(),
+                    device: p.ctx.device.clone(),
+                    payload: DialRotatePayload {
+                        settings: p.settings,
+                        coordinates: p.coords,
+                        ticks: p.ticks,
+                        pressed: false,
+                    },
+                },
+            )
+            .await;
+        });
+    }
+
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -84,45 +159,56 @@ struct DialPressEvent {
 }
 
 pub async fn dial_press(device: &str, event: &'static str, index: u8) -> Result<(), anyhow::Error> {
-    let mut locks = acquire_locks_mut().await;
-    let selected_profile = locks.device_stores.get_selected_profile(device)?;
-    let page = locks
-        .profile_stores
-        .get_profile_store_mut(&DEVICES.get(device).unwrap(), &selected_profile)
-        .await?
-        .value
-        .selected_page
-        .clone();
-    let context = ActionContext {
-        device: device.to_owned(),
-        profile: selected_profile.to_owned(),
-        page,
-        controller: "Encoder".to_owned(),
-        position: index,
-        index: 0,
+    // IMPORTANT: do not hold profile locks while awaiting network IO to the plugin.
+    let (plugin, action_uuid, ctx, settings, coords) = {
+        let mut locks = acquire_locks_mut().await;
+        let selected_profile = locks.device_stores.get_selected_profile(device)?;
+        let page = locks
+            .profile_stores
+            .get_profile_store_mut(&DEVICES.get(device).unwrap(), &selected_profile)
+            .await?
+            .value
+            .selected_page
+            .clone();
+        let context = ActionContext {
+            device: device.to_owned(),
+            profile: selected_profile.to_owned(),
+            page,
+            controller: "Encoder".to_owned(),
+            position: index,
+            index: 0,
+        };
+        let Some(instance) = get_instance_mut(&context, &mut locks).await? else {
+            return Ok(());
+        };
+        (
+            instance.action.plugin.clone(),
+            instance.action.uuid.clone(),
+            instance.context.clone(),
+            instance.settings.clone(),
+            Coordinates {
+                row: instance.context.position / 3,
+                column: instance.context.position % 3,
+            },
+        )
     };
-    let Some(instance) = get_instance_mut(&context, &mut locks).await? else {
-        return Ok(());
-    };
+
     ui::emit(UiEvent::KeyMoved {
-        context: context.clone().into(),
+        context: ctx.clone().into(),
         down: event == "dialDown",
     });
 
     send_to_plugin(
-        &instance.action.plugin,
+        &plugin,
         &DialPressEvent {
             event,
-            action: instance.action.uuid.clone(),
-            context: instance.context.clone(),
-            device: instance.context.device.clone(),
+            action: action_uuid,
+            context: ctx.clone(),
+            device: ctx.device.clone(),
             payload: DialPressPayload {
                 controller: "Encoder",
-                settings: instance.settings.clone(),
-                coordinates: Coordinates {
-                    row: instance.context.position / 3,
-                    column: instance.context.position % 3,
-                },
+                settings,
+                coordinates: coords,
             },
         },
     )

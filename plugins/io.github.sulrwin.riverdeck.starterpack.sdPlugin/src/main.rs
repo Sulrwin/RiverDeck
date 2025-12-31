@@ -39,6 +39,46 @@ impl openaction::GlobalEventHandler for GlobalEventHandler {}
 
 struct ActionEventHandler {}
 impl openaction::ActionEventHandler for ActionEventHandler {
+	async fn will_appear(
+		&self,
+		event: openaction::AppearEvent,
+		outbound: &mut openaction::OutboundEventManager,
+	) -> EventHandlerResult {
+		match &event.action[..] {
+			"com.amansprojects.starterpack.devicebrightness"
+			| "io.github.sulrwin.riverdeck.starterpack.devicebrightness" => {
+				if let Some(title) = device_brightness::title_for_settings(&event.payload.settings)
+				{
+					outbound
+						.set_title(event.context.clone(), Some(title), None)
+						.await?;
+				}
+				Ok(())
+			}
+			_ => Ok(()),
+		}
+	}
+
+	async fn did_receive_settings(
+		&self,
+		event: openaction::DidReceiveSettingsEvent,
+		outbound: &mut openaction::OutboundEventManager,
+	) -> EventHandlerResult {
+		match &event.action[..] {
+			"com.amansprojects.starterpack.devicebrightness"
+			| "io.github.sulrwin.riverdeck.starterpack.devicebrightness" => {
+				if let Some(title) = device_brightness::title_for_settings(&event.payload.settings)
+				{
+					outbound
+						.set_title(event.context.clone(), Some(title), None)
+						.await?;
+				}
+				Ok(())
+			}
+			_ => Ok(()),
+		}
+	}
+
 	async fn key_down(
 		&self,
 		event: KeyEvent,

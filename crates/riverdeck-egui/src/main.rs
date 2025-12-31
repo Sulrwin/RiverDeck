@@ -200,8 +200,8 @@ fn make_native_options() -> eframe::NativeOptions {
     // SAFETY VALVE: some environments have shown hangs during icon decode in debug builds.
     // The window icon is non-critical; default to skipping it in debug builds to ensure the UI
     // always starts. Set `RIVERDECK_ENABLE_WINDOW_ICON=1` to force-enable.
-    let enable_window_icon =
-        env_truthy_any("RIVERDECK_ENABLE_WINDOW_ICON") && !env_truthy_any("RIVERDECK_DISABLE_WINDOW_ICON");
+    let enable_window_icon = env_truthy_any("RIVERDECK_ENABLE_WINDOW_ICON")
+        && !env_truthy_any("RIVERDECK_DISABLE_WINDOW_ICON");
     let icon = if enable_window_icon {
         Some(load_window_icon_with_timeout(Duration::from_millis(250)))
     } else {
@@ -228,7 +228,9 @@ fn is_wayland_session() -> bool {
     std::env::var("XDG_SESSION_TYPE")
         .ok()
         .is_some_and(|v| v.eq_ignore_ascii_case("wayland"))
-        || std::env::var("WAYLAND_DISPLAY").ok().is_some_and(|v| !v.trim().is_empty())
+        || std::env::var("WAYLAND_DISPLAY")
+            .ok()
+            .is_some_and(|v| !v.trim().is_empty())
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -296,7 +298,8 @@ fn main() -> anyhow::Result<()> {
                 .to_lowercase()
                 .contains("hypr");
         let prefer_wayland = env_truthy_any("RIVERDECK_PREFER_WAYLAND");
-        let backend_before = std::env::var("WINIT_UNIX_BACKEND").unwrap_or_else(|_| "<unset>".to_owned());
+        let backend_before =
+            std::env::var("WINIT_UNIX_BACKEND").unwrap_or_else(|_| "<unset>".to_owned());
         let backend_is_unset = backend_before == "<unset>";
 
         // Tray builds rely on "hide window" semantics for close-to-tray. On Linux/Wayland,
@@ -338,7 +341,9 @@ fn main() -> anyhow::Result<()> {
             unsafe {
                 std::env::set_var("WINIT_UNIX_BACKEND", "x11");
             }
-            log::warn!("Hyprland detected: forcing WINIT_UNIX_BACKEND=x11 for UI reliability (set RIVERDECK_PREFER_WAYLAND=1 to opt out)");
+            log::warn!(
+                "Hyprland detected: forcing WINIT_UNIX_BACKEND=x11 for UI reliability (set RIVERDECK_PREFER_WAYLAND=1 to opt out)"
+            );
         }
     }
 
@@ -2048,7 +2053,8 @@ impl RiverDeckApp {
         let tray_hide_ok = tray.is_some();
         #[cfg(feature = "tray")]
         if tray.is_some() {
-            let backend = std::env::var("WINIT_UNIX_BACKEND").unwrap_or_else(|_| "<unset>".to_owned());
+            let backend =
+                std::env::var("WINIT_UNIX_BACKEND").unwrap_or_else(|_| "<unset>".to_owned());
             let xdg = std::env::var("XDG_SESSION_TYPE").unwrap_or_else(|_| "<unset>".to_owned());
             let wayland_display =
                 std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "<unset>".to_owned());
@@ -2246,9 +2252,15 @@ impl RiverDeckApp {
         }
         self.hide_to_tray_requested = true;
         self.hidden_to_tray = true;
-        ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Visible(false));
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::Visible(false),
+        );
         // Some WMs behave better when we also request minimization; harmless where unsupported.
-        ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Minimized(true));
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::Minimized(true),
+        );
         ctx.request_repaint();
     }
 
@@ -4691,7 +4703,10 @@ impl RiverDeckApp {
         }
 
         let stroke = if selected || (drag_payload.is_some() && drop_hovered && drop_valid) {
-            egui::Stroke::new(tokens.stroke_width_active, ui.visuals().selection.stroke.color)
+            egui::Stroke::new(
+                tokens.stroke_width_active,
+                ui.visuals().selection.stroke.color,
+            )
         } else if drag_payload.is_some() && drop_hovered && !drop_valid {
             egui::Stroke::new(tokens.stroke_width_active, ui.visuals().error_fg_color)
         } else {
@@ -4936,7 +4951,10 @@ impl RiverDeckApp {
                 egui::pos2(center.x, notch_y),
                 egui::pos2(center.x, notch_y + notch_len),
             ],
-            egui::Stroke::new(tokens.stroke_width, visuals.widgets.inactive.bg_stroke.color),
+            egui::Stroke::new(
+                tokens.stroke_width,
+                visuals.widgets.inactive.bg_stroke.color,
+            ),
         );
 
         resp
@@ -5651,8 +5669,14 @@ impl eframe::App for RiverDeckApp {
         // A real exit is done via the tray menu (Quit).
         #[cfg(feature = "tray")]
         if ctx.input(|i| i.viewport().close_requested()) {
-            // Allow close to proceed only when we're actually quitting.
-            self.request_hide_to_tray(ctx, true, "Close requested");
+            // Some users expect closing the window to quit the app (and release the device).
+            // Opt-in via env var to keep the default close-to-tray behavior.
+            if env_truthy("RIVERDECK_CLOSE_QUITS") {
+                self.initiate_quit(ctx);
+            } else {
+                // Allow close to proceed only when we're actually quitting.
+                self.request_hide_to_tray(ctx, true, "Close requested");
+            }
         }
 
         if self.start_hidden {
@@ -5663,7 +5687,10 @@ impl eframe::App for RiverDeckApp {
             if self.hide_to_tray_available() {
                 self.hidden_to_tray = true;
                 log_tray_status_to_file("startup: start hidden-to-tray");
-                ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Visible(false));
+                ctx.send_viewport_cmd_to(
+                    egui::ViewportId::ROOT,
+                    egui::ViewportCommand::Visible(false),
+                );
             } else {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
             }
@@ -5704,7 +5731,10 @@ impl eframe::App for RiverDeckApp {
                 log_tray_status_to_file("show requested: making window visible");
             }
             ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Visible(true));
-            ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd_to(
+                egui::ViewportId::ROOT,
+                egui::ViewportCommand::Minimized(false),
+            );
         }
 
         #[cfg(feature = "tray")]
@@ -5712,7 +5742,10 @@ impl eframe::App for RiverDeckApp {
             self.hide_to_tray_requested = false;
             if self.hide_to_tray_available() {
                 self.hidden_to_tray = true;
-                ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Visible(false));
+                ctx.send_viewport_cmd_to(
+                    egui::ViewportId::ROOT,
+                    egui::ViewportCommand::Visible(false),
+                );
             } else {
                 self.hidden_to_tray = false;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
@@ -8344,7 +8377,11 @@ impl RiverDeckApp {
                     let close = ui.add(egui::Button::new("X").min_size(btn_size));
                     if close.clicked() {
                         #[cfg(feature = "tray")]
-                        self.request_hide_to_tray(ctx, false, "Titlebar X clicked");
+                        if env_truthy("RIVERDECK_CLOSE_QUITS") {
+                            self.initiate_quit(ctx);
+                        } else {
+                            self.request_hide_to_tray(ctx, false, "Titlebar X clicked");
+                        }
                         #[cfg(feature = "tray")]
                         if QUIT_REQUESTED.load(Ordering::SeqCst) || !self.hide_to_tray_available() {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -8506,12 +8543,21 @@ impl TrayState {
         let mut out = Vec::new();
         while let Ok(ev) = MenuEvent::receiver().try_recv() {
             if ev.id == self.show.id() {
-                ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Visible(true));
-                ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Minimized(false));
+                ctx.send_viewport_cmd_to(
+                    egui::ViewportId::ROOT,
+                    egui::ViewportCommand::Visible(true),
+                );
+                ctx.send_viewport_cmd_to(
+                    egui::ViewportId::ROOT,
+                    egui::ViewportCommand::Minimized(false),
+                );
                 out.push(TrayCommand::Show);
             } else if ev.id == self.hide.id() {
                 // Hide to tray (no taskbar entry).
-                ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Visible(false));
+                ctx.send_viewport_cmd_to(
+                    egui::ViewportId::ROOT,
+                    egui::ViewportCommand::Visible(false),
+                );
                 out.push(TrayCommand::Hide);
             } else if ev.id == self.quit.id() {
                 QUIT_REQUESTED.store(true, Ordering::SeqCst);
