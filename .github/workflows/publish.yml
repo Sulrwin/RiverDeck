@@ -128,6 +128,8 @@ jobs:
 
             cp -a target/debian/*.deb dist/
             cp -a target/generate-rpm/*.rpm dist/
+            # Per-asset checksums so updaters can verify downloads without needing a merged sums file.
+            (cd dist && for f in *.deb *.rpm; do sha256sum "$f" > "$f.sha256"; done)
           elif [[ "$TARGET" == *"apple-darwin"* ]]; then
             APP="dist/RiverDeck.app"
             VERSION="${{ needs.create-release.outputs.version }}"
@@ -159,7 +161,7 @@ jobs:
           TAG="${{ needs.create-release.outputs.tag }}"
           TARGET="${{ matrix.target }}"
           if [[ "$TARGET" == linux-* ]]; then
-            gh release upload "$TAG" dist/*.deb dist/*.rpm --clobber
+            gh release upload "$TAG" dist/*.deb dist/*.rpm dist/*.sha256 --clobber
           elif [[ "$TARGET" == *"apple-darwin"* ]]; then
             gh release upload "$TAG" "dist/RiverDeck_${TARGET}.dmg" --clobber
           elif [[ "$TARGET" == *"windows"* ]]; then

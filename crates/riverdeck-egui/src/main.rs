@@ -2,6 +2,7 @@ use riverdeck_core::{application_watcher, elgato, plugins, shared, ui};
 
 #[path = "ui/mod.rs"]
 mod app_ui;
+mod updater;
 
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -41,6 +42,35 @@ static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 static SHOW_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 static IPC_PORT: OnceLock<u16> = OnceLock::new();
+
+fn env_truthy_any(name: &str) -> bool {
+    matches!(
+        std::env::var(name).ok().as_deref(),
+        Some("1")
+            | Some("true")
+            | Some("TRUE")
+            | Some("yes")
+            | Some("YES")
+            | Some("on")
+            | Some("ON")
+    )
+}
+
+fn force_exit_is_disabled() -> bool {
+    // Escape hatch for debugging shutdown hangs.
+    env_truthy_any("RIVERDECK_NO_FORCE_EXIT")
+}
+
+fn spawn_shutdown_watchdog(reason: &'static str) {
+    if force_exit_is_disabled() {
+        return;
+    }
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(2));
+        log::error!("Forced exit after shutdown timeout ({reason})");
+        std::process::exit(0);
+    });
+}
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -144,19 +174,6 @@ fn init_logging() {
     }));
     // Let the inner logger handle filtering; keep max_level permissive.
     log::set_max_level(LevelFilter::Trace);
-}
-
-fn env_truthy_any(name: &str) -> bool {
-    matches!(
-        std::env::var(name).ok().as_deref(),
-        Some("1")
-            | Some("true")
-            | Some("TRUE")
-            | Some("yes")
-            | Some("YES")
-            | Some("on")
-            | Some("ON")
-    )
 }
 
 fn make_native_options() -> eframe::NativeOptions {
@@ -564,8 +581,12 @@ fn main() -> anyhow::Result<()> {
     )
     .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
-    runtime.block_on(async { riverdeck_core::lifecycle::shutdown_all().await });
-    Ok(())
+    spawn_shutdown_watchdog("run_native returned");
+    let _ = runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), riverdeck_core::lifecycle::shutdown_all())
+            .await
+    });
+    std::process::exit(0);
 }
 
 #[cfg(unix)]
@@ -593,12 +614,22 @@ fn start_signal_handlers(runtime: Arc<Runtime>) {
                 },
                 _ = sigterm.recv() => {
                     log::warn!("Received termination signal; shutting down RiverDeck");
-                    riverdeck_core::lifecycle::shutdown_all().await;
+                    spawn_shutdown_watchdog("SIGTERM");
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(2),
+                        riverdeck_core::lifecycle::shutdown_all(),
+                    )
+                    .await;
                     std::process::exit(0);
                 },
                 _ = sigint.recv() => {
                     log::warn!("Received interrupt signal; shutting down RiverDeck");
-                    riverdeck_core::lifecycle::shutdown_all().await;
+                    spawn_shutdown_watchdog("SIGINT");
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(2),
+                        riverdeck_core::lifecycle::shutdown_all(),
+                    )
+                    .await;
                     std::process::exit(0);
                 },
             }
@@ -1702,11 +1733,19 @@ struct RiverDeckApp {
     action_editor_open: bool,
 
     show_update_details: bool,
+    update_auto_prompted: bool,
+    pending_update_install: Option<mpsc::Receiver<UpdateInstallEvent>>,
+    update_install_status: Option<String>,
+    update_install_progress: Option<updater::DownloadProgress>,
     show_settings: bool,
     settings_theme: riverdeck_core::store::ThemeId,
     settings_autostart: bool,
     settings_screensaver: bool,
+    settings_updatecheck: bool,
+    settings_autoupdate_prompt: bool,
     settings_error: Option<String>,
+    update_check_status: Option<String>,
+    pending_update_check: Option<mpsc::Receiver<Result<Option<UpdateInfo>, String>>>,
 
     // Marketplace window state (a simple webview window via `riverdeck-pi`).
     marketplace_child: Option<std::process::Child>,
@@ -2197,11 +2236,19 @@ impl RiverDeckApp {
             drag_hover_valid: false,
             action_editor_open: false,
             show_update_details: false,
+            update_auto_prompted: false,
+            pending_update_install: None,
+            update_install_status: None,
+            update_install_progress: None,
             show_settings: false,
             settings_theme: theme,
             settings_autostart: false,
             settings_screensaver: false,
+            settings_updatecheck: true,
+            settings_autoupdate_prompt: false,
             settings_error: None,
+            update_check_status: None,
+            pending_update_check: None,
             marketplace_child: None,
             marketplace_last_error: None,
             property_inspector_child: None,
@@ -5477,7 +5524,8 @@ impl RiverDeckApp {
         // even if the GUI event loop doesn't terminate promptly (tray integration can keep it alive).
         let runtime = self.runtime.clone();
         runtime.spawn(async move {
-            riverdeck_core::lifecycle::shutdown_all().await;
+            spawn_shutdown_watchdog("tray quit");
+            let _ = tokio::time::timeout(Duration::from_secs(2), riverdeck_core::lifecycle::shutdown_all()).await;
             std::process::exit(0);
         });
     }
@@ -5926,6 +5974,8 @@ impl eframe::App for RiverDeckApp {
         if pending_async
             || self.pending_plugin_install_result.is_some()
             || self.pending_plugin_remove_result.is_some()
+            || self.pending_update_check.is_some()
+            || self.pending_update_install.is_some()
             || self.pending_icon_pick.is_some()
             || self.pending_screen_bg_pick.is_some()
             || self.toasts.is_active()
@@ -5982,6 +6032,68 @@ impl eframe::App for RiverDeckApp {
             }
         }
 
+        // Manual update check (non-blocking result channel).
+        if let Some(rx) = self.pending_update_check.as_ref() && let Ok(res) = rx.try_recv() {
+            self.pending_update_check = None;
+            match res {
+                Ok(Some(info)) => {
+                    *self.update_info.lock().unwrap() = Some(info.clone());
+                    self.update_check_status = Some(format!("Update available: {}", info.tag));
+                    self.show_update_details = true;
+                    self.update_install_status = None;
+                    self.update_install_progress = None;
+                    self.pending_update_install = None;
+                }
+                Ok(None) => {
+                    *self.update_info.lock().unwrap() = None;
+                    self.update_check_status = Some("You're up to date.".to_owned());
+                }
+                Err(err) => {
+                    self.update_check_status = Some(format!("Update check failed: {err}"));
+                }
+            }
+        }
+
+        // Auto-prompt: if enabled, open the update details window when an update is discovered.
+        if !self.update_auto_prompted
+            && self.update_info.lock().unwrap().is_some()
+            && let Ok(store) = riverdeck_core::store::get_settings()
+            && store.value.autoupdate_prompt
+        {
+            self.show_update_details = true;
+            self.update_auto_prompted = true;
+        }
+
+        // Self-update operation (non-blocking progress channel).
+        if let Some(rx) = self.pending_update_install.as_ref() {
+            while let Ok(ev) = rx.try_recv() {
+                match ev {
+                    UpdateInstallEvent::Status(s) => {
+                        self.update_install_status = Some(s);
+                    }
+                    UpdateInstallEvent::Progress(p) => {
+                        self.update_install_progress = Some(p);
+                    }
+                    UpdateInstallEvent::Finished(res) => {
+                        self.pending_update_install = None;
+                        self.update_install_progress = None;
+                        match res {
+                            Ok(()) => {
+                                self.update_install_status = Some(
+                                    "Update installed. Please restart RiverDeck.".to_owned(),
+                                );
+                            }
+                            Err(err) => {
+                                self.update_install_status =
+                                    Some(format!("Update failed: {err}"));
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
         // Reset per-frame drag hover state.
         self.drag_hover_slot = None;
         self.drag_hover_valid = false;
@@ -6018,6 +6130,8 @@ impl eframe::App for RiverDeckApp {
                             ui.label(format!("Update available: {}", info.tag));
                             if ui.button("Details").clicked() {
                                 self.show_update_details = true;
+                                self.update_install_status = None;
+                                self.update_install_progress = None;
                             }
                         }
                     });
@@ -6044,7 +6158,147 @@ impl eframe::App for RiverDeckApp {
                                     .show(ui, |ui| {
                                         ui.label(&info.body);
                                     });
-                                ui.label("Update via your package manager / release download.");
+                                ui.add_space(6.0);
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "Current: v{} • Latest: v{}",
+                                        env!("CARGO_PKG_VERSION"),
+                                        info.remote_version
+                                    ))
+                                    .small()
+                                    .color(ui.visuals().weak_text_color()),
+                                );
+
+                                ui.add_space(8.0);
+                                if let Some(status) = self.update_install_status.as_ref() {
+                                    ui.label(
+                                        egui::RichText::new(status)
+                                            .small()
+                                            .color(ui.visuals().weak_text_color()),
+                                    );
+                                }
+
+                                if let Some(p) = self.update_install_progress.as_ref() {
+                                    if let Some(total) = p.total_bytes.filter(|t| *t > 0) {
+                                        let frac =
+                                            (p.downloaded_bytes as f32 / total as f32).clamp(0.0, 1.0);
+                                        ui.add(
+                                            egui::ProgressBar::new(frac)
+                                                .show_percentage()
+                                                .animate(true),
+                                        );
+                                    } else {
+                                        ui.label(format!("Downloaded {} bytes", p.downloaded_bytes));
+                                    }
+                                }
+
+                                #[cfg(target_os = "linux")]
+                                {
+                                    let inflight = self.pending_update_install.is_some();
+                                    let can_install = info.asset.is_some();
+                                    ui.horizontal(|ui| {
+                                        if ui
+                                            .add_enabled(!inflight && can_install, egui::Button::new("Update now"))
+                                            .clicked()
+                                        {
+                                            let Some(asset) = info.asset.clone() else {
+                                                self.update_install_status = Some(
+                                                    "No installable package found for this system."
+                                                        .to_owned(),
+                                                );
+                                                return;
+                                            };
+                                            let tag = info.tag.clone();
+                                            let dest =
+                                                updater::default_update_download_path(&tag, asset.kind);
+                                            self.update_install_status = Some(format!(
+                                                "Downloading {}…",
+                                                asset.filename
+                                            ));
+                                            self.update_install_progress = None;
+                                            let (tx, rx) = mpsc::channel();
+                                            self.pending_update_install = Some(rx);
+                                            self.runtime.spawn(async move {
+                                                let _ = tx.send(UpdateInstallEvent::Status(
+                                                    "Downloading…".to_owned(),
+                                                ));
+                                                let progress_tx = tx.clone();
+                                                if let Err(err) = updater::download_asset_to(
+                                                    &asset,
+                                                    &dest,
+                                                    move |p| {
+                                                        let _ = progress_tx
+                                                            .send(UpdateInstallEvent::Progress(p));
+                                                    },
+                                                )
+                                                .await
+                                                {
+                                                    let _ = tx.send(UpdateInstallEvent::Finished(Err(
+                                                        err.to_string(),
+                                                    )));
+                                                    return;
+                                                }
+
+                                                match updater::fetch_expected_sha256(&asset).await {
+                                                    Ok(Some(expected)) => {
+                                                        let _ = tx.send(UpdateInstallEvent::Status(
+                                                            "Verifying download…".to_owned(),
+                                                        ));
+                                                        if let Err(err) =
+                                                            updater::verify_sha256(&dest, &expected).await
+                                                        {
+                                                            let _ = tx.send(
+                                                                UpdateInstallEvent::Finished(Err(
+                                                                    err.to_string(),
+                                                                )),
+                                                            );
+                                                            return;
+                                                        }
+                                                    }
+                                                    Ok(None) => {}
+                                                    Err(err) => {
+                                                        let _ = tx.send(UpdateInstallEvent::Finished(Err(
+                                                            err.to_string(),
+                                                        )));
+                                                        return;
+                                                    }
+                                                }
+
+                                                let _ = tx.send(UpdateInstallEvent::Status(
+                                                    "Installing…".to_owned(),
+                                                ));
+                                                let res = updater::install_package_with_pkexec(
+                                                    &dest,
+                                                    asset.kind,
+                                                )
+                                                .await
+                                                .map_err(|e| e.to_string());
+                                                let _ = tx.send(UpdateInstallEvent::Finished(res));
+                                            });
+                                        }
+
+                                        if inflight {
+                                            ui.label(
+                                                egui::RichText::new("In progress…")
+                                                    .small()
+                                                    .color(ui.visuals().weak_text_color()),
+                                            );
+                                        } else if !can_install {
+                                            ui.label(
+                                                egui::RichText::new(
+                                                    "Installable package not available (not a .deb/.rpm install).",
+                                                )
+                                                .small()
+                                                .color(ui.visuals().weak_text_color()),
+                                            );
+                                        }
+                                    });
+                                }
+
+                                #[cfg(not(target_os = "linux"))]
+                                {
+                                    ui.label("Update via your package manager / release download.");
+                                }
                             });
                     });
                 if close_requested {
@@ -6807,12 +7061,90 @@ impl eframe::App for RiverDeckApp {
                                     )
                                     .changed();
 
+                                ui.add_space(8.0);
+                                ui.separator();
+                                ui.add_space(8.0);
+
+                                ui.label(egui::RichText::new("Updates").strong());
+                                changed |= ui
+                                    .checkbox(
+                                        &mut self.settings_updatecheck,
+                                        "Check for updates on startup",
+                                    )
+                                    .changed();
+                                changed |= ui
+                                    .checkbox(
+                                        &mut self.settings_autoupdate_prompt,
+                                        "Prompt to download & install updates",
+                                    )
+                                    .changed();
+
+                                ui.horizontal(|ui| {
+                                    let checking = self.pending_update_check.is_some();
+                                    if ui
+                                        .add_enabled(!checking, egui::Button::new("Check for updates now"))
+                                        .clicked()
+                                    {
+                                        self.update_check_status = Some("Checking…".to_owned());
+                                        let (tx, rx) = mpsc::channel();
+                                        self.pending_update_check = Some(rx);
+                                        self.runtime.spawn(async move {
+                                            let current_version =
+                                                semver::Version::parse(env!("CARGO_PKG_VERSION"))
+                                                    .ok();
+                                            let res = updater::fetch_latest_release(current_version)
+                                                .await
+                                                .map(|opt| {
+                                                    opt.map(|r| UpdateInfo {
+                                                        tag: r.tag,
+                                                        body: r.body,
+                                                        remote_version: r.remote_version,
+                                                        asset: r.asset,
+                                                    })
+                                                })
+                                                .map_err(|e| e.to_string());
+
+                                            // Record the successful check time (best-effort).
+                                            if res.is_ok()
+                                                && let Ok(mut store) = riverdeck_core::store::get_settings()
+                                            {
+                                                store.value.last_update_check_unix = std::time::SystemTime::now()
+                                                    .duration_since(std::time::UNIX_EPOCH)
+                                                    .map(|d| d.as_secs())
+                                                    .unwrap_or(0);
+                                                let _ = store.save();
+                                            }
+
+                                            let _ = tx.send(res);
+                                        });
+                                    }
+
+                                    if checking {
+                                        ui.label(
+                                            egui::RichText::new("Checking…")
+                                                .small()
+                                                .color(ui.visuals().weak_text_color()),
+                                        );
+                                    }
+                                });
+
+                                if let Some(status) = self.update_check_status.as_ref() {
+                                    ui.label(
+                                        egui::RichText::new(status)
+                                            .small()
+                                            .color(ui.visuals().weak_text_color()),
+                                    );
+                                }
+
                                 if changed {
                                     match riverdeck_core::store::get_settings() {
                                         Ok(mut store) => {
                                             store.value.autolaunch = self.settings_autostart;
                                             store.value.screensaver = self.settings_screensaver;
                                             store.value.theme = self.settings_theme.clone();
+                                            store.value.updatecheck = self.settings_updatecheck;
+                                            store.value.autoupdate_prompt =
+                                                self.settings_autoupdate_prompt;
                                             if let Err(err) = store.save() {
                                                 self.settings_error = Some(err.to_string());
                                             } else {
@@ -8265,8 +8597,12 @@ impl Drop for RiverDeckApp {
         // Dropping the UI window must not stop the backend.
         #[cfg(not(feature = "tray"))]
         {
-            self.runtime
-                .block_on(async { riverdeck_core::lifecycle::shutdown_all().await });
+            // Do not block in Drop: shutdown can require I/O and can hang if a task/lock deadlocks.
+            // The main exit path also performs shutdown (with a watchdog) after `run_native` returns.
+            let rt = self.runtime.clone();
+            rt.spawn(async move {
+                let _ = tokio::time::timeout(Duration::from_secs(2), riverdeck_core::lifecycle::shutdown_all()).await;
+            });
         }
     }
 }
@@ -8324,6 +8660,8 @@ impl RiverDeckApp {
                         ui.label(format!("Update available: {}", info.tag));
                         if ui.button("Details").clicked() {
                             self.show_update_details = true;
+                            self.update_install_status = None;
+                            self.update_install_progress = None;
                         }
                     }
                 });
@@ -8350,12 +8688,16 @@ impl RiverDeckApp {
                         if cog.clicked() {
                             self.show_settings = true;
                             self.settings_error = None;
+                            self.update_check_status = None;
+                            self.pending_update_check = None;
                             // Load current settings into the local UI state (best effort).
                             match riverdeck_core::store::get_settings() {
                                 Ok(store) => {
                                     self.settings_theme = store.value.theme.clone();
                                     self.settings_autostart = store.value.autolaunch;
                                     self.settings_screensaver = store.value.screensaver;
+                                    self.settings_updatecheck = store.value.updatecheck;
+                                    self.settings_autoupdate_prompt = store.value.autoupdate_prompt;
                                 }
                                 Err(err) => {
                                     self.settings_error = Some(err.to_string());
@@ -8438,44 +8780,54 @@ fn log_tray_status_to_file(msg: &str) {
 struct UpdateInfo {
     tag: String,
     body: String,
+    remote_version: semver::Version,
+    asset: Option<updater::UpdateAsset>,
+}
+
+#[derive(Debug, Clone)]
+enum UpdateInstallEvent {
+    Status(String),
+    Progress(updater::DownloadProgress),
+    Finished(Result<(), String>),
 }
 
 fn start_update_check(runtime: Arc<Runtime>, update_info: Arc<Mutex<Option<UpdateInfo>>>) {
     let current_version = semver::Version::parse(env!("CARGO_PKG_VERSION")).ok();
     runtime.spawn(async move {
-        // Respect stored setting if present.
-        if let Ok(store) = riverdeck_core::store::get_settings()
-            && !store.value.updatecheck
-        {
+        // Respect stored setting if present, and avoid checking too frequently.
+        let (enabled, last_check) = match riverdeck_core::store::get_settings() {
+            Ok(store) => (store.value.updatecheck, store.value.last_update_check_unix),
+            Err(_) => (true, 0),
+        };
+        if !enabled {
             return;
         }
 
-        let res = reqwest::Client::new()
-            .get("https://api.github.com/repos/sulrwin/RiverDeck/releases/latest")
-            .header("Accept", "application/vnd.github+json")
-            .header("User-Agent", "RiverDeck")
-            .send()
-            .await;
-        let Ok(res) = res else { return };
-        let Ok(json) = res.json::<serde_json::Value>().await else {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        const MIN_INTERVAL_SECS: u64 = 24 * 60 * 60;
+        if last_check != 0 && now.saturating_sub(last_check) < MIN_INTERVAL_SECS {
             return;
-        };
+        }
 
-        let tag_name = json.get("tag_name").and_then(|v| v.as_str()).unwrap_or("");
-        let body = json
-            .get("body")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_owned();
-        let remote = tag_name.strip_prefix('v').unwrap_or(tag_name);
+        let res = updater::fetch_latest_release(current_version).await;
 
-        if let (Some(cur), Ok(remote)) = (current_version, semver::Version::parse(remote))
-            && cur < remote
+        // Record successful check (best-effort).
+        if res.is_ok()
+            && let Ok(mut store) = riverdeck_core::store::get_settings()
         {
+            store.value.last_update_check_unix = now;
+            let _ = store.save();
+        }
+
+        if let Ok(Some(r)) = res {
             *update_info.lock().unwrap() = Some(UpdateInfo {
-                tag: tag_name.to_owned(),
-                body,
+                tag: r.tag,
+                body: r.body,
+                remote_version: r.remote_version,
+                asset: r.asset,
             });
         }
     });

@@ -178,7 +178,12 @@ pub struct Settings {
     pub autolaunch: bool,
     /// Placeholder toggle for future screensaver integration.
     pub screensaver: bool,
+    /// Check for updates on startup (GitHub releases). Disabled by default on Flatpak.
     pub updatecheck: bool,
+    /// When an update is found, prompt the user to download and install it (Linux package builds).
+    pub autoupdate_prompt: bool,
+    /// Unix timestamp (seconds) of the last successful update check, used to avoid frequent polling.
+    pub last_update_check_unix: u64,
     pub statistics: bool,
     pub separatewine: bool,
     pub developer: bool,
@@ -199,6 +204,8 @@ impl Default for Settings {
             autolaunch: false,
             screensaver: false,
             updatecheck: option_env!("RIVERDECK_DISABLE_UPDATE_CHECK").is_none() && !is_flatpak(),
+            autoupdate_prompt: false,
+            last_update_check_unix: 0,
             // RiverDeck does not enable telemetry by default.
             statistics: false,
             separatewine: false,
@@ -240,6 +247,8 @@ struct SettingsSerde {
     autolaunch: bool,
     screensaver: bool,
     updatecheck: bool,
+    autoupdate_prompt: bool,
+    last_update_check_unix: u64,
     statistics: bool,
     separatewine: bool,
     developer: bool,
@@ -268,6 +277,8 @@ impl From<SettingsSerde> for Settings {
             autolaunch: s.autolaunch,
             screensaver: s.screensaver,
             updatecheck: s.updatecheck,
+            autoupdate_prompt: s.autoupdate_prompt,
+            last_update_check_unix: s.last_update_check_unix,
             statistics: s.statistics,
             separatewine: s.separatewine,
             developer: s.developer,
